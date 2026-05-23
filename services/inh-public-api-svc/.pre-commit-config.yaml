@@ -1,0 +1,83 @@
+# Pre-commit hooks for inh-public-api-svc
+# Install: uv add --dev pre-commit && uv run pre-commit install
+# Run manually: uv run pre-commit run --all-files
+
+default_language_version:
+  python: python3
+
+repos:
+  # General file checks
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.5.0
+    hooks:
+      - id: trailing-whitespace
+        args: [--markdown-linebreak-ext=md]
+      - id: end-of-file-fixer
+      - id: check-yaml
+        args: [--unsafe]
+      - id: check-toml
+      - id: check-json
+      - id: check-added-large-files
+        args: [--maxkb=1000]
+      - id: check-merge-conflict
+      - id: check-case-conflict
+      - id: detect-private-key
+      - id: debug-statements
+
+  # Ruff - Fast Python linter (local to this service)
+  # Note: Run 'uv run ruff check --fix src/ tests/' to auto-fix issues
+  - repo: local
+    hooks:
+      # Linter (check only, use 'uv run ruff check --fix' to auto-fix)
+      - id: ruff
+        name: ruff
+        entry: bash -c 'cd services/inh-public-api-svc && uv run ruff check src/ tests/'
+        language: system
+        types: [python]
+        pass_filenames: false
+        files: ^services/inh-public-api-svc/(src|tests)/
+      # Formatter (use Black to match CI)
+      - id: black
+        name: black
+        entry: bash -c 'cd services/inh-public-api-svc && uv run black --check src/ tests/'
+        language: system
+        types: [python]
+        pass_filenames: false
+        files: ^services/inh-public-api-svc/(src|tests)/
+
+  # Type checking with mypy (local to this service)
+  - repo: local
+    hooks:
+      - id: mypy
+        name: mypy
+        entry: bash -c 'cd services/inh-public-api-svc && uv run mypy --ignore-missing-imports --no-error-summary src/'
+        language: system
+        types: [python]
+        pass_filenames: false
+        files: ^services/inh-public-api-svc/src/
+
+  # Security checks (local to this service)
+  - repo: local
+    hooks:
+      - id: bandit
+        name: bandit
+        entry: bash -c 'cd services/inh-public-api-svc && uv run bandit -c pyproject.toml -r src/'
+        language: system
+        types: [python]
+        pass_filenames: false
+        files: ^services/inh-public-api-svc/src/
+
+  # Check for secrets (disabled in monorepo - enable if needed)
+  # - repo: https://github.com/Yelp/detect-secrets
+  #   rev: v1.4.0
+  #   hooks:
+  #     - id: detect-secrets
+  #       args: [--baseline, .secrets.baseline]
+  #       exclude: (uv\.lock|\.secrets\.baseline)$
+
+# CI configuration
+ci:
+  autofix_commit_msg: "style: auto-fix by pre-commit hooks"
+  autofix_prs: true
+  autoupdate_commit_msg: "chore: update pre-commit hooks"
+  autoupdate_schedule: weekly

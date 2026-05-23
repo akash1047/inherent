@@ -1,0 +1,131 @@
+[project]
+name = "inh-public-api-svc"
+version = "0.1.0"
+description = "Customer-facing API and MCP server for Inherent Knowledge Base"
+readme = "Readme.md"
+requires-python = ">=3.11"
+dependencies = [
+    # Web framework
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    # Database
+    "sqlalchemy>=2.0.36",
+    "greenlet>=3.1.1",
+    "asyncpg>=0.30.0",
+    "psycopg[binary]>=3.2.3",
+    # Cloud SQL connector (for production on Cloud Run)
+    "cloud-sql-python-connector[asyncpg]>=1.0.0",
+    # MCP
+    "mcp>=1.1.2",
+    # HTTP client
+    "httpx>=0.27.2",
+    # Configuration
+    "pydantic-settings>=2.6.1",
+    # Logging
+    "structlog>=24.4.0",
+    # S3 storage
+    "boto3>=1.35.0",
+    # Message queue (Redis Streams / Valkey)
+    "redis>=5.0.0",
+    # Utilities
+    "python-multipart>=0.0.12",
+    # Metrics
+    "prometheus-client>=0.19.0",
+    # Circuit breaker
+    "aiobreaker>=1.2.0",
+    # MongoDB (read-only — for workspace ownership lookups; control-plane truth)
+    "motor>=3.6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3.3",
+    "pytest-asyncio>=0.24.0",
+    "pytest-cov>=6.0.0",
+    "httpx>=0.27.2",
+    "playwright>=1.49.0",
+    "ruff>=0.7.4",
+    "black==24.10.0",
+    "pre-commit>=3.6.0",
+    "mypy>=1.8.0",
+    "bandit[toml]>=1.7.7",
+    "types-redis>=4.6.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-v --tb=short"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W"]
+ignore = ["E501"]
+
+[tool.black]
+line-length = 100
+target-version = ["py311"]
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = false  # Disabled for gradual adoption
+warn_unused_configs = true
+ignore_missing_imports = true
+# Disable strict optional checks for gradual adoption
+strict_optional = false
+check_untyped_defs = false
+exclude = [
+    "tests/",
+    "build/",
+    "dist/",
+]
+
+[[tool.mypy.overrides]]
+module = "tests.*"
+ignore_errors = true
+
+# Gradual typing adoption - ignore errors in existing modules
+[[tool.mypy.overrides]]
+module = [
+    "src.mcp.*",
+    "src.utils.logger",
+    "src.core.problem_details",
+    "src.services.database",
+]
+ignore_errors = true
+
+[tool.bandit]
+exclude_dirs = ["tests", "build", "dist"]
+skips = ["B101"]  # Skip assert_used check (used in tests)
+
+[tool.bandit.assert_used]
+skips = ["*_test.py", "test_*.py"]
+
+[tool.coverage.run]
+source = ["src"]
+omit = ["tests/*", "*/__pycache__/*"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+    "if __name__ == .__main__.:",
+]
+
+[dependency-groups]
+dev = [
+    "mypy>=1.19.1",
+]

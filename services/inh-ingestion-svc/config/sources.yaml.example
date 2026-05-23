@@ -1,0 +1,19 @@
+# Sources configuration for scheduled ingestion
+sources:
+  - type: filesystem
+    path: ./data/sources
+    enabled: false
+    schedule: "0 */6 * * *"  # Every 6 hours
+
+  - type: gcs
+    bucket: your-bucket-name
+    prefix: documents/
+    enabled: false
+    schedule: "0 0 * * *"  # Daily at midnight
+
+# Global settings
+settings:
+  chunking_strategy: tokens
+  max_tokens: 512
+  overlap_tokens: 50
+  embedding_enabled: true

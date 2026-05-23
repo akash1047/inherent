@@ -1,0 +1,694 @@
+"""Read-only database service for PostgreSQL access.
+
+Supports two connection modes:
+1. Direct connection via DATABASE_URL (local development)
+2. Cloud SQL Python Connector (production on Cloud Run)
+
+The connection mode is determined by the USE_CLOUD_SQL_CONNECTOR setting.
+"""
+
+import hashlib
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from typing import TYPE_CHECKING, Any, AsyncGenerator
+
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+
+from src.config import settings
+from src.models.api_key import APIKeyInfo
+from src.models.document import Document, DocumentChunk
+from src.utils import get_logger
+
+if TYPE_CHECKING:
+    from google.cloud.sql.connector import Connector
+
+logger = get_logger(__name__)
+
+
+class DatabaseService:
+    """Read-only database service for PostgreSQL.
+
+    This service provides read-only access to the PostgreSQL database
+    for API key validation and document/chunk queries.
+
+    Connection Modes:
+        - Direct: Uses DATABASE_URL with asyncpg driver
+        - Cloud SQL: Uses Google Cloud SQL Python Connector with asyncpg driver
+
+    The Cloud SQL connector provides:
+        - Automatic SSL/TLS encryption
+        - IAM-based authentication (no passwords in connection string)
+        - Secure connection without exposing database ports
+    """
+
+    # Pool configuration - can be overridden via environment if needed
+    POOL_SIZE = 5
+    MAX_OVERFLOW = 10
+    POOL_TIMEOUT = 30
+    POOL_RECYCLE = 1800
+
+    def __init__(self) -> None:
+        """Initialize database service.
+
+        Engine creation is deferred to initialize() to support async context.
+        """
+        self.engine = None
+        self.session_factory = None
+        self._initialized = False
+        self._cloud_sql_connector: "Connector | None" = None
+
+    def _create_direct_engine(self):
+        """Create SQLAlchemy engine for direct PostgreSQL connection.
+
+        Used for local development with DATABASE_URL.
+        """
+        database_url = settings.database_url
+
+        # Convert postgresql:// to postgresql+asyncpg:// for async support
+        if database_url.startswith("postgresql://"):
+            database_url = database_url.replace("postgresql://", "postgresql+asyncpg://", 1)
+
+        logger.info(
+            "Creating direct database connection",
+            url=database_url.split("@")[-1] if "@" in database_url else "***",
+        )
+
+        return create_async_engine(
+            database_url,
+            pool_size=self.POOL_SIZE,
+            max_overflow=self.MAX_OVERFLOW,
+            pool_timeout=self.POOL_TIMEOUT,
+            pool_recycle=self.POOL_RECYCLE,
+            echo=False,
+        )
+
+    async def _create_cloud_sql_engine(self):
+        """Create SQLAlchemy async engine using Cloud SQL Python Connector.
+
+        Used for production deployment on Cloud Run.
+
+        The connector provides:
+            - Automatic SSL/TLS encryption
+            - Support for both IAM and password authentication
+            - Secure connection without exposing ports
+
+        Authentication modes:
+            - IAM auth (default): Uses service account, requires roles/cloudsql.client
+            - Password auth: Uses CLOUD_SQL_PASSWORD when CLOUD_SQL_USE_IAM_AUTH=false
+
+        Note: Uses create_async_connector() which properly integrates with the
+        current thread's running event loop, avoiding event loop mismatch errors.
+        """
+        try:
+            from google.cloud.sql.connector import create_async_connector
+        except ImportError as e:
+            raise ImportError(
+                "cloud-sql-python-connector is required for Cloud SQL connections. "
+                "Install with: pip install 'cloud-sql-python-connector[asyncpg]'"
+            ) from e
+
+        if not settings.cloud_sql_instance:
+            raise ValueError(
+                "CLOUD_SQL_INSTANCE must be set when USE_CLOUD_SQL_CONNECTOR=true. "
+                "Format: project:region:instance"
+            )
+
+        # Use create_async_connector() which uses the current thread's running event loop
+        # This avoids the "event loop does not match" error that occurs with Connector()
+        self._cloud_sql_connector = await create_async_connector()
+
+        use_iam_auth = settings.cloud_sql_use_iam_auth
+        password = settings.cloud_sql_password
+
+        # Determine authentication mode
+        if password and not use_iam_auth:
+            logger.info(
+                "Using Cloud SQL with password authentication (async)",
+                instance=settings.cloud_sql_instance,
+                database=settings.cloud_sql_database,
+                user=settings.cloud_sql_user,
+            )
+            auth_mode = "password"
+        else:
+            logger.info(
+                "Using Cloud SQL with IAM authentication (async)",
+                instance=settings.cloud_sql_instance,
+                database=settings.cloud_sql_database,
+                user=settings.cloud_sql_user,
+            )
+            auth_mode = "iam"
+
+        # Store these for use in the async creator
+        instance = settings.cloud_sql_instance
+        database = settings.cloud_sql_database
+        user = settings.cloud_sql_user
+        connector = self._cloud_sql_connector
+
+        async def getconn() -> Any:
+            """Async connection factory for Cloud SQL connector."""
+            connect_kwargs: dict[str, Any] = {
+                "user": user,
+                "db": database,
+            }
+
+            if auth_mode == "password":
+                connect_kwargs["password"] = password
+            else:
+                connect_kwargs["enable_iam_auth"] = True
+
+            conn = await connector.connect_async(
+                instance,
+                "asyncpg",
+                **connect_kwargs,
+            )
+            return conn
+
+        return create_async_engine(
+            "postgresql+asyncpg://",
+            async_creator=getconn,
+            pool_size=self.POOL_SIZE,
+            max_overflow=self.MAX_OVERFLOW,
+            pool_timeout=self.POOL_TIMEOUT,
+            pool_recycle=self.POOL_RECYCLE,
+            echo=False,
+        )
+
+    async def initialize(self) -> None:
+        """Initialize the database connection.
+
+        Creates the appropriate engine based on configuration:
+        - Cloud SQL connector when USE_CLOUD_SQL_CONNECTOR=true
+        - Direct asyncpg connection otherwise
+        """
+        if self._initialized:
+            return
+
+        try:
+            # Select connection mode based on settings
+            if settings.use_cloud_sql_connector:
+                self.engine = await self._create_cloud_sql_engine()
+            else:
+                self.engine = self._create_direct_engine()
+
+            self.session_factory = async_sessionmaker(
+                self.engine,
+                class_=AsyncSession,
+                expire_on_commit=False,
+            )
+
+            # Verify connection
+            async with self.engine.connect() as conn:
+                await conn.execute(text("SELECT 1"))
+
+            self._initialized = True
+            logger.info(
+                "Database connection established",
+                mode="cloud_sql" if settings.use_cloud_sql_connector else "direct",
+            )
+        except Exception as e:
+            logger.error("Failed to connect to database", error=str(e))
+            raise
+
+    async def close(self) -> None:
+        """Close the database connection and cleanup resources."""
+        if self.engine:
+            await self.engine.dispose()
+            self.engine = None
+
+        # Cleanup Cloud SQL connector if used (use close_async for async connector)
+        if self._cloud_sql_connector:
+            await self._cloud_sql_connector.close_async()
+            self._cloud_sql_connector = None
+
+        self.session_factory = None
+        self._initialized = False
+        logger.info("Database connection closed")
+
+    @asynccontextmanager
+    async def session(self) -> AsyncGenerator[AsyncSession, None]:
+        """Get a database session."""
+        async with self.session_factory() as session:
+            try:
+                yield session
+            finally:
+                await session.close()
+
+    # API Key validation
+    async def validate_api_key(self, api_key: str) -> APIKeyInfo | None:
+        """Validate an API key and return key info if valid."""
+        if not api_key or not api_key.startswith("ink_"):
+            return None
+
+        key_hash = hashlib.sha256(api_key.encode()).hexdigest()
+
+        async with self.session() as session:
+            result = await session.execute(
+                text(
+                    """
+                    SELECT key_id, user_id, workspace_id, permissions, rate_limit,
+                           expires_at, status
+                    FROM api_keys
+                    WHERE key_hash = :key_hash AND status = 'active'
+                """
+                ),
+                {"key_hash": key_hash},
+            )
+            row = result.fetchone()
+
+            if not row:
+                return None
+
+            # Check expiration
+            if row.expires_at and datetime.now(timezone.utc) > row.expires_at:
+                return None
+
+            # Update last_used_at (fire and forget style, don't block)
+            await session.execute(
+                text("UPDATE api_keys SET last_used_at = NOW() WHERE key_hash = :key_hash"),
+                {"key_hash": key_hash},
+            )
+            await session.commit()
+
+            return APIKeyInfo(
+                key_id=row.key_id,
+                user_id=row.user_id,
+                workspace_id=row.workspace_id,
+                permissions=row.permissions if isinstance(row.permissions, list) else [],
+                rate_limit=row.rate_limit,
+                expires_at=row.expires_at,
+                status=row.status,
+            )
+
+    # Document queries
+    async def get_documents(
+        self,
+        workspace_id: str,
+        page: int = 1,
+        page_size: int = 20,
+    ) -> tuple[list[Document], int]:
+        """Get documents for a workspace."""
+        offset = (page - 1) * page_size
+
+        async with self.session() as session:
+            # Get total count
+            count_result = await session.execute(
+                text(
+                    """
+                    SELECT COUNT(*) FROM processed_documents
+                    WHERE workspace_id = :workspace_id
+                """
+                ),
+                {"workspace_id": workspace_id},
+            )
+            total = count_result.scalar() or 0
+
+            # Get documents
+            result = await session.execute(
+                text(
+                    """
+                    SELECT document_id, original_filename, workspace_id,
+                           storage_backend, content_type,
+                           size_bytes, chunk_count, status,
+                           created_at, updated_at, metadata
+                    FROM processed_documents
+                    WHERE workspace_id = :workspace_id
+                    ORDER BY created_at DESC
+                    LIMIT :limit OFFSET :offset
+                """
+                ),
+                {"workspace_id": workspace_id, "limit": page_size, "offset": offset},
+            )
+            rows = result.fetchall()
+
+            documents = [
+                Document(
+                    id=str(row.document_id),
+                    name=row.original_filename,
+                    workspace_id=str(row.workspace_id),
+                    source_type=row.storage_backend,
+                    mime_type=row.content_type,
+                    size_bytes=row.size_bytes or 0,
+                    chunk_count=row.chunk_count or 0,
+                    status=row.status,
+                    created_at=row.created_at,
+                    updated_at=row.updated_at,
+                    metadata=row.metadata,
+                )
+                for row in rows
+            ]
+
+            return documents, total
+
+    async def get_document(self, document_id: str, workspace_id: str) -> Document | None:
+        """Get a single document."""
+        async with self.session() as session:
+            result = await session.execute(
+                text(
+                    """
+                    SELECT document_id, original_filename, workspace_id,
+                           storage_backend, content_type,
+                           size_bytes, chunk_count, status,
+                           created_at, updated_at, metadata
+                    FROM processed_documents
+                    WHERE document_id = :document_id AND workspace_id = :workspace_id
+                """
+                ),
+                {"document_id": document_id, "workspace_id": workspace_id},
+            )
+            row = result.fetchone()
+
+            if not row:
+                return None
+
+            return Document(
+                id=str(row.document_id),
+                name=row.original_filename,
+                workspace_id=str(row.workspace_id),
+                source_type=row.storage_backend,
+                mime_type=row.content_type,
+                size_bytes=row.size_bytes or 0,
+                chunk_count=row.chunk_count or 0,
+                status=row.status,
+                created_at=row.created_at,
+                updated_at=row.updated_at,
+                metadata=row.metadata,
+            )
+
+    async def get_document_chunks(self, document_id: str, workspace_id: str) -> list[DocumentChunk]:
+        """Get all chunks for a document."""
+        async with self.session() as session:
+            # First verify document belongs to workspace
+            doc_result = await session.execute(
+                text(
+                    """
+                    SELECT document_id FROM processed_documents
+                    WHERE document_id = :document_id AND workspace_id = :workspace_id
+                """
+                ),
+                {"document_id": document_id, "workspace_id": workspace_id},
+            )
+            if not doc_result.fetchone():
+                return []
+
+            result = await session.execute(
+                text(
+                    """
+                    SELECT id, document_id, content, chunk_index, token_count, metadata
+                    FROM document_chunks
+                    WHERE document_id = :document_id
+                    ORDER BY chunk_index ASC
+                """
+                ),
+                {"document_id": document_id},
+            )
+            rows = result.fetchall()
+
+            return [
+                DocumentChunk(
+                    id=str(row.id),
+                    document_id=str(row.document_id),
+                    content=row.content,
+                    chunk_index=row.chunk_index,
+                    token_count=row.token_count or 0,
+                    metadata=row.metadata,
+                )
+                for row in rows
+            ]
+
+    # User workspace queries
+    async def get_user_workspace_ids(self, user_id: str) -> list[str]:
+        """Get all workspace IDs the user has access to.
+
+        Truth source is the MongoDB ``workspaces`` collection (control plane,
+        owned by intg-svc). The previous implementation queried PostgreSQL's
+        ``processed_documents`` table — but that only knows about workspaces
+        that already have at least one ingested document. A brand-new
+        workspace (zero docs) was invisible to this check, producing a 403
+        on the user's first upload — a chicken-and-egg auth bug.
+
+        We also union with the PG-side workspaces (any workspace the user has
+        ever ingested into) as a defensive fallback for legacy data created
+        before the workspaces collection was canonical.
+        """
+        from src.services.mongo_client import get_mongo_client
+
+        ws_ids: set[str] = set()
+
+        # Primary: Mongo workspaces.user_id ownership (canonical).
+        # Mongoose stores ObjectId-typed refs as bson.ObjectId, not strings.
+        # We OR both shapes so the lookup is robust to either schema.
+        try:
+            from bson import ObjectId
+            from bson.errors import InvalidId
+
+            user_id_filters: list[dict[str, Any]] = [{"user_id": user_id}]
+            try:
+                user_id_filters.append({"user_id": ObjectId(user_id)})
+            except (InvalidId, TypeError, ValueError):
+                pass  # caller passed a non-ObjectId-shaped string; string match only
+
+            client = get_mongo_client()
+            db = client[settings.mongodb_db_name]
+            cursor = db["workspaces"].find({"$or": user_id_filters}, {"_id": 1})
+            async for doc in cursor:
+                ws_ids.add(str(doc["_id"]))
+        except Exception as exc:
+            logger.warning(
+                "mongo_workspace_lookup_failed",
+                user_id=user_id,
+                error=str(exc),
+            )
+
+        # Fallback: any workspace the user has uploaded to in PG. Catches
+        # legacy data + cushions a transient Mongo outage.
+        try:
+            async with self.session() as session:
+                result = await session.execute(
+                    text(
+                        """
+                        SELECT DISTINCT workspace_id
+                        FROM processed_documents
+                        WHERE user_id = :user_id
+                        """
+                    ),
+                    {"user_id": user_id},
+                )
+                for row in result.fetchall():
+                    ws_ids.add(str(row.workspace_id))
+        except Exception as exc:
+            logger.warning(
+                "pg_workspace_fallback_lookup_failed",
+                user_id=user_id,
+                error=str(exc),
+            )
+
+        return list(ws_ids)
+
+    # Multi-workspace document queries
+    async def get_documents_multi_workspace(
+        self,
+        workspace_ids: list[str],
+        page: int = 1,
+        page_size: int = 20,
+    ) -> tuple[list[Document], int]:
+        """Get documents across multiple workspaces."""
+        if not workspace_ids:
+            return [], 0
+
+        offset = (page - 1) * page_size
+
+        async with self.session() as session:
+            # Get total count
+            count_result = await session.execute(
+                text(
+                    """
+                    SELECT COUNT(*) FROM processed_documents
+                    WHERE workspace_id = ANY(:workspace_ids)
+                """
+                ),
+                {"workspace_ids": workspace_ids},
+            )
+            total = count_result.scalar() or 0
+
+            # Get documents
+            result = await session.execute(
+                text(
+                    """
+                    SELECT document_id, original_filename, workspace_id,
+                           storage_backend, content_type,
+                           size_bytes, chunk_count, status,
+                           created_at, updated_at, metadata
+                    FROM processed_documents
+                    WHERE workspace_id = ANY(:workspace_ids)
+                    ORDER BY created_at DESC
+                    LIMIT :limit OFFSET :offset
+                """
+                ),
+                {"workspace_ids": workspace_ids, "limit": page_size, "offset": offset},
+            )
+            rows = result.fetchall()
+
+            documents = [
+                Document(
+                    id=str(row.document_id),
+                    name=row.original_filename,
+                    workspace_id=str(row.workspace_id),
+                    source_type=row.storage_backend,
+                    mime_type=row.content_type,
+                    size_bytes=row.size_bytes or 0,
+                    chunk_count=row.chunk_count or 0,
+                    status=row.status,
+                    created_at=row.created_at,
+                    updated_at=row.updated_at,
+                    metadata=row.metadata,
+                )
+                for row in rows
+            ]
+
+            return documents, total
+
+    async def get_document_by_id(self, document_id: str) -> Document | None:
+        """Get a document by ID without workspace restriction (for user-scoped keys)."""
+        async with self.session() as session:
+            result = await session.execute(
+                text(
+                    """
+                    SELECT document_id, original_filename, workspace_id,
+                           storage_backend, content_type,
+                           size_bytes, chunk_count, status,
+                           created_at, updated_at, metadata
+                    FROM processed_documents
+                    WHERE document_id = :document_id
+                """
+                ),
+                {"document_id": document_id},
+            )
+            row = result.fetchone()
+
+            if not row:
+                return None
+
+            return Document(
+                id=str(row.document_id),
+                name=row.original_filename,
+                workspace_id=str(row.workspace_id),
+                source_type=row.storage_backend,
+                mime_type=row.content_type,
+                size_bytes=row.size_bytes or 0,
+                chunk_count=row.chunk_count or 0,
+                status=row.status,
+                created_at=row.created_at,
+                updated_at=row.updated_at,
+                metadata=row.metadata,
+            )
+
+    async def get_document_chunks_by_doc_id(self, document_id: str) -> list[DocumentChunk]:
+        """Get all chunks for a document by document ID only (for user-scoped keys)."""
+        async with self.session() as session:
+            result = await session.execute(
+                text(
+                    """
+                    SELECT id, document_id, content, chunk_index, token_count, metadata
+                    FROM document_chunks
+                    WHERE document_id = :document_id
+                    ORDER BY chunk_index ASC
+                """
+                ),
+                {"document_id": document_id},
+            )
+            rows = result.fetchall()
+
+            return [
+                DocumentChunk(
+                    id=str(row.id),
+                    document_id=str(row.document_id),
+                    content=row.content,
+                    chunk_index=row.chunk_index,
+                    token_count=row.token_count or 0,
+                    metadata=row.metadata,
+                )
+                for row in rows
+            ]
+
+    async def get_context_chunks(
+        self,
+        workspace_id: str,
+        ranges: list[tuple[str, int, int]],
+    ) -> list[DocumentChunk]:
+        """Fetch chunks whose (document_id, chunk_index) lies in any of the given ranges.
+
+        One batched query: one round-trip regardless of how many ranges are passed.
+        Indexed by uq_document_chunks_doc_idx constraint.
+        Empty ranges short-circuits — returns [] without a DB call.
+        """
+        if not ranges:
+            return []
+
+        clauses: list[str] = []
+        params: dict[str, object] = {"workspace_id": workspace_id}
+        for i, (doc_id, lo, hi) in enumerate(ranges):
+            clauses.append(f"(document_id = :doc_{i} AND chunk_index BETWEEN :lo_{i} AND :hi_{i})")
+            params[f"doc_{i}"] = doc_id
+            params[f"lo_{i}"] = lo
+            params[f"hi_{i}"] = hi
+
+        query = text(
+            f"""
+            SELECT id, document_id, chunk_index, content, token_count, metadata
+            FROM document_chunks
+            WHERE workspace_id = :workspace_id
+              AND ({" OR ".join(clauses)})
+            ORDER BY document_id, chunk_index
+            """
+        )
+
+        async with self.session() as session:
+            result = await session.execute(query, params)
+            rows = result.fetchall()
+
+        return [
+            DocumentChunk(
+                id=str(row.id),
+                document_id=str(row.document_id),
+                chunk_index=row.chunk_index,
+                content=row.content,
+                token_count=row.token_count or 0,
+                metadata=row.metadata,
+            )
+            for row in rows
+        ]
+
+
+# Singleton instance management
+_database: DatabaseService | None = None
+
+
+async def get_database() -> DatabaseService:
+    """Get the database service singleton instance.
+
+    Creates and initializes the database service on first call.
+    Subsequent calls return the same instance.
+
+    Returns:
+        Initialized DatabaseService instance
+
+    Raises:
+        Exception: If database connection fails
+    """
+    global _database
+    if _database is None:
+        _database = DatabaseService()
+        await _database.initialize()
+    return _database
+
+
+async def close_database() -> None:
+    """Close the database connection and cleanup resources.
+
+    Safe to call even if database was never initialized.
+    """
+    global _database
+    if _database is not None:
+        await _database.close()
+        _database = None

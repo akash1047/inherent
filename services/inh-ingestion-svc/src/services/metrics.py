@@ -1,0 +1,74 @@
+"""Prometheus metrics for the ingestion service.
+
+Provides counters, histograms, and gauges for monitoring ingestion
+workflows, HTTP requests, and database operations.
+"""
+
+from prometheus_client import Counter, Gauge, Histogram, generate_latest
+
+# ── HTTP Metrics ─────────────────────────────────────────────────────
+
+HTTP_REQUEST_COUNT = Counter(
+    "http_requests_total",
+    "Total number of HTTP requests",
+    ["method", "endpoint", "status_code"],
+)
+
+HTTP_REQUEST_LATENCY = Histogram(
+    "http_request_duration_seconds",
+    "HTTP request latency in seconds",
+    ["method", "endpoint"],
+    buckets=[0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0],
+)
+
+# ── Ingestion Workflow Metrics ───────────────────────────────────────
+
+WORKFLOW_RUNS_TOTAL = Counter(
+    "ingestion_workflow_runs_total",
+    "Total number of ingestion workflow runs",
+    ["status"],
+)
+
+WORKFLOW_DURATION = Histogram(
+    "ingestion_workflow_duration_seconds",
+    "Ingestion workflow duration in seconds",
+    buckets=[1.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0],
+)
+
+CHUNKS_CREATED_TOTAL = Counter(
+    "ingestion_chunks_created_total",
+    "Total number of chunks created by ingestion",
+)
+
+DOCUMENTS_PROCESSED_TOTAL = Counter(
+    "ingestion_documents_processed_total",
+    "Total number of documents processed",
+    ["content_type"],
+)
+
+# ── Database Metrics ─────────────────────────────────────────────────
+
+POSTGRES_QUERY_DURATION = Histogram(
+    "postgres_query_duration_seconds",
+    "PostgreSQL query latency in seconds",
+    ["operation"],
+    buckets=[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0],
+)
+
+WEAVIATE_WRITE_DURATION = Histogram(
+    "weaviate_write_duration_seconds",
+    "Weaviate write latency in seconds",
+    buckets=[0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0],
+)
+
+# ── Worker Metrics ───────────────────────────────────────────────────
+
+TEMPORAL_WORKER_RUNNING = Gauge(
+    "temporal_worker_running",
+    "Whether the Temporal worker is currently running (1=yes, 0=no)",
+)
+
+
+def get_metrics() -> bytes:
+    """Generate Prometheus metrics output."""
+    return generate_latest()

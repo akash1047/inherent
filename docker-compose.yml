@@ -1,0 +1,285 @@
+services:
+  postgres:
+    image: postgres:15
+    container_name: inherent-oss-postgres
+    restart: unless-stopped
+    ports:
+      - "15432:5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-knowledge_base}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - inherent-oss
+
+  postgres-init:
+    image: postgres:15
+    container_name: inherent-oss-postgres-init
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD:-postgres}
+    volumes:
+      - ./services/inh-ingestion-svc/scripts/migrations:/migrations:ro
+    command:
+      - /bin/sh
+      - -lc
+      - |
+        for migration in /migrations/*.sql; do
+          echo "Applying $${migration}"
+          psql -h postgres -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-knowledge_base} -v ON_ERROR_STOP=1 -f "$${migration}"
+        done
+    networks:
+      - inherent-oss
+    restart: "no"
+
+  mongodb:
+    image: mongo:7
+    container_name: inherent-oss-mongodb
+    restart: unless-stopped
+    ports:
+      - "27018:27017"
+    volumes:
+      - mongodb_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - inherent-oss
+
+  weaviate:
+    image: semitechnologies/weaviate:1.27.0
+    container_name: inherent-oss-weaviate
+    restart: unless-stopped
+    ports:
+      - "18080:8080"
+      - "15051:50051"
+    environment:
+      QUERY_DEFAULTS_LIMIT: 25
+      AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: "true"
+      PERSISTENCE_DATA_PATH: /var/lib/weaviate
+      DEFAULT_VECTORIZER_MODULE: none
+      ENABLE_MODULES: ""
+      CLUSTER_HOSTNAME: node1
+    volumes:
+      - weaviate_data:/var/lib/weaviate
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8080/v1/.well-known/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - inherent-oss
+
+  valkey:
+    image: valkey/valkey:8-alpine
+    container_name: inherent-oss-valkey
+    restart: unless-stopped
+    ports:
+      - "16379:6379"
+    command: valkey-server --appendonly yes --maxmemory 128mb --maxmemory-policy allkeys-lru
+    volumes:
+      - valkey_data:/data
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - inherent-oss
+
+  s3rver:
+    image: node:20-alpine
+    container_name: inherent-oss-s3rver
+    restart: unless-stopped
+    ports:
+      - "19000:9000"
+    command: npx s3rver -d /data -a 0.0.0.0 -p 9000 --no-vhost-buckets --configure-bucket inherent-documents
+    volumes:
+      - s3_data:/data
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:9000"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - inherent-oss
+
+  text-embeddings-inference:
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.6
+    platform: linux/amd64
+    container_name: inherent-oss-tei
+    restart: unless-stopped
+    ports:
+      - "18088:80"
+    command:
+      - "--model-id"
+      - "${EMBEDDING_MODEL_ID:-BAAI/bge-small-en-v1.5}"
+      - "--port"
+      - "80"
+    volumes:
+      - tei_cache:/data
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/80' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 90s
+    networks:
+      - inherent-oss
+
+  temporal:
+    image: temporalio/auto-setup:1.24.2
+    container_name: inherent-oss-temporal
+    restart: unless-stopped
+    ports:
+      - "17233:7233"
+    environment:
+      DB: postgres12
+      DB_PORT: 5432
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PWD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_SEEDS: postgres
+      DEFAULT_NAMESPACE: default
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "tctl --address $(hostname -i):7233 cluster health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks:
+      - inherent-oss
+
+  temporal-ui:
+    image: temporalio/ui:2.24.0
+    container_name: inherent-oss-temporal-ui
+    restart: unless-stopped
+    ports:
+      - "18233:8080"
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+    depends_on:
+      - temporal
+    networks:
+      - inherent-oss
+
+  inh-ingestion-svc:
+    build:
+      context: ./services/inh-ingestion-svc
+      dockerfile: Dockerfile
+    container_name: inherent-oss-ingestion
+    restart: unless-stopped
+    ports:
+      - "18002:8000"
+      - "19090:9090"
+    environment:
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-knowledge_base}
+      WEAVIATE_URL: http://weaviate:8080
+      MQ_BACKEND: redis
+      REDIS_URL: redis://valkey:6379
+      STORAGE_BACKEND: s3
+      STORAGE_BUCKET: ${AWS_S3_BUCKET:-inherent-documents}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-S3RVER}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-S3RVER}
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      AWS_S3_ENDPOINT: http://s3rver:9000
+      SERVICE_MODE: worker
+      TEMPORAL_ENABLED: "true"
+      TEMPORAL_HOST: temporal:7233
+      TEMPORAL_NAMESPACE: default
+      TEMPORAL_TASK_QUEUE: document-ingestion
+      INGESTION_API_KEY: ${INGESTION_API_KEY:-dev-ingestion-key}
+      API_HOST: 0.0.0.0
+      API_PORT: 8000
+      EMBEDDING_ENABLED: "true"
+      EMBEDDING_SERVICE_URL: http://text-embeddings-inference:80
+      EMBEDDING_DIM: 384
+      MONGODB_URI: mongodb://mongodb:27017
+      MONGODB_DB_NAME: main
+      LOG_LEVEL: INFO
+    depends_on:
+      postgres-init:
+        condition: service_completed_successfully
+      mongodb:
+        condition: service_healthy
+      weaviate:
+        condition: service_healthy
+      valkey:
+        condition: service_healthy
+      s3rver:
+        condition: service_healthy
+      temporal:
+        condition: service_healthy
+      text-embeddings-inference:
+        condition: service_healthy
+    networks:
+      - inherent-oss
+
+  inh-public-api-svc:
+    build:
+      context: ./services/inh-public-api-svc
+      dockerfile: Dockerfile
+    container_name: inherent-oss-public-api
+    restart: unless-stopped
+    ports:
+      - "18000:8080"
+      - "18001:8001"
+    environment:
+      SERVICE_MODE: both
+      PORT: 8080
+      MCP_PORT: 8001
+      ENVIRONMENT: development
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-knowledge_base}
+      MONGODB_URI: mongodb://mongodb:27017/main
+      MONGODB_DB_NAME: main
+      WEAVIATE_URL: http://weaviate:8080
+      MQ_REDIS_URL: redis://valkey:6379
+      REDIS_URL: redis://valkey:6379
+      AWS_S3_ENDPOINT: http://s3rver:9000
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-S3RVER}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-S3RVER}
+      AWS_S3_BUCKET: ${AWS_S3_BUCKET:-inherent-documents}
+      AWS_S3_REGION: ${AWS_REGION:-us-east-1}
+      EMBEDDING_SERVICE_URL: http://text-embeddings-inference:80
+      EMBEDDING_DIM: 384
+      LOG_LEVEL: INFO
+    depends_on:
+      postgres-init:
+        condition: service_completed_successfully
+      mongodb:
+        condition: service_healthy
+      weaviate:
+        condition: service_healthy
+      valkey:
+        condition: service_healthy
+      s3rver:
+        condition: service_healthy
+      text-embeddings-inference:
+        condition: service_healthy
+    networks:
+      - inherent-oss
+
+volumes:
+  postgres_data:
+  mongodb_data:
+  weaviate_data:
+  valkey_data:
+  s3_data:
+  tei_cache:
+
+networks:
+  inherent-oss:
+    driver: bridge
