@@ -12,7 +12,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, AsyncGenerator
 
-from sqlalchemy import text
+from sqlalchemy import and_, bindparam, column, or_, select, table, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from src.config import settings
@@ -625,22 +625,48 @@ class DatabaseService:
         if not ranges:
             return []
 
-        clauses: list[str] = []
+        document_chunks = table(
+            "document_chunks",
+            column("id"),
+            column("document_id"),
+            column("chunk_index"),
+            column("content"),
+            column("token_count"),
+            column("metadata"),
+            column("workspace_id"),
+        )
+
+        clauses = []
         params: dict[str, object] = {"workspace_id": workspace_id}
         for i, (doc_id, lo, hi) in enumerate(ranges):
-            clauses.append(f"(document_id = :doc_{i} AND chunk_index BETWEEN :lo_{i} AND :hi_{i})")
-            params[f"doc_{i}"] = doc_id
-            params[f"lo_{i}"] = lo
-            params[f"hi_{i}"] = hi
+            doc_param = f"doc_{i}"
+            lo_param = f"lo_{i}"
+            hi_param = f"hi_{i}"
+            clauses.append(
+                and_(
+                    document_chunks.c.document_id == bindparam(doc_param),
+                    document_chunks.c.chunk_index.between(
+                        bindparam(lo_param),
+                        bindparam(hi_param),
+                    ),
+                )
+            )
+            params[doc_param] = doc_id
+            params[lo_param] = lo
+            params[hi_param] = hi
 
-        query = text(
-            f"""
-            SELECT id, document_id, chunk_index, content, token_count, metadata
-            FROM document_chunks
-            WHERE workspace_id = :workspace_id
-              AND ({" OR ".join(clauses)})
-            ORDER BY document_id, chunk_index
-            """
+        query = (
+            select(
+                document_chunks.c.id,
+                document_chunks.c.document_id,
+                document_chunks.c.chunk_index,
+                document_chunks.c.content,
+                document_chunks.c.token_count,
+                document_chunks.c.metadata,
+            )
+            .where(document_chunks.c.workspace_id == bindparam("workspace_id"))
+            .where(or_(*clauses))
+            .order_by(document_chunks.c.document_id, document_chunks.c.chunk_index)
         )
 
         async with self.session() as session:

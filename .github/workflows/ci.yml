@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  service-checks:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - service: inh-ingestion-svc
+            path: services/inh-ingestion-svc
+            python-version: "3.11"
+            lint: uv run ruff check src tests
+            format: uv run black --check src tests
+            typecheck: ""
+            security: ""
+            test: uv run pytest
+          - service: inh-public-api-svc
+            path: services/inh-public-api-svc
+            python-version: "3.11"
+            lint: uv run ruff check src tests
+            format: uv run black --check src tests
+            typecheck: uv run mypy src
+            security: uv run bandit -c pyproject.toml -r src
+            test: uv run pytest
+
+    defaults:
+      run:
+        working-directory: ${{ matrix.path }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Install dependencies
+        run: uv sync --frozen --extra dev --group dev
+
+      - name: Lint
+        run: ${{ matrix.lint }}
+
+      - name: Format check
+        run: ${{ matrix.format }}
+
+      - name: Type check
+        if: ${{ matrix.typecheck }}
+        run: ${{ matrix.typecheck }}
+
+      - name: Security check
+        if: ${{ matrix.security }}
+        run: ${{ matrix.security }}
+
+      - name: Test
+        run: ${{ matrix.test }}

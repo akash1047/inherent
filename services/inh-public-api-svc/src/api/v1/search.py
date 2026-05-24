@@ -9,8 +9,10 @@ from src.services.audit_publisher import build_audit_event, publish_audit_event
 from src.services.auth import ResolvedAuth, resolve_workspace_search
 from src.services.database import get_database
 from src.services.search import SearchService, get_search_service
+from src.utils import get_logger
 
 router = APIRouter()
+logger = get_logger(__name__)
 
 
 def _build_result_snippets(results: list[SearchResult]) -> list[dict]:
@@ -49,8 +51,8 @@ def _compute_total_tokens(results: list[SearchResult]) -> int:
             from src.services.metrics import record_search_chunks_missing_token_count
 
             record_search_chunks_missing_token_count(missing)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("search_metric_record_failed", metric="missing_token_count", error=str(exc))
     return total
 
 
@@ -65,8 +67,8 @@ def _record_search_metrics(request: SearchRequest, workspace_id: str | None) -> 
         )
         if request.include_context:
             record_search_context_request(k=request.context_window)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("search_metric_record_failed", metric="search_request", error=str(exc))
 
 
 def _schedule_audit(

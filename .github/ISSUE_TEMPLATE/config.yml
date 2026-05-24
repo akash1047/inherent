@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security report
+    url: https://github.com/inherent-prime/inherent/security
+    about: Report vulnerabilities privately instead of opening a public issue.
+  - name: Support guidance
+    url: https://github.com/inherent-prime/inherent/blob/main/SUPPORT.md
+    about: Read the support routes before opening a new issue.

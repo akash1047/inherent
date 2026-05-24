@@ -236,7 +236,6 @@ services:
     restart: unless-stopped
     ports:
       - "18000:8080"
-      - "18001:8001"
     environment:
       SERVICE_MODE: both
       PORT: 8080

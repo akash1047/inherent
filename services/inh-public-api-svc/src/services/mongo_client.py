@@ -38,8 +38,8 @@ def get_mongo_client() -> AsyncIOMotorClient:
                 if _CLIENT is not None:
                     try:
                         _CLIENT.close()
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        logger.warning("mongo_client_close_failed", error=str(exc))
                 logger.info("mongo_client_initialized", uri_host=uri.split("@")[-1])
                 _CLIENT = AsyncIOMotorClient(uri, serverSelectionTimeoutMS=3000)
                 _CLIENT_URI = uri
@@ -52,6 +52,6 @@ async def close_mongo_client() -> None:
     if _CLIENT is not None:
         try:
             _CLIENT.close()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("mongo_client_close_failed", error=str(exc))
         _CLIENT = None

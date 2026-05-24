@@ -1,0 +1,6 @@
+* @inherent-prime
+
+/.github/ @inherent-prime
+/docs/ @inherent-prime
+/services/inh-ingestion-svc/ @inherent-prime
+/services/inh-public-api-svc/ @inherent-prime

@@ -152,10 +152,12 @@ class SearchService:
             #   normalised similarity. Fall back to certainty so semantic mode surfaces a
             #   non-zero, comparable relevance value to clients.
             def _to_float(value: object) -> float:
-                try:
-                    return float(value) if value is not None else 0.0
-                except (TypeError, ValueError):
-                    return 0.0
+                if isinstance(value, (int, float, str)):
+                    try:
+                        return float(value)
+                    except ValueError:
+                        return 0.0
+                return 0.0
 
             bm25_score = _to_float(additional.get("score"))
             certainty = _to_float(additional.get("certainty"))
