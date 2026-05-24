@@ -1,6 +1,6 @@
 <p align="center">
   <a href="https://inherent.sh/">
-    <img src="https://inherent.sh/opengraph-image?8c02d64eaf5fa1e4" alt="Inherent — Build your private company brain" width="100%" />
+    <img src="docs/imgs/Hero.png" alt="Inherent — Build your private company brain" width="100%" />
   </a>
 </p>
 
