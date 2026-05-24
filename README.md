@@ -1,16 +1,30 @@
+<p align="center">
+  <a href="https://inherent.sh/">
+    <img src="https://inherent.sh/opengraph-image?8c02d64eaf5fa1e4" alt="Inherent — Build your private company brain" width="100%" />
+  </a>
+</p>
+
+<p align="center">
+  <a href="https://inherent.sh/">Website</a> ·
+  <a href="https://docs.inherent.sh/">Docs</a> ·
+  <a href="https://inherent.sh/#pricing">Pricing</a> ·
+  <a href="https://inherent.sh/blog">Blog</a> ·
+  <a href="https://app.inherent.sh/">Try the Sandbox</a>
+</p>
+
 # Inherent
 
-Document ingestion and retrieval backend for building a RAG knowledge base.
+Build your private company brain.
 
-This repository turns raw documents into searchable knowledge.
+Inherent is the backend for turning company knowledge into something AI systems can actually query.
 
-Add files such as PDFs, DOCX, HTML, JSON, text, or CSV. The system extracts text, chunks it, generates embeddings, stores the results in PostgreSQL and Weaviate, and exposes an API for search and retrieval.
+You connect sources like PDFs, DOCX, HTML, JSON, text, CSV, code, and internal docs. Inherent extracts the content, chunks it, generates embeddings, stores it, and exposes retrieval over REST and MCP-friendly patterns.
 
-In practical terms, this is the backend layer of a RAG system: ingestion, indexing, storage, and retrieval.
+In practical terms, this repository is the ingestion, indexing, storage, and retrieval layer of a private RAG system.
 
 ## About
 
-Inherent is for teams that want to build search and question-answering workflows on top of their own documents without building the backend stack from scratch.
+Inherent is for teams that want their agents to answer from company context instead of guessing from general model knowledge.
 
 It gives you:
 
@@ -26,6 +40,13 @@ It gives you:
 - Run locally: the repo ships with a Compose stack for the required databases and supporting services.
 - Separate ingestion from retrieval: one service writes and indexes data, another serves search requests.
 - Build on standard components: FastAPI, PostgreSQL, Weaviate, Temporal, Redis/Valkey, and S3-compatible storage.
+
+## The Pitch
+
+- Your AI stops answering in the abstract and starts answering from your actual docs.
+- Retrieval is structured, repeatable, and citeable instead of relying on prompt copy-paste.
+- You keep a clean separation between data ingestion, indexing, and query serving.
+- The stack is understandable and self-hostable instead of being a black-box hosted dependency.
 
 ## Key Features
 
