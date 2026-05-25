@@ -52,7 +52,9 @@ def _compute_total_tokens(results: list[SearchResult]) -> int:
 
             record_search_chunks_missing_token_count(missing)
         except Exception as exc:
-            logger.debug("search_metric_record_failed", metric="missing_token_count", error=str(exc))
+            logger.debug(
+                "search_metric_record_failed", metric="missing_token_count", error=str(exc)
+            )
     return total
 
 
