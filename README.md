@@ -73,7 +73,7 @@ The repository is split into two main services:
 
 Local development uses Docker Compose for the supporting infrastructure:
 
-- PostgreSQL
+- PostgreSQL (v15)
 - MongoDB
 - Weaviate
 - Valkey
