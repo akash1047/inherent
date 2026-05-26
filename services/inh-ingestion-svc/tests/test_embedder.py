@@ -51,7 +51,7 @@ class _StubClient:
         # in tests can distinguish them.
         vecs = []
         for i, text in enumerate(inputs):
-            seed = (hash(text) % 7) + i + 1  # non-zero, deterministic, varies by input
+            seed = sum((pos + 1) * ord(char) for pos, char in enumerate(text)) + i + 1
             vecs.append([float(seed) / 1000.0] * self.dim)
         return _StubResponse(vecs)
 

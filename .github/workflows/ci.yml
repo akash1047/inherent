@@ -80,3 +80,19 @@ jobs:
 
       - name: Test
         run: ${{ matrix.test }}
+
+  required-tests:
+    name: Required tests before merge
+    runs-on: ubuntu-latest
+    needs:
+      - service-checks
+    if: always()
+    steps:
+      - name: Verify service checks passed
+        run: |
+          if [ "${{ needs.service-checks.result }}" != "success" ]; then
+            echo "::error::One or more service checks failed. Do not merge until CI is green."
+            exit 1
+          fi
+
+          echo "All service checks passed."

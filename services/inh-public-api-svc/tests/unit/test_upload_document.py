@@ -471,10 +471,10 @@ class TestUploadAllowedMimeTypes:
             "text/plain",
             "text/markdown",
             "text/csv",
+            "text/html",
             "application/pdf",
             "application/json",
             "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         ],
     )
     async def test_allowed_mime_types_accepted(
@@ -507,4 +507,40 @@ class TestUploadAllowedMimeTypes:
         assert (
             response.status_code == 201
         ), f"MIME {mime} should be accepted but got {response.status_code}"
+        application.dependency_overrides.clear()
+
+    async def test_xlsx_rejected_until_extraction_is_supported(
+        self, write_key, mock_db, mock_storage, mock_mq
+    ):
+        """Do not accept spreadsheet uploads until ingestion has an XLSX extractor."""
+        application = create_app()
+        application.dependency_overrides[get_api_key_info] = lambda: write_key
+        application.dependency_overrides[get_write_permission] = lambda: write_key
+        application.dependency_overrides[resolve_workspace_write] = lambda: ResolvedAuth(
+            key_info=write_key, workspace_id=write_key.workspace_id
+        )
+        application.dependency_overrides[get_database] = lambda: mock_db
+
+        with (
+            patch("src.api.v1.documents.get_storage_service", return_value=mock_storage),
+            patch(
+                "src.api.v1.documents.get_mq_service",
+                new_callable=AsyncMock,
+                return_value=mock_mq,
+            ),
+        ):
+            transport = ASGITransport(app=application)
+            async with AsyncClient(transport=transport, base_url="http://test") as ac:
+                response = await ac.post(
+                    "/v1/documents",
+                    files=_file_payload(
+                        filename="sheet.xlsx",
+                        content_type=(
+                            "application/vnd.openxmlformats-officedocument." "spreadsheetml.sheet"
+                        ),
+                    ),
+                    headers={"X-API-Key": "ink_test_key"},
+                )
+
+        assert response.status_code == 400
         application.dependency_overrides.clear()

@@ -83,10 +83,10 @@ ALLOWED_MIME_TYPES: Final[list[str]] = [
     "text/plain",
     "text/markdown",
     "text/csv",
+    "text/html",
     "application/pdf",
     "application/json",
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document",  # .docx
-    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",  # .xlsx
 ]
 
 # Search constraints
