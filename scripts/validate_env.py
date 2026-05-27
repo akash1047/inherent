@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """Validate local development environment against both service settings.
 
-Loads `.env` (if present), then attempts to instantiate the Settings classes
-from `inh-ingestion-svc` and `inh-public-api-svc`. Reports missing required
-values and a small set of cross-service consistency checks.
+Loads `.env` (if present) from the repository root, then attempts to
+instantiate the Settings classes from `inh-ingestion-svc` and
+`inh-public-api-svc`. Reports missing required values and a small set of
+cross-service consistency checks.
 
-Run from the repository root:
+Run from anywhere; the script resolves the repository root from its own
+location:
 
-    python scripts/validate_env.py
+    uv --project services/inh-ingestion-svc run python scripts/validate_env.py
 
 Exits non-zero when any blocking issue is found.
 """
@@ -40,6 +42,9 @@ CONTAINER_HOSTS = {
     "text-embeddings-inference",
 }
 
+ING_SERVICE_MODE_VALID = {"worker", "standalone"}
+PUB_SERVICE_MODE_VALID = {"api", "mcp", "both"}
+
 
 @dataclass
 class Report:
@@ -53,30 +58,77 @@ class Report:
         self.warnings.append(msg)
 
 
-def load_dotenv(path: Path) -> None:
-    """Minimal .env loader. Does not override existing environment values."""
+def _load_dotenv(path: Path) -> None:
+    """Load repository-root `.env` into os.environ.
+
+    Uses python-dotenv when available (it correctly handles quoted values
+    containing `#`, line continuations, export-prefixed lines, etc., which
+    is the same parser pydantic-settings uses inside the services). Falls
+    back to a minimal parser if python-dotenv is not importable, since the
+    script has no install-time guarantee outside a service venv.
+    """
     if not path.exists():
         return
+
+    try:
+        from dotenv import dotenv_values  # type: ignore[import-not-found]
+    except ImportError:
+        _load_dotenv_fallback(path)
+        return
+
+    for key, value in dotenv_values(path).items():
+        if value is None:
+            continue
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+def _load_dotenv_fallback(path: Path) -> None:
+    """Minimal best-effort parser used only when python-dotenv is unavailable.
+
+    Honors single- and double-quoted values so that `#` inside a quoted
+    string is preserved. Does not handle escapes or line continuations.
+    """
     for raw in path.read_text().splitlines():
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
+        if line.startswith("export "):
+            line = line[len("export ") :].lstrip()
         if "=" not in line:
             continue
         key, _, value = line.partition("=")
         key = key.strip()
-        value = value.split("#", 1)[0].strip().strip('"').strip("'")
+        value = value.strip()
+        if (len(value) >= 2) and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1]
+        else:
+            value = value.split("#", 1)[0].rstrip()
         if key and key not in os.environ:
             os.environ[key] = value
 
 
 def _import_settings_module(name: str, path: Path) -> Any:
+    """Import the service settings module with cwd pinned to REPO_ROOT.
+
+    Some service settings modules (notably inh-public-api-svc) instantiate
+    `settings = get_settings()` at import time. Pydantic-settings resolves
+    its configured `env_file=".env"` against the *current working directory*
+    at that moment. Pinning cwd to REPO_ROOT ensures any module-level
+    Settings() call reads the same .env we already loaded, instead of a
+    stray .env in the caller's cwd.
+    """
     spec = importlib.util.spec_from_file_location(name, path)
     if spec is None or spec.loader is None:
         raise ImportError(f"cannot load spec for {path}")
     module = importlib.util.module_from_spec(spec)
     sys.modules[name] = module
-    spec.loader.exec_module(module)
+    saved_cwd = os.getcwd()
+    try:
+        os.chdir(REPO_ROOT)
+        spec.loader.exec_module(module)
+    finally:
+        os.chdir(saved_cwd)
     return module
 
 
@@ -106,10 +158,9 @@ def _load_settings(
             return None
 
         try:
-            # Pass `_env_file=None` so pydantic-settings does NOT additionally
-            # load a stray `.env` from cwd. We have already loaded the canonical
-            # one from REPO_ROOT into os.environ, so the resolved cwd would
-            # silently override or mask values otherwise.
+            # `_env_file=None` prevents pydantic-settings from layering a
+            # cwd-relative `.env` on top of the REPO_ROOT/.env we already
+            # loaded into os.environ.
             return module.Settings(_env_file=None)  # type: ignore[call-arg]
         except Exception as exc:  # noqa: BLE001
             report.error(f"{name}: settings load failed:\n    {exc}")
@@ -123,7 +174,6 @@ def _check_host_reachability(name: str, url: str, report: Report) -> None:
     """Warn when URL points at a Compose-internal hostname while running on host."""
     if not url:
         return
-    # Normalize: urlparse needs a scheme to populate .hostname correctly.
     parsed = urlparse(url if "://" in url else f"//{url}", scheme="")
     host = (parsed.hostname or "").lower()
     if host in CONTAINER_HOSTS:
@@ -172,30 +222,40 @@ def _check_consistency(ing: Any, pub: Any, report: Report) -> None:
         )
 
 
+def _resolve_public_api_overrides(report: Report) -> dict[str, str | None]:
+    """Decide which env values to override before loading public-api Settings.
+
+    Only the documented `SERVICE_MODE` collision warrants an override:
+    a value that is valid for ingestion-svc but not for public-api-svc.
+    Any other value (including invalid garbage like 'not-a-mode') is left
+    alone so public-api's own Literal validation surfaces the real error
+    instead of being masked by a blanket override.
+    """
+    overrides: dict[str, str | None] = {}
+    sm = os.environ.get("SERVICE_MODE")
+    if sm and sm in ING_SERVICE_MODE_VALID and sm not in PUB_SERVICE_MODE_VALID:
+        overrides["SERVICE_MODE"] = "both"
+        report.warn(
+            f"SERVICE_MODE='{sm}' is valid for ingestion-svc but not public-api-svc "
+            f"(expects one of {sorted(PUB_SERVICE_MODE_VALID)}). The two services share "
+            "this env var name — in Compose they get separate values via per-service "
+            "`environment:` blocks. Validator will override SERVICE_MODE='both' when "
+            "loading public-api-svc."
+        )
+    return overrides
+
+
 def main() -> int:
     report = Report()
 
-    load_dotenv(REPO_ROOT / ".env")
-
-    ing_service_mode = os.environ.get("SERVICE_MODE")
-    ing_valid = {"worker", "standalone"}
-    pub_valid = {"api", "mcp", "both"}
-    if ing_service_mode and ing_service_mode in ing_valid and ing_service_mode in pub_valid:
-        pass  # no collision
-    elif ing_service_mode and ing_service_mode in ing_valid:
-        report.warn(
-            f"SERVICE_MODE='{ing_service_mode}' is valid for ingestion-svc but not public-api-svc "
-            f"(expects one of {sorted(pub_valid)}). The two services share this env var name — "
-            "in Compose they get separate values via per-service `environment:` blocks. Validator will "
-            "override SERVICE_MODE='both' when loading public-api-svc."
-        )
+    _load_dotenv(REPO_ROOT / ".env")
 
     ing = _load_settings("inh_ingestion_settings", INGESTION_SETTINGS, report)
     pub = _load_settings(
         "inh_public_api_settings",
         PUBLIC_API_SETTINGS,
         report,
-        env_overrides={"SERVICE_MODE": "both"},
+        env_overrides=_resolve_public_api_overrides(report),
     )
 
     if ing is not None:
