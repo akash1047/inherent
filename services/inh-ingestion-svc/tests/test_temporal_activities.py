@@ -134,6 +134,35 @@ class TestExtractTextActivity:
         written_text = mock_staging.write_text.call_args[0][1]
         assert '"key": "value"' in written_text
 
+    @patch("src.temporal.shared_services.get_staging_service")
+    @patch("src.temporal.shared_services.get_storage_service")
+    @pytest.mark.asyncio
+    async def test_extract_text_xlsx_raises_until_supported(
+        self, mock_get_storage, mock_get_staging
+    ):
+        """Spreadsheet binaries should fail explicitly until XLSX extraction exists."""
+        mock_storage = MagicMock()
+        mock_storage.read_file.return_value = b"PK\x03\x04fake workbook bytes"
+        mock_get_storage.return_value = mock_storage
+
+        mock_staging = MagicMock()
+        mock_get_staging.return_value = mock_staging
+
+        input_data = ExtractTextInput(
+            workflow_run_id="wf_xlsx",
+            storage_backend="local",
+            storage_path="sheet.xlsx",
+            content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            original_filename="sheet.xlsx",
+        )
+
+        from src.temporal.activities.extract import extract_text
+
+        with pytest.raises(RuntimeError, match="Unsupported spreadsheet"):
+            await extract_text(input_data)
+
+        mock_staging.write_text.assert_not_called()
+
     @patch("src.temporal.shared_services.get_storage_service")
     @pytest.mark.asyncio
     async def test_extract_text_azure_without_url_raises(self, mock_get_storage):

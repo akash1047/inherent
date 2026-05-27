@@ -111,6 +111,13 @@ async def _extract_text_inner(input: ExtractTextInput) -> ExtractTextOutput:
     elif "wordprocessingml" in content_type or filename.endswith((".docx", ".doc")):
         text = _extract_docx_text(content)
 
+    # Spreadsheet documents
+    elif "spreadsheetml" in content_type or filename.endswith((".xlsx", ".xls")):
+        raise RuntimeError(
+            "Unsupported spreadsheet document type. "
+            "Add an XLSX extractor before accepting spreadsheet uploads."
+        )
+
     # HTML files
     elif content_type == "text/html" or filename.endswith(".html"):
         text = _extract_html_text(content)
