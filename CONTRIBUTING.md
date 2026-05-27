@@ -39,6 +39,41 @@ cp .env.example .env
 docker compose up --build
 ```
 
+### Validating Your `.env`
+
+`.env.example` is the canonical reference for every env var the Compose stack
+and both services read. Values tagged `# LOCAL-ONLY` (e.g. `POSTGRES_PASSWORD`,
+`AWS_ACCESS_KEY_ID=S3RVER`, `INGESTION_API_KEY=dev-ingestion-key`) are
+development placeholders and must never be reused in production.
+
+To check a local `.env` against both service settings before starting Compose
+or running a service on the host, run from the repository root. The script
+imports both services' `Settings` classes, so it needs `pydantic` and
+`pydantic-settings` available. Use a service venv (or `uv run`):
+
+```bash
+# via uv (recommended — auto-resolves the venv)
+uv --project services/inh-ingestion-svc run python scripts/validate_env.py
+
+# or directly via the service venv
+services/inh-ingestion-svc/.venv/bin/python scripts/validate_env.py
+```
+
+If you see `cannot import (missing dependency 'pydantic')`, sync the venv
+first: `cd services/inh-ingestion-svc && uv sync --extra dev --group dev`.
+
+The script loads `.env` from the repository root (cwd does not matter),
+instantiates the `Settings` classes from both services, and reports:
+
+- missing required values (`DATABASE_URL`, `WEAVIATE_URL`)
+- cross-service inconsistencies (mismatched `EMBEDDING_DIM`, region drift,
+  MQ topic divergence, `SERVICE_MODE` literal collision)
+- URLs pointing at Compose-internal hostnames (`postgres`, `weaviate`, …),
+  which only resolve inside the Compose network; use the published host
+  ports listed in `.env.example` when running services on the host.
+
+Exits non-zero on any blocking issue (missing required vars, etc.).
+
 ## Pull Request Expectations
 
 - Explain the problem and the approach.

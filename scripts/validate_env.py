@@ -1,0 +1,226 @@
+#!/usr/bin/env python3
+"""Validate local development environment against both service settings.
+
+Loads `.env` (if present), then attempts to instantiate the Settings classes
+from `inh-ingestion-svc` and `inh-public-api-svc`. Reports missing required
+values and a small set of cross-service consistency checks.
+
+Run from the repository root:
+
+    python scripts/validate_env.py
+
+Exits non-zero when any blocking issue is found.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import os
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlparse
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+INGESTION_SETTINGS = (
+    REPO_ROOT / "services" / "inh-ingestion-svc" / "src" / "config" / "settings.py"
+)
+PUBLIC_API_SETTINGS = (
+    REPO_ROOT / "services" / "inh-public-api-svc" / "src" / "config" / "settings.py"
+)
+
+CONTAINER_HOSTS = {
+    "postgres",
+    "mongodb",
+    "weaviate",
+    "valkey",
+    "s3rver",
+    "temporal",
+    "text-embeddings-inference",
+}
+
+
+@dataclass
+class Report:
+    errors: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+
+    def error(self, msg: str) -> None:
+        self.errors.append(msg)
+
+    def warn(self, msg: str) -> None:
+        self.warnings.append(msg)
+
+
+def load_dotenv(path: Path) -> None:
+    """Minimal .env loader. Does not override existing environment values."""
+    if not path.exists():
+        return
+    for raw in path.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.split("#", 1)[0].strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+def _import_settings_module(name: str, path: Path) -> Any:
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load spec for {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_settings(
+    name: str,
+    path: Path,
+    report: Report,
+    env_overrides: dict[str, str | None] | None = None,
+) -> Any | None:
+    saved = os.environ.copy()
+    try:
+        for k, v in (env_overrides or {}).items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        try:
+            module = _import_settings_module(name, path)
+        except ModuleNotFoundError as exc:
+            report.error(
+                f"{name}: cannot import (missing dependency '{exc.name}'). "
+                "Install service deps first: cd services/<svc> && uv sync"
+            )
+            return None
+        except Exception as exc:  # noqa: BLE001
+            report.error(f"{name}: import failed: {exc}")
+            return None
+
+        try:
+            return module.Settings()  # type: ignore[call-arg]
+        except Exception as exc:  # noqa: BLE001
+            report.error(f"{name}: settings load failed:\n    {exc}")
+            return None
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
+
+
+def _check_host_reachability(name: str, url: str, report: Report) -> None:
+    """Warn when URL points at a Compose-internal hostname while running on host."""
+    if not url:
+        return
+    # Normalize: urlparse needs a scheme to populate .hostname correctly.
+    parsed = urlparse(url if "://" in url else f"//{url}", scheme="")
+    host = (parsed.hostname or "").lower()
+    if host in CONTAINER_HOSTS:
+        report.warn(
+            f"{name}={url} uses Compose-internal hostname '{host}'. "
+            "Only valid inside the docker-compose network. "
+            "Use the published host port (see .env.example) when running outside Compose."
+        )
+
+
+def _check_consistency(ing: Any, pub: Any, report: Report) -> None:
+    if ing is None or pub is None:
+        return
+
+    if ing.database_url and pub.database_url and ing.database_url != pub.database_url:
+        report.warn(
+            "DATABASE_URL differs between ingestion-svc and public-api-svc; both should "
+            "point at the same Postgres instance for local dev."
+        )
+
+    if ing.mongodb_uri and pub.mongodb_uri and ing.mongodb_uri.split("/")[2:3] != pub.mongodb_uri.split("/")[2:3]:
+        report.warn("MONGODB_URI host differs between services.")
+
+    pub_weaviate = pub.effective_weaviate_url
+    if ing.weaviate_url and pub_weaviate and ing.weaviate_url.rstrip("/") != pub_weaviate.rstrip("/"):
+        report.warn(
+            f"WEAVIATE_URL differs: ingestion={ing.weaviate_url}, public-api={pub_weaviate}."
+        )
+
+    if ing.s3_region and pub.aws_s3_region and ing.s3_region != pub.aws_s3_region:
+        report.warn(
+            f"AWS_REGION ({ing.s3_region}) and AWS_S3_REGION ({pub.aws_s3_region}) disagree. "
+            "Set both to the same value."
+        )
+
+    if ing.mq_upload_topic != pub.mq_topic_document_uploaded:
+        report.warn(
+            f"Upload topic mismatch: ingestion MQ_UPLOAD_TOPIC={ing.mq_upload_topic}, "
+            f"public-api MQ_TOPIC_DOCUMENT_UPLOADED={pub.mq_topic_document_uploaded}."
+        )
+
+    if ing.embedding_dim != pub.embedding_dim:
+        report.error(
+            f"EMBEDDING_DIM mismatch: ingestion={ing.embedding_dim}, public-api={pub.embedding_dim}. "
+            "Vectors written by ingestion will be unreadable by public-api search."
+        )
+
+
+def main() -> int:
+    report = Report()
+
+    load_dotenv(REPO_ROOT / ".env")
+
+    ing_service_mode = os.environ.get("SERVICE_MODE")
+    ing_valid = {"worker", "standalone"}
+    pub_valid = {"api", "mcp", "both"}
+    if ing_service_mode and ing_service_mode in ing_valid and ing_service_mode in pub_valid:
+        pass  # no collision
+    elif ing_service_mode and ing_service_mode in ing_valid:
+        report.warn(
+            f"SERVICE_MODE='{ing_service_mode}' is valid for ingestion-svc but not public-api-svc "
+            f"(expects one of {sorted(pub_valid)}). The two services share this env var name — "
+            "in Compose they get separate values via per-service `environment:` blocks. Validator will "
+            "override SERVICE_MODE='both' when loading public-api-svc."
+        )
+
+    ing = _load_settings("inh_ingestion_settings", INGESTION_SETTINGS, report)
+    pub = _load_settings(
+        "inh_public_api_settings",
+        PUBLIC_API_SETTINGS,
+        report,
+        env_overrides={"SERVICE_MODE": "both"},
+    )
+
+    if ing is not None:
+        _check_host_reachability("DATABASE_URL", ing.database_url, report)
+        _check_host_reachability("WEAVIATE_URL", ing.weaviate_url, report)
+        _check_host_reachability("REDIS_URL", ing.redis_url, report)
+        _check_host_reachability("MONGODB_URI", ing.mongodb_uri, report)
+        if ing.s3_endpoint:
+            _check_host_reachability("AWS_S3_ENDPOINT", ing.s3_endpoint, report)
+
+    _check_consistency(ing, pub, report)
+
+    if report.warnings:
+        print("WARNINGS:")
+        for w in report.warnings:
+            print(f"  - {w}")
+        print()
+
+    if report.errors:
+        print("ERRORS:")
+        for e in report.errors:
+            print(f"  - {e}")
+        print()
+        print(f"FAIL: {len(report.errors)} error(s), {len(report.warnings)} warning(s).")
+        return 1
+
+    print(f"OK: settings loaded. {len(report.warnings)} warning(s).")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
