@@ -106,7 +106,11 @@ def _load_settings(
             return None
 
         try:
-            return module.Settings()  # type: ignore[call-arg]
+            # Pass `_env_file=None` so pydantic-settings does NOT additionally
+            # load a stray `.env` from cwd. We have already loaded the canonical
+            # one from REPO_ROOT into os.environ, so the resolved cwd would
+            # silently override or mask values otherwise.
+            return module.Settings(_env_file=None)  # type: ignore[call-arg]
         except Exception as exc:  # noqa: BLE001
             report.error(f"{name}: settings load failed:\n    {exc}")
             return None
@@ -195,12 +199,27 @@ def main() -> int:
     )
 
     if ing is not None:
-        _check_host_reachability("DATABASE_URL", ing.database_url, report)
-        _check_host_reachability("WEAVIATE_URL", ing.weaviate_url, report)
-        _check_host_reachability("REDIS_URL", ing.redis_url, report)
-        _check_host_reachability("MONGODB_URI", ing.mongodb_uri, report)
+        _check_host_reachability("ingestion DATABASE_URL", ing.database_url, report)
+        _check_host_reachability("ingestion WEAVIATE_URL", ing.weaviate_url, report)
+        _check_host_reachability("ingestion REDIS_URL", ing.redis_url, report)
+        _check_host_reachability("ingestion MONGODB_URI", ing.mongodb_uri, report)
         if ing.s3_endpoint:
-            _check_host_reachability("AWS_S3_ENDPOINT", ing.s3_endpoint, report)
+            _check_host_reachability("ingestion AWS_S3_ENDPOINT", ing.s3_endpoint, report)
+
+    if pub is not None:
+        _check_host_reachability(
+            "public-api WEAVIATE_URL (effective)", pub.effective_weaviate_url, report
+        )
+        _check_host_reachability("public-api MQ_REDIS_URL", pub.mq_redis_url, report)
+        _check_host_reachability("public-api MONGODB_URI", pub.mongodb_uri, report)
+        if pub.aws_s3_endpoint:
+            _check_host_reachability(
+                "public-api AWS_S3_ENDPOINT", pub.aws_s3_endpoint, report
+            )
+        if pub.redis_url:
+            _check_host_reachability(
+                "public-api REDIS_URL (rate-limit)", pub.redis_url, report
+            )
 
     _check_consistency(ing, pub, report)
 
