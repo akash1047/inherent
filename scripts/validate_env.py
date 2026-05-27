@@ -42,7 +42,17 @@ CONTAINER_HOSTS = {
     "text-embeddings-inference",
 }
 
-ING_SERVICE_MODE_VALID = {"worker", "standalone"}
+# Values ingestion-svc accepts. The current modes are `worker` and `standalone`;
+# the others are legacy aliases that `inh-ingestion-svc/src/main.py` still maps
+# to `worker` at startup. Keep this in sync with `_MODE_ALIASES` in that module.
+ING_SERVICE_MODE_VALID = {
+    "worker",
+    "standalone",
+    "pubsub",
+    "temporal_worker",
+    "temporal_trigger",
+    "temporal_all",
+}
 PUB_SERVICE_MODE_VALID = {"api", "mcp", "both"}
 
 
@@ -263,6 +273,13 @@ def main() -> int:
         _check_host_reachability("ingestion WEAVIATE_URL", ing.weaviate_url, report)
         _check_host_reachability("ingestion REDIS_URL", ing.redis_url, report)
         _check_host_reachability("ingestion MONGODB_URI", ing.mongodb_uri, report)
+        _check_host_reachability(
+            "ingestion EMBEDDING_SERVICE_URL", ing.embedding_service_url, report
+        )
+        # TEMPORAL_HOST is a bare host:port (no scheme); _check_host_reachability
+        # handles that by prepending `//` when no scheme is present.
+        if ing.temporal_enabled:
+            _check_host_reachability("ingestion TEMPORAL_HOST", ing.temporal_host, report)
         if ing.s3_endpoint:
             _check_host_reachability("ingestion AWS_S3_ENDPOINT", ing.s3_endpoint, report)
 
@@ -272,6 +289,9 @@ def main() -> int:
         )
         _check_host_reachability("public-api MQ_REDIS_URL", pub.mq_redis_url, report)
         _check_host_reachability("public-api MONGODB_URI", pub.mongodb_uri, report)
+        _check_host_reachability(
+            "public-api EMBEDDING_SERVICE_URL", pub.embedding_service_url, report
+        )
         if pub.aws_s3_endpoint:
             _check_host_reachability(
                 "public-api AWS_S3_ENDPOINT", pub.aws_s3_endpoint, report
