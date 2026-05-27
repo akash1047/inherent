@@ -4,7 +4,10 @@ Ready-to-run curl snippets for every API endpoint. Use these to verify the stack
 
 ## Prerequisites
 
-Stack running locally. Verify:
+- Stack running locally (`docker compose up --build`)
+- [`jq`](https://jqlang.github.io/jq/) installed (used to pretty-print responses in all snippets)
+
+Verify stack is up:
 
 ```bash
 curl http://localhost:18000/health
@@ -179,7 +182,7 @@ curl -s -X POST "$API_BASE/v1/documents" \
   "document_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
   "name": "sample.txt",
   "workspace_id": "ws_local_001",
-  "storage_url": "s3://inherent-documents/workspaces/ws_local_001/sample.txt",
+  "storage_url": "s3://inherent-documents/ws_local_001/3fa85f64-5717-4562-b3fc-2c963f66afa6/sample.txt",
   "mime_type": "text/plain",
   "size_bytes": 842,
   "status": "pending",
@@ -270,7 +273,7 @@ curl -s "$API_BASE/v1/documents?page=1&page_size=5" \
   ],
   "total": 1,
   "page": 1,
-  "page_size": 20
+  "page_size": 5
 }
 ```
 
@@ -531,7 +534,7 @@ curl -s -X POST "$INGEST_BASE/ingest" \
     \"content_type\": \"text/plain\",
     \"size_bytes\": 842,
     \"storage_backend\": \"s3\",
-    \"storage_path\": \"workspaces/$WORKSPACE_ID/sample.txt\"
+    \"storage_path\": \"$WORKSPACE_ID/$DOC_ID/sample.txt\"
   }" \
   | jq .
 ```
