@@ -20,3 +20,5 @@ uploads/
 playwright-report/
 test-results/
 .DS_Store
+
+graphify-out/

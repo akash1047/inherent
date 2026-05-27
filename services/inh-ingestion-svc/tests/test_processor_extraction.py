@@ -84,6 +84,30 @@ class TestProcessorExtraction:
         assert text == "Some content"
 
     @pytest.mark.asyncio
+    async def test_extract_xlsx_returns_empty_until_supported(self, processor_settings):
+        """Legacy processor should not decode XLSX binaries as searchable text."""
+        processor = DocumentProcessor(processor_settings)
+        processor._initialized = True
+
+        message = DocumentUploadMessage(
+            event_type="document.uploaded",
+            document_id="doc1",
+            workspace_id="ws1",
+            user_id="u1",
+            filename="sheet.xlsx",
+            original_filename="sheet.xlsx",
+            content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            size_bytes=10,
+            storage_backend="local",
+            storage_path="path",
+            timestamp=datetime.now(UTC).isoformat() + "Z",
+        )
+
+        text = await processor._extract_text(b"PK\x03\x04fake workbook bytes", message)
+
+        assert text == ""
+
+    @pytest.mark.asyncio
     async def test_chunk_by_size_logic(self, processor_settings):
         """Test chunk by size logic details."""
         processor = DocumentProcessor(processor_settings)

@@ -352,6 +352,15 @@ class DocumentProcessor:
             if "wordprocessingml" in content_type or filename.endswith((".docx", ".doc")):
                 return self._extract_docx_text(content)
 
+            # Spreadsheet documents
+            if "spreadsheetml" in content_type or filename.endswith((".xlsx", ".xls")):
+                logger.warning(
+                    "Spreadsheet extraction is unsupported",
+                    content_type=content_type,
+                    filename=filename,
+                )
+                return ""
+
             # HTML files
             if content_type == "text/html" or filename.endswith(".html"):
                 return self._extract_html_text(content)
