@@ -1,0 +1,21 @@
+Inherent Knowledge Base — Sample Text Document
+
+This is a plain text file used to test document ingestion and retrieval.
+
+Section 1: Introduction
+Inherent is a backend system for turning company knowledge into something AI systems can query.
+It ingests documents, chunks them, generates embeddings, and exposes retrieval over REST and MCP.
+
+Section 2: Key Concepts
+- Workspace: an isolated namespace for documents and search
+- Document: a file uploaded and processed by the ingestion pipeline
+- Chunk: a segment of a document after text extraction and splitting
+- Embedding: a vector representation of a chunk used for semantic search
+
+Section 3: Supported Formats
+Inherent supports: plain text, Markdown, CSV, HTML, PDF, JSON, and DOCX.
+
+Section 4: Retrieval Modes
+- Semantic: nearText vector similarity search
+- Hybrid: BM25 keyword + vector fusion (tunable via alpha)
+- Keyword: BM25 full-text search only
