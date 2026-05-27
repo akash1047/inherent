@@ -1,0 +1,10 @@
+id,name,role,description,status
+svc-001,inh-ingestion-svc,ingestion,Processes uploaded documents and indexes them into PostgreSQL and Weaviate,active
+svc-002,inh-public-api-svc,retrieval,Serves REST API and MCP server for document search and retrieval,active
+dep-001,PostgreSQL,storage,Structured metadata and chunk storage for documents and workspaces,required
+dep-002,Weaviate,vector-index,Vector similarity search over document embeddings,required
+dep-003,Valkey,cache-and-queue,Message queue for upload events and rate-limit state store,required
+dep-004,MongoDB,document-store,Auxiliary document store for audit and supplementary data,required
+dep-005,Temporal,workflow,Orchestrates ingestion workflows with retry and visibility,required
+dep-006,s3rver,object-storage,S3-compatible object storage for raw uploaded files,required
+dep-007,hugging-face-tei,embeddings,Generates text embeddings for ingested chunks,required

@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Inherent Knowledge Base — Sample HTML Document</title>
+</head>
+<body>
+  <h1>Inherent Knowledge Base</h1>
+  <p>This HTML file is used to test ingestion and retrieval of web content.</p>
+
+  <h2>What Is Inherent?</h2>
+  <p>
+    Inherent is a backend for turning company knowledge into something AI systems can query.
+    Upload documents, let the ingestion pipeline extract and index them, then query via REST or MCP.
+  </p>
+
+  <h2>Supported Document Formats</h2>
+  <ul>
+    <li>Plain text (<code>.txt</code>)</li>
+    <li>Markdown (<code>.md</code>)</li>
+    <li>CSV (<code>.csv</code>)</li>
+    <li>HTML (<code>.html</code>)</li>
+    <li>PDF (<code>.pdf</code>)</li>
+    <li>JSON (<code>.json</code>)</li>
+    <li>DOCX (<code>.docx</code>)</li>
+  </ul>
+
+  <h2>Local Endpoints</h2>
+  <table>
+    <thead>
+      <tr><th>Service</th><th>URL</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Public API</td><td>http://localhost:18000</td></tr>
+      <tr><td>Ingestion API</td><td>http://localhost:18002</td></tr>
+      <tr><td>Temporal UI</td><td>http://localhost:18233</td></tr>
+      <tr><td>Weaviate</td><td>http://localhost:18080</td></tr>
+      <tr><td>S3-compatible storage</td><td>http://localhost:19000</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Authentication</h2>
+  <p>
+    All <code>/v1/</code> routes require an <code>X-API-Key</code> header.
+    Scope a request to a workspace by adding <code>X-Workspace-Id</code>.
+  </p>
+</body>
+</html>

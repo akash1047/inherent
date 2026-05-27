@@ -1,0 +1,41 @@
+{
+  "title": "Inherent Knowledge Base — Sample JSON Document",
+  "description": "Used to test ingestion and retrieval of structured JSON content.",
+  "version": "1.0.0",
+  "services": [
+    {
+      "name": "inh-ingestion-svc",
+      "role": "Document processing and indexing",
+      "modes": ["worker", "standalone"],
+      "dependencies": ["PostgreSQL", "Weaviate", "Valkey", "MongoDB", "Temporal"]
+    },
+    {
+      "name": "inh-public-api-svc",
+      "role": "REST API and MCP server for search and retrieval",
+      "modes": ["api", "mcp", "both"],
+      "dependencies": ["PostgreSQL", "Weaviate", "Valkey", "MongoDB"]
+    }
+  ],
+  "endpoints": {
+    "public_api": "http://localhost:18000",
+    "ingestion_api": "http://localhost:18002",
+    "temporal_ui": "http://localhost:18233",
+    "weaviate": "http://localhost:18080",
+    "s3": "http://localhost:19000"
+  },
+  "supported_mime_types": [
+    "text/plain",
+    "text/markdown",
+    "text/csv",
+    "text/html",
+    "application/pdf",
+    "application/json",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+  ],
+  "limits": {
+    "max_upload_size_bytes": 52428800,
+    "max_search_results": 100,
+    "default_search_results": 10,
+    "max_page_size": 100
+  }
+}

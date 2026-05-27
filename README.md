@@ -182,6 +182,8 @@ After the stack is up:
 - let the ingestion pipeline extract, chunk, and embed them
 - query the public API to search across the indexed content
 
+See [docs/examples/README.md](docs/examples/README.md) for ready-to-run curl snippets, sample documents, and expected response shapes.
+
 ## Local Endpoints
 
 - Public API: `http://localhost:18000`
