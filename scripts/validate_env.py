@@ -204,8 +204,16 @@ def _check_consistency(ing: Any, pub: Any, report: Report) -> None:
             "point at the same Postgres instance for local dev."
         )
 
-    if ing.mongodb_uri and pub.mongodb_uri and ing.mongodb_uri.split("/")[2:3] != pub.mongodb_uri.split("/")[2:3]:
-        report.warn("MONGODB_URI host differs between services.")
+    if ing.mongodb_uri and pub.mongodb_uri:
+        # Parse host with urlparse so we ignore auth, path, and query — a
+        # split("/")[2:3] approach would treat `mongodb://user:pass@host` and
+        # `mongodb://host` as different even when the underlying host matches.
+        ing_host = urlparse(ing.mongodb_uri).hostname
+        pub_host = urlparse(pub.mongodb_uri).hostname
+        if ing_host and pub_host and ing_host != pub_host:
+            report.warn(
+                f"MONGODB_URI host differs: ingestion={ing_host}, public-api={pub_host}."
+            )
 
     pub_weaviate = pub.effective_weaviate_url
     if ing.weaviate_url and pub_weaviate and ing.weaviate_url.rstrip("/") != pub_weaviate.rstrip("/"):
@@ -217,6 +225,15 @@ def _check_consistency(ing: Any, pub: Any, report: Report) -> None:
         report.warn(
             f"AWS_REGION ({ing.s3_region}) and AWS_S3_REGION ({pub.aws_s3_region}) disagree. "
             "Set both to the same value."
+        )
+
+    # Ingestion reads STORAGE_BUCKET; public-api reads AWS_S3_BUCKET. They are
+    # two different env vars pointing at the same physical bucket — drift means
+    # ingestion writes objects public-api will never find.
+    if ing.storage_bucket and pub.aws_s3_bucket and ing.storage_bucket != pub.aws_s3_bucket:
+        report.warn(
+            f"STORAGE_BUCKET ({ing.storage_bucket}) and AWS_S3_BUCKET ({pub.aws_s3_bucket}) "
+            "disagree. Ingestion would write to one bucket while public-api reads from another."
         )
 
     if ing.mq_upload_topic != pub.mq_topic_document_uploaded:
