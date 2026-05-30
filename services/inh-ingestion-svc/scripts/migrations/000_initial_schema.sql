@@ -262,11 +262,16 @@ LEFT JOIN workspace_metadata wm ON t.user_id = wm.user_id
 GROUP BY t.id, t.user_id, t.status, t.created_at, t.last_activity_at;
 
 -- ============================================
--- STEP 9: Grant permissions to ingestion_user
+-- STEP 9: Grant permissions to ingestion_user when that role exists
 -- ============================================
-GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO ingestion_user;
-GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO ingestion_user;
-GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public TO ingestion_user;
+DO $$
+BEGIN
+    IF to_regrole('ingestion_user') IS NOT NULL THEN
+        GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO ingestion_user;
+        GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO ingestion_user;
+        GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public TO ingestion_user;
+    END IF;
+END $$;
 
 -- Verification
 SELECT 'Schema created successfully' AS status;

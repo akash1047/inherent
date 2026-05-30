@@ -33,6 +33,7 @@ services:
       - /bin/sh
       - -lc
       - |
+        set -e
         for migration in /migrations/*.sql; do
           echo "Applying $${migration}"
           psql -h postgres -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-knowledge_base} -v ON_ERROR_STOP=1 -f "$${migration}"
