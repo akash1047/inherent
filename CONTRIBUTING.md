@@ -39,6 +39,29 @@ cp .env.example .env
 docker compose up --build
 ```
 
+## Codebase Graph (Graphify)
+
+Graphify output (`graphify-out/`) is local and generated — it is listed in `.gitignore` and must not be committed.
+
+Install once via:
+
+```bash
+uv tool install graphifyy
+```
+
+Code files are always extracted locally via tree-sitter (no API key needed). To build or refresh the graph:
+
+```bash
+graphify .          # full build
+graphify . --update # re-extract changed files only
+```
+
+To include semantic extraction of docs, PDFs, and images, set an API key before running:
+
+```bash
+ANTHROPIC_API_KEY=<your-key> graphify .
+```
+
 ### Validating Your `.env`
 
 `.env.example` is the canonical reference for every env var the Compose stack
