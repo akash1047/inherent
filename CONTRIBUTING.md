@@ -74,6 +74,30 @@ instantiates the `Settings` classes from both services, and reports:
 
 Exits non-zero on any blocking issue (missing required vars, etc.).
 
+## Codebase Graph (Graphify)
+
+Graphify output (`graphify-out/`) is local and generated — it is listed in `.gitignore` and must not be committed.
+
+Install once via `uv tool install graphifyy` (PyPI package name is `graphifyy` — double y; the CLI command is `graphify`):
+
+```bash
+uv tool install graphifyy
+```
+
+Code files are always extracted locally via tree-sitter (no API key needed). To build or refresh the graph:
+
+```bash
+graphify .          # full build
+graphify . --update # re-extract changed files only
+```
+
+To include semantic extraction of docs, PDFs, and images, export an API key before running:
+
+```bash
+export ANTHROPIC_API_KEY=<your-key>
+graphify .
+```
+
 ## Pull Request Expectations
 
 - Explain the problem and the approach.
