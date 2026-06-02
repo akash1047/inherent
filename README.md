@@ -162,27 +162,22 @@ curl -X POST http://localhost:18002/ingest \
 
 ## Quickstart
 
-1. Copy the example environment file:
+The Makefile is the shortest path for local development:
 
 ```bash
-cp .env.example .env
+make setup
+make validate
+make dev
+make health
 ```
 
-2. Build and start the local stack:
+This starts the stack in the background and seeds the local API key
+`ink_dev_local_key_001`.
 
-```bash
-docker compose up --build
-```
-
-3. Wait for the services to become healthy. The embeddings container can take longer than the rest on first boot.
-
-After the stack is up:
-
-- send documents into the ingestion service
-- let the ingestion pipeline extract, chunk, and embed them
-- query the public API to search across the indexed content
-
-See [docs/examples/README.md](docs/examples/README.md) for ready-to-run curl snippets, sample documents, and expected response shapes.
+Follow [Getting Started Locally](docs/getting-started/local.md) to upload a
+sample document, wait for ingestion, search indexed content, inspect logs, and
+reset your local stack. The [docs index](docs/README.md) is organized for
+agent-first discovery.
 
 ## Local Endpoints
 
@@ -217,7 +212,22 @@ See [services/inh-public-api-svc/Readme.md](services/inh-public-api-svc/Readme.m
 
 ## Development
 
-Each service is maintained as its own Python project. Install and run checks per service:
+Each service is maintained as its own Python project. From the repository root,
+use Makefile targets for the common checks:
+
+```bash
+make lint
+make format-check
+make test
+```
+
+Run the full local validation suite with:
+
+```bash
+make check
+```
+
+You can also run service-specific commands directly:
 
 ```bash
 cd services/inh-ingestion-svc
