@@ -228,7 +228,7 @@ Open the Temporal UI to inspect workflow history and identify failed activities:
 http://localhost:18233
 ```
 
-Or probe the Temporal frontend directly:
+Or list namespaces via the Temporal UI REST API:
 
 ```bash
 curl -s http://localhost:18233/api/v1/namespaces | jq .
@@ -253,13 +253,13 @@ curl -s "http://localhost:18080/v1/objects?limit=1" | jq .totalResults
 Ping Valkey from inside the Compose network:
 
 ```bash
-docker compose exec valkey redis-cli PING
+docker compose exec valkey valkey-cli PING
 ```
 
 List keys to check whether upload events were published:
 
 ```bash
-docker compose exec valkey redis-cli KEYS '*'
+docker compose exec valkey valkey-cli KEYS '*'
 ```
 
 ### PostgreSQL — document metadata missing
@@ -267,7 +267,7 @@ docker compose exec valkey redis-cli KEYS '*'
 Connect to the database and verify the schema exists:
 
 ```bash
-docker compose exec postgres psql -U inherent -d inherent -c '\dt'
+docker compose exec postgres psql -U postgres -d knowledge_base -c '\dt'
 ```
 
 The host port for external clients such as `psql` on the host is `localhost:15432`.
