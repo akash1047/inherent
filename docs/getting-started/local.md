@@ -221,32 +221,36 @@ curl -s http://localhost:19000
 ```
 
 If the container is up but uploads fail, the bucket may not have been created
-yet. The `postgres-init` container normally creates the required bucket on first
-boot. Check its exit status:
+yet. The `s3rver` container creates the `inherent-documents` bucket on startup
+via its `--configure-bucket` flag. Check its logs:
 
 ```bash
-docker compose ps postgres-init
-docker compose logs postgres-init
+docker compose logs s3rver
 ```
 
-If the bucket is missing, restart the init container:
+If the bucket is missing, recreate the container:
 
 ```bash
-docker compose restart postgres-init
+docker compose up -d --force-recreate s3rver
 ```
 
 ### PostgreSQL — migrations not applied
 
-The `postgres-init` container runs database migrations and S3 bucket setup on
-startup. If services report missing tables, check whether it completed
-successfully:
+The `postgres-init` container applies SQL migrations on startup. If services
+report missing tables, check whether it completed successfully:
+
+```bash
+docker compose ps postgres-init
+```
+
+A clean run exits with code `0`. If it shows a non-zero exit or is still
+running, check the logs:
 
 ```bash
 docker compose logs postgres-init
 ```
 
-A successful run ends with `All migrations applied`. If it exited with an error,
-restart it after the `postgres` container is healthy:
+Restart it after the `postgres` container is healthy:
 
 ```bash
 docker compose restart postgres-init
@@ -278,7 +282,8 @@ service first:
 ```bash
 # Example: force the embedding model to re-download (fixes a corrupt cache)
 docker compose stop text-embeddings-inference
-docker volume rm inherent-oss_tei_cache
+docker volume ls | grep tei_cache          # find the exact volume name
+docker volume rm <volume-name-from-above>
 docker compose up -d text-embeddings-inference
 ```
 

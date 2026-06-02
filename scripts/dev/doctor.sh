@@ -38,7 +38,7 @@ check_curl "weaviate          :18080" http://localhost:18080/v1/.well-known/read
 check_exec "valkey            :16379" valkey    valkey-cli ping
 check_curl "s3rver            :19000" http://localhost:19000 s3rver
 check_curl "text-embeddings   :18088" http://localhost:18088/health text-embeddings-inference
-check_curl "temporal-ui       :18233" http://localhost:18233/api/v1/namespaces temporal
+check_curl "temporal-ui       :18233" http://localhost:18233/api/v1/namespaces temporal-ui
 check_curl "inh-ingestion-svc :18002" http://localhost:18002/health inh-ingestion-svc
 check_curl "inh-public-api-svc:18000" http://localhost:18000/health inh-public-api-svc
 
