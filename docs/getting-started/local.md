@@ -220,6 +220,73 @@ make clean
 make dev
 ```
 
+### Temporal — workflow execution failures
+
+Open the Temporal UI to inspect workflow history and identify failed activities:
+
+```
+http://localhost:18233
+```
+
+Or probe the Temporal frontend directly:
+
+```bash
+curl -s http://localhost:18233/api/v1/namespaces | jq .
+```
+
+### Weaviate — vector store not indexing
+
+Check Weaviate readiness:
+
+```bash
+curl -s http://localhost:18080/v1/.well-known/ready
+```
+
+Confirm objects have been written:
+
+```bash
+curl -s "http://localhost:18080/v1/objects?limit=1" | jq .totalResults
+```
+
+### Valkey — event queue not delivering messages
+
+Ping Valkey from inside the Compose network:
+
+```bash
+docker compose exec valkey redis-cli PING
+```
+
+List keys to check whether upload events were published:
+
+```bash
+docker compose exec valkey redis-cli KEYS '*'
+```
+
+### PostgreSQL — document metadata missing
+
+Connect to the database and verify the schema exists:
+
+```bash
+docker compose exec postgres psql -U inherent -d inherent -c '\dt'
+```
+
+The host port for external clients such as `psql` on the host is `localhost:15432`.
+
+### Embedding service — embeddings not generated
+
+Check service health:
+
+```bash
+curl -s http://localhost:18088/health
+```
+
+If the service is not ready, it may still be downloading the model on first
+boot. Watch logs until `Ready` appears:
+
+```bash
+make logs SVC=text-embeddings-inference
+```
+
 ## Next Steps
 
 - Use [docs/examples/README.md](../examples/README.md) for endpoint-by-endpoint
