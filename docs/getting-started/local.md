@@ -172,6 +172,7 @@ curl -s "$API_BASE/v1/chunks/$DOC_ID/context" \
 | `make dev` | Start the stack in the background and seed the local API key. |
 | `make up` | Start the stack in the foreground. |
 | `make health` | Check public API and ingestion API health. |
+| `make doctor` | Check every service and print triage hints for failures. |
 | `make logs` | Follow all Compose logs. |
 | `make logs SVC=inh-public-api-svc` | Follow one service's logs. |
 | `make ps` | Show Compose service status. |
@@ -211,9 +212,77 @@ Then check the ingestion service logs:
 make logs SVC=inh-ingestion-svc
 ```
 
-### You want a clean local database
+### S3 — file upload or retrieval fails
 
-Remove Compose volumes and start again:
+Confirm the s3rver container is reachable:
+
+```bash
+curl -s http://localhost:19000
+```
+
+If the container is up but uploads fail, the bucket may not have been created
+yet. The `postgres-init` container normally creates the required bucket on first
+boot. Check its exit status:
+
+```bash
+docker compose ps postgres-init
+docker compose logs postgres-init
+```
+
+If the bucket is missing, restart the init container:
+
+```bash
+docker compose restart postgres-init
+```
+
+### PostgreSQL — migrations not applied
+
+The `postgres-init` container runs database migrations and S3 bucket setup on
+startup. If services report missing tables, check whether it completed
+successfully:
+
+```bash
+docker compose logs postgres-init
+```
+
+A successful run ends with `All migrations applied`. If it exited with an error,
+restart it after the `postgres` container is healthy:
+
+```bash
+docker compose restart postgres-init
+```
+
+To verify the schema directly:
+
+```bash
+docker compose exec postgres psql -U postgres -d knowledge_base -c '\dt'
+```
+
+### Deleting local volumes
+
+Use `make clean` (equivalent to `docker compose down -v`) only when you want a
+complete reset. All persistent data is destroyed.
+
+| Volume | Data destroyed |
+| --- | --- |
+| `postgres_data` | PostgreSQL tables — workspaces, API keys, document metadata |
+| `mongodb_data` | Raw document storage |
+| `weaviate_data` | Vector embeddings — re-ingest all documents to rebuild |
+| `valkey_data` | Redis stream offsets and cached state |
+| `s3_data` | Uploaded file blobs |
+| `tei_cache` | Downloaded embedding model — re-downloads on next start |
+
+To delete a single volume without stopping the whole stack, stop the relevant
+service first:
+
+```bash
+# Example: force the embedding model to re-download (fixes a corrupt cache)
+docker compose stop text-embeddings-inference
+docker volume rm inherent-oss_tei_cache
+docker compose up -d text-embeddings-inference
+```
+
+After `make clean`, run `make dev` to rebuild and reseed:
 
 ```bash
 make clean
