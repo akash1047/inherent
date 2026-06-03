@@ -179,6 +179,42 @@ sample document, wait for ingestion, search indexed content, inspect logs, and
 reset your local stack. The [docs index](docs/README.md) is organized for
 agent-first discovery.
 
+## Local Smoke Test
+
+After `make dev` succeeds, run these commands to verify the full document path
+works end-to-end:
+
+```bash
+export API_BASE="http://localhost:18000"
+export API_KEY="ink_dev_local_key_001"
+export WORKSPACE_ID="ws_local_001"
+
+# 1. Upload a sample document
+curl -s -X POST "$API_BASE/v1/documents" \
+  -H "X-API-Key: $API_KEY" \
+  -H "X-Workspace-Id: $WORKSPACE_ID" \
+  -F "file=@docs/examples/sample-documents/sample.txt;type=text/plain" \
+  | tee /tmp/inherent-upload.json | jq .
+
+export DOC_ID="$(jq -r .document_id /tmp/inherent-upload.json)"
+
+# 2. Poll until status is "processed" (re-run until you see "processed")
+curl -s "$API_BASE/v1/documents/$DOC_ID" \
+  -H "X-API-Key: $API_KEY" \
+  -H "X-Workspace-Id: $WORKSPACE_ID" | jq .status
+
+# 3. Search the indexed document
+curl -s -X POST "$API_BASE/v1/search" \
+  -H "X-API-Key: $API_KEY" \
+  -H "X-Workspace-Id: $WORKSPACE_ID" \
+  -H "Content-Type: application/json" \
+  -d '{"query":"what retrieval modes does Inherent support","limit":3}' | jq .
+```
+
+A non-empty `results` array in the search response confirms the full path is
+healthy. See [Getting Started Locally](docs/getting-started/local.md) for the
+complete walkthrough and per-service troubleshooting.
+
 ## Local Endpoints
 
 - Public API: `http://localhost:18000`
