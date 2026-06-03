@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := help
 
-.PHONY: help setup env install validate up dev down restart ps logs health seed dev-seed check test lint format-check type-check security-check clean
+.PHONY: help setup env install validate up dev down restart ps logs health doctor seed dev-seed check test lint format-check type-check security-check clean
 
 COMPOSE              ?= docker compose
 PUBLIC_API_URL       ?= http://localhost:18000
@@ -79,6 +79,10 @@ health:
 	@printf "\n"
 	@curl -fsS $(INGESTION_API_URL)/health
 	@printf "\n"
+
+## doctor: Check health of every local service and print triage hints on failure.
+doctor:
+	@bash scripts/dev/doctor.sh
 
 ## seed: Insert a local development API key into PostgreSQL.
 ##       Safe to re-run. Key value: ink_dev_local_key_001
