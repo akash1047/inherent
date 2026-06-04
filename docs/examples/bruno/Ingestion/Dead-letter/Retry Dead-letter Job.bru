@@ -1,0 +1,22 @@
+meta {
+  name: Retry Dead-letter Job
+  type: http
+  seq: 3
+}
+
+post {
+  url: {{ingest_base}}/dead-letter/1/retry
+  body: none
+  auth: inherit
+}
+
+tests {
+  test("status is 200, 404 (not found), 409 (bad status), or 500 (retry failed)", function() {
+    expect([200, 404, 409, 500]).to.include(res.status);
+  });
+}
+
+docs {
+  Retry a dead-letter job by re-publishing its original message. Only jobs with status `pending`
+  or `retrying` can be retried (else 409). 404 if missing, 500 if the re-trigger fails.
+}

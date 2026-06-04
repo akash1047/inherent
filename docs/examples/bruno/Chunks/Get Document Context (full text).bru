@@ -1,0 +1,26 @@
+meta {
+  name: Get Document Context (full text)
+  type: http
+  seq: 2
+}
+
+get {
+  url: {{api_base}}/v1/chunks/{{document_id}}/context
+  body: none
+  auth: inherit
+}
+
+headers {
+  X-Workspace-Id: {{workspace_id}}
+}
+
+tests {
+  test("status is 200", function() {
+    expect(res.status).to.equal(200);
+  });
+}
+
+docs {
+  Returns document metadata + all chunks combined into `full_text`. For MCP-style full-document
+  context retrieval.
+}

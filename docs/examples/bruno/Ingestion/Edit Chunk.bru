@@ -1,0 +1,28 @@
+meta {
+  name: Edit Chunk
+  type: http
+  seq: 4
+}
+
+patch {
+  url: {{ingest_base}}/chunks/{{document_id}}/0
+  body: json
+  auth: inherit
+}
+
+body:json {
+  {
+    "content": "Updated chunk text goes here."
+  }
+}
+
+tests {
+  test("status is 200, 409 (in progress), or 500 (failed)", function() {
+    expect([200, 409, 500]).to.include(res.status);
+  });
+}
+
+docs {
+  Edit chunk #0 via a Temporal workflow (updates PostgreSQL + re-embeds in Weaviate). Replace the
+  trailing `0` with the target chunk index. 409 if an edit is already in progress, 500 if it fails.
+}

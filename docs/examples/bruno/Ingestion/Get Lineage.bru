@@ -1,0 +1,22 @@
+meta {
+  name: Get Lineage
+  type: http
+  seq: 5
+}
+
+get {
+  url: {{ingest_base}}/lineage/{{document_id}}
+  body: none
+  auth: inherit
+}
+
+tests {
+  test("status is 200", function() {
+    expect(res.status).to.equal(200);
+  });
+}
+
+docs {
+  Get data lineage for a document: an ordered list of ingestion pipeline step events. Returns
+  `{ document_id, events: [...] }`.
+}

@@ -1,0 +1,30 @@
+meta {
+  name: List Documents
+  type: http
+  seq: 2
+}
+
+get {
+  url: {{api_base}}/v1/documents?page=1&page_size=5
+  body: none
+  auth: inherit
+}
+
+params:query {
+  page: 1
+  page_size: 5
+}
+
+headers {
+  X-Workspace-Id: {{workspace_id}}
+}
+
+tests {
+  test("status is 200", function() {
+    expect(res.status).to.equal(200);
+  });
+}
+
+docs {
+  List documents in the workspace with pagination.
+}

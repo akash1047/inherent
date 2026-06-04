@@ -1,0 +1,40 @@
+meta {
+  name: Trigger Ingestion (wait for result)
+  type: http
+  seq: 2
+}
+
+post {
+  url: {{ingest_base}}/ingest?wait=true
+  body: json
+  auth: inherit
+}
+
+params:query {
+  wait: true
+}
+
+body:json {
+  {
+    "document_id": "{{document_id}}",
+    "workspace_id": "{{workspace_id}}",
+    "user_id": "{{user_id}}",
+    "filename": "sample.txt",
+    "original_filename": "sample.txt",
+    "content_type": "text/plain",
+    "size_bytes": 842,
+    "storage_backend": "s3",
+    "storage_path": "{{workspace_id}}/{{document_id}}/sample.txt"
+  }
+}
+
+tests {
+  test("status is 200 (completed) or 409 (already running)", function() {
+    expect([200, 409]).to.include(res.status);
+  });
+}
+
+docs {
+  Same as Trigger Ingestion but blocks until the workflow finishes and returns **200 OK** with the
+  full result (`success`, `chunks_created`, `processing_time_ms`).
+}
