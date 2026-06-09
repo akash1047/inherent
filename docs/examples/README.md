@@ -1,6 +1,6 @@
 # Inherent — Request Examples
 
-Ready-to-run curl snippets for every API endpoint. Use these to verify the stack after `docker compose up --build`, reproduce bugs, or explore the API.
+Use Inherent to make your documents searchable, run queries over your knowledge base, and manage indexed content via REST. This page maps common user goals to the API calls that accomplish them, then gives ready-to-run curl snippets for every endpoint.
 
 Prefer a GUI? The same endpoints are also available as a [Postman Collection](#postman-collection) and a [Bruno Collection](#bruno-collection) alongside this file.
 
@@ -39,6 +39,22 @@ export API_KEY="ink_dev_local_key_001"  # created by make dev-seed
 export WORKSPACE_ID="ws_local_001"      # matches workspace seeded above
 export INGEST_KEY="dev-ingestion-key"   # set via INGESTION_API_KEY in docker-compose
 ```
+
+---
+
+## Common Workflows
+
+Not sure which endpoint to call? Start here.
+
+| Goal | What to call |
+|------|-------------|
+| Make a document searchable | [Upload](#2-upload-a-document) → [Trigger ingestion](#7-trigger-ingestion-manually) → [Poll status](#8-get-ingestion-status) |
+| Search your knowledge base | [Search](#5-search) — semantic (default), hybrid, or keyword |
+| Inspect indexed content | [Fetch chunks](#6-fetch-chunks) — list chunks or get the full reconstructed text |
+| Fix or refine a chunk | [Edit a chunk](#9-edit-a-chunk) — replaces content and re-embeds in Weaviate |
+| Debug why a document wasn't indexed | [Ingestion status](#8-get-ingestion-status) → [Lineage](#10-document-lineage) → [Dead-letter jobs](#12-dead-letter-jobs) |
+| Retry a failed ingestion | [Dead-letter jobs → Retry](#12-dead-letter-jobs) |
+| Remove a document | [Delete a document](#11-delete-a-document) — clears PostgreSQL and Weaviate |
 
 ---
 
@@ -101,6 +117,8 @@ curl -s "$INGEST_BASE/health" | jq .
 ---
 
 ## 2. Upload a Document
+
+Upload registers a file in storage and queues it for ingestion. The returned `document_id` is what every other endpoint uses to reference this document.
 
 Allowed MIME types: `text/plain`, `text/markdown`, `text/csv`, `text/html`,
 `application/pdf`, `application/json`,
@@ -238,6 +256,8 @@ curl -s -X POST "$API_BASE/v1/documents" \
 
 ## 3. List Documents
 
+Lists all documents in your workspace. The `status` field shows whether a document is still in the pipeline (`pending`) or ready to search (`processed`).
+
 ```bash
 curl -s "$API_BASE/v1/documents" \
   -H "X-API-Key: $API_KEY" \
@@ -283,6 +303,8 @@ curl -s "$API_BASE/v1/documents?page=1&page_size=5" \
 
 ## 4. Get Document by ID
 
+Check a single document's current status and metadata. Use this to poll until `status` is `processed` before running a search.
+
 ```bash
 curl -s "$API_BASE/v1/documents/$DOC_ID" \
   -H "X-API-Key: $API_KEY" \
@@ -326,6 +348,8 @@ curl -s "$API_BASE/v1/documents/does-not-exist" \
 ---
 
 ## 5. Search
+
+Query your indexed knowledge base. Semantic search matches by meaning (default); hybrid blends semantic and keyword scoring; keyword matches exact terms. All modes return ranked chunks with relevance scores.
 
 Wait for ingestion to complete (`status: "processed"` in list/get) before searching.
 
@@ -450,6 +474,8 @@ curl -s -X POST "$API_BASE/v1/search" \
 ---
 
 ## 6. Fetch Chunks
+
+View the individual text segments Inherent split your document into. Use the context endpoint to get all chunks reassembled into the full document text in one call.
 
 ### List all chunks for a document
 

@@ -115,6 +115,8 @@ Local development uses Docker Compose for the supporting infrastructure:
 
 ## Typical Flow
 
+From a user perspective: you upload a file, Inherent processes it in the background, and it becomes searchable. Here is what happens under the hood:
+
 1. A document is uploaded or queued for ingestion.
 2. The ingestion service extracts text and splits it into chunks.
 3. Embeddings are generated for those chunks.
@@ -135,7 +137,7 @@ You can also verify the ingestion API:
 curl http://localhost:18002/health
 ```
 
-To trigger ingestion manually in a local setup:
+To trigger ingestion manually in a local setup (the public API handles this automatically when you upload — this direct call is for re-ingestion or debugging):
 
 ```bash
 curl -X POST http://localhost:18002/ingest \
