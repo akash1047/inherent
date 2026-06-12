@@ -1,0 +1,28 @@
+meta {
+  name: Delete Document
+  type: http
+  seq: 6
+}
+
+delete {
+  url: {{ingest_base}}/documents/{{document_id}}?workspace_id={{workspace_id}}&user_id={{user_id}}
+  body: none
+  auth: inherit
+}
+
+params:query {
+  workspace_id: {{workspace_id}}
+  user_id: {{user_id}}
+}
+
+tests {
+  test("status is 200 or 404 (not found)", function() {
+    expect([200, 404]).to.include(res.status);
+  });
+}
+
+docs {
+  DESTRUCTIVE. Deletes the document from PostgreSQL and its chunks from Weaviate. Both
+  `workspace_id` and `user_id` query params are required. Weaviate cleanup is best-effort
+  (`weaviate_cleaned=false` if it fails). 404 if the document is not in PostgreSQL.
+}

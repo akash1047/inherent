@@ -1,0 +1,10 @@
+meta {
+  name: Dead-letter
+  seq: 7
+}
+
+docs {
+  Inspect and recover failed ingestion jobs. List/get are read-only; retry re-publishes the
+  original message; abandon marks a job permanently dead. Inherits the Ingestion folder's
+  `{{ingest_key}}` auth.
+}

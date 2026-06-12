@@ -1,0 +1,28 @@
+meta {
+  name: List Dead-letter Jobs
+  type: http
+  seq: 1
+}
+
+get {
+  url: {{ingest_base}}/dead-letter?status=pending&limit=50
+  body: none
+  auth: inherit
+}
+
+params:query {
+  status: pending
+  limit: 50
+  ~workspace_id: {{workspace_id}}
+}
+
+tests {
+  test("status is 200", function() {
+    expect(res.status).to.equal(200);
+  });
+}
+
+docs {
+  List dead-letter jobs. Optional filters: `workspace_id`, `status` (default `pending`),
+  `limit` (1–200, default 50).
+}

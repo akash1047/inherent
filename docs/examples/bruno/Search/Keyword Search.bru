@@ -1,0 +1,33 @@
+meta {
+  name: Keyword Search
+  type: http
+  seq: 3
+}
+
+post {
+  url: {{api_base}}/v1/search
+  body: json
+  auth: inherit
+}
+
+headers {
+  X-Workspace-Id: {{workspace_id}}
+}
+
+body:json {
+  {
+    "query": "Weaviate PostgreSQL",
+    "limit": 5,
+    "search_mode": "keyword"
+  }
+}
+
+tests {
+  test("status is 200", function() {
+    expect(res.status).to.equal(200);
+  });
+}
+
+docs {
+  Keyword (BM25) search.
+}

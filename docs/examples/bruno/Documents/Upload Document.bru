@@ -1,0 +1,38 @@
+meta {
+  name: Upload Document
+  type: http
+  seq: 1
+}
+
+post {
+  url: {{api_base}}/v1/documents
+  body: multipartForm
+  auth: inherit
+}
+
+headers {
+  X-Workspace-Id: {{workspace_id}}
+}
+
+body:multipart-form {
+  file: @file(../sample-documents/sample.txt)
+}
+
+script:post-response {
+  if (res.status === 201 && res.body && res.body.document_id) {
+    bru.setEnvVar("document_id", res.body.document_id);
+    console.log("Saved document_id =", res.body.document_id);
+  }
+}
+
+tests {
+  test("status is 201", function() {
+    expect(res.status).to.equal(201);
+  });
+}
+
+docs {
+  Upload a document (multipart/form-data). Returns 201 with `document_id`, `status: pending`.
+  The post-response script saves `document_id` to the environment. Swap the file path for any
+  allowed type (txt, md, csv, html, pdf, json, docx; max 50 MB).
+}

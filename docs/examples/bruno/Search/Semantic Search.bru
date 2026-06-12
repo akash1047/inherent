@@ -1,0 +1,32 @@
+meta {
+  name: Semantic Search
+  type: http
+  seq: 1
+}
+
+post {
+  url: {{api_base}}/v1/search
+  body: json
+  auth: inherit
+}
+
+headers {
+  X-Workspace-Id: {{workspace_id}}
+}
+
+body:json {
+  {
+    "query": "what retrieval modes does Inherent support",
+    "limit": 5
+  }
+}
+
+tests {
+  test("status is 200", function() {
+    expect(res.status).to.equal(200);
+  });
+}
+
+docs {
+  Default semantic (vector) search. Wait until documents are `processed` before searching.
+}

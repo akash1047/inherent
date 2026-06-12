@@ -1,0 +1,20 @@
+meta {
+  name: Ingestion
+  seq: 5
+}
+
+auth {
+  mode: apikey
+}
+
+auth:apikey {
+  key: X-API-Key
+  value: {{ingest_key}}
+  placement: header
+}
+
+docs {
+  Write/admin plane on the ingestion service ({{ingest_base}}). Authenticates with
+  `X-API-Key = {{ingest_key}}` (set here, inherited by every request in this folder) and takes no
+  workspace header.
+}

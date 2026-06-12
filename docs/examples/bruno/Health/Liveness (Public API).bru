@@ -1,0 +1,21 @@
+meta {
+  name: Liveness (Public API)
+  type: http
+  seq: 1
+}
+
+get {
+  url: {{api_base}}/health
+  body: none
+  auth: inherit
+}
+
+tests {
+  test("status is 200", function() {
+    expect(res.status).to.equal(200);
+  });
+}
+
+docs {
+  Liveness probe for the public API. No auth required (inherited header is ignored).
+}

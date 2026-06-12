@@ -1,0 +1,38 @@
+auth {
+  mode: apikey
+}
+
+auth:apikey {
+  key: X-API-Key
+  value: {{api_key}}
+  placement: header
+}
+
+docs {
+  # Inherent API — Bruno collection
+
+  23 requests across Health, Documents, Search, Chunks, and Ingestion (incl. dead-letter).
+
+  ## Two planes
+  - **Public API** (`{{api_base}}`, port 18000) — read + upload: documents, search, chunks.
+    Auth: `X-API-Key` (`ink_...`) + `X-Workspace-Id`.
+  - **Ingestion API** (`{{ingest_base}}`, port 18002) — write/admin: trigger/inspect ingestion,
+    edit chunks, delete documents, lineage, dead-letter jobs. Auth: `X-API-Key` (`{{ingest_key}}`),
+    no workspace header.
+
+  ## Auth model
+  `X-API-Key = {{api_key}}` is set at the collection level (inherited by public requests). The
+  **Ingestion** folder overrides it to `{{ingest_key}}`. Public requests add an explicit
+  `X-Workspace-Id` header.
+
+  ## Setup
+  1. `docker compose up --build`
+  2. `make dev-seed` (creates `ink_dev_local_key_001` + workspace `ws_local_001`)
+  3. Select the **Inherent Local** environment (top-right).
+
+  ## Chaining
+  Run **Documents → Upload Document** first; its post-response script saves `document_id` to the
+  environment so the dependent requests resolve automatically.
+
+  Heads-up: **Ingestion → Delete Document** is destructive; it is ordered after the read requests.
+}

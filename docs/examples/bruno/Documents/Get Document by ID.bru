@@ -1,0 +1,25 @@
+meta {
+  name: Get Document by ID
+  type: http
+  seq: 3
+}
+
+get {
+  url: {{api_base}}/v1/documents/{{document_id}}
+  body: none
+  auth: inherit
+}
+
+headers {
+  X-Workspace-Id: {{workspace_id}}
+}
+
+tests {
+  test("status is 200", function() {
+    expect(res.status).to.equal(200);
+  });
+}
+
+docs {
+  Fetch a single document by ID. 404 if not found in the workspace.
+}

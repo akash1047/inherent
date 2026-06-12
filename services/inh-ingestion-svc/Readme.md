@@ -80,7 +80,26 @@ uv run python -m src.main
 
 ## HTTP API
 
-When `INGESTION_API_KEY` is set, the service exposes an HTTP API on `API_PORT` (default `8000`).
+When `INGESTION_API_KEY` is set, the service exposes an HTTP API on `API_PORT` (default `8000`;
+mapped to `18002` in the local Compose stack). This is the **write/admin plane** — it owns writes to
+PostgreSQL and Weaviate. All protected routes authenticate with `X-API-Key: $INGESTION_API_KEY`.
+
+| Method | Path | Auth | Purpose |
+|---|---|---|---|
+| `GET` | `/health` | none | Liveness + Temporal worker status |
+| `GET` | `/metrics` | none | Prometheus metrics |
+| `POST` | `/ingest` | yes | Trigger ingestion. Async: **202** + `workflow_id`; `?wait=true` → **200** result; **409** if already running |
+| `GET` | `/ingest/{document_id}/status` | yes | Real-time workflow progress (`step`, `progress`, `chunks_created`) |
+| `PATCH` | `/chunks/{document_id}/{chunk_index}` | yes | Edit a chunk (updates PG + re-embeds in Weaviate) |
+| `DELETE` | `/documents/{document_id}?workspace_id=&user_id=` | yes | Delete a document from PG + Weaviate (best-effort) |
+| `GET` | `/lineage/{document_id}` | yes | Ordered ingestion pipeline events for a document |
+| `GET` | `/dead-letter` | yes | List failed-ingestion (dead-letter) jobs; filters `workspace_id`, `status`, `limit` |
+| `GET` | `/dead-letter/{job_id}` | yes | Get a single dead-letter job (404 if missing) |
+| `POST` | `/dead-letter/{job_id}/retry` | yes | Re-publish a job's original message (409 if not retriable) |
+| `POST` | `/dead-letter/{job_id}/abandon` | yes | Mark a dead-letter job permanently abandoned |
+
+Copy-paste curl examples for every endpoint (and a Postman collection) live in
+[`docs/examples/README.md`](../../docs/examples/README.md).
 
 ### Health Check
 
@@ -89,6 +108,9 @@ curl http://localhost:8000/health
 ```
 
 ### Trigger Ingestion
+
+Returns **202 Accepted** with a `workflow_id` (async). Append `?wait=true` to block until the
+workflow finishes and receive the full result as **200 OK**.
 
 ```bash
 curl -X POST http://localhost:8000/ingest \

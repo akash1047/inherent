@@ -1,0 +1,36 @@
+meta {
+  name: Trigger Ingestion
+  type: http
+  seq: 1
+}
+
+post {
+  url: {{ingest_base}}/ingest
+  body: json
+  auth: inherit
+}
+
+body:json {
+  {
+    "document_id": "{{document_id}}",
+    "workspace_id": "{{workspace_id}}",
+    "user_id": "{{user_id}}",
+    "filename": "sample.txt",
+    "original_filename": "sample.txt",
+    "content_type": "text/plain",
+    "size_bytes": 842,
+    "storage_backend": "s3",
+    "storage_path": "{{workspace_id}}/{{document_id}}/sample.txt"
+  }
+}
+
+tests {
+  test("status is 202 (accepted) or 409 (already running)", function() {
+    expect([202, 409]).to.include(res.status);
+  });
+}
+
+docs {
+  Manually (re-)ingest a file already in S3. Async: returns **202 Accepted** with a `workflow_id`.
+  **409** if a workflow is already running for this document, **503** if Temporal is unavailable.
+}
