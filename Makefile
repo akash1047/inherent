@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := help
 
-.PHONY: help setup quickstart env install validate up dev down restart ps logs health doctor bootstrap seed dev-seed check test lint format-check type-check security-check clean
+.PHONY: help setup quickstart env install validate up dev down restart ps logs health doctor bootstrap seed dev-seed check test test-integration lint format-check type-check security-check clean
 
 COMPOSE              ?= docker compose
 PUBLIC_API_URL       ?= http://localhost:18000
@@ -130,6 +130,10 @@ check: validate lint format-check type-check security-check test
 test:
 	@cd $(INGESTION_DIR) && uv run pytest
 	@cd $(PUBLIC_API_DIR) && uv run pytest
+
+## test-integration: Run Compose-backed integration tests (requires a running stack).
+test-integration:
+	@cd $(PUBLIC_API_DIR) && uv run pytest -m compose
 
 ## lint: Run Ruff checks for both services.
 lint:
