@@ -214,6 +214,25 @@ async def store_in_weaviate(input: StoreDocumentInput) -> StoreDocumentOutput:
             for c in chunk_dicts
         ]
 
+        # Idempotent reindex: delete any existing chunks for this document
+        # before writing the new ones. Without this, re-processing that
+        # produces fewer chunks leaves stale higher-index chunks orphaned
+        # (deterministic UUIDs only overwrite matching indexes). Use the
+        # graceful variant so a Weaviate hiccup during delete doesn't
+        # hard-fail the activity; we log and proceed to the write.
+        deleted_ok, deleted_count = await weaviate_service.delete_document_chunks_graceful(
+            workspace_id=input.workspace_id,
+            document_id=input.document_id,
+            user_id=input.user_id,
+        )
+        if not deleted_ok:
+            logger.warning(
+                "Could not delete existing Weaviate chunks before reindex (non-fatal)",
+                document_id=input.document_id,
+                workspace_id=input.workspace_id,
+                user_id=input.user_id,
+            )
+
         await weaviate_service.store_chunks_with_tenant(
             chunks=chunks,
             document_id=input.document_id,

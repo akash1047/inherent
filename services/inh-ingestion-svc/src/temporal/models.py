@@ -190,6 +190,21 @@ class StoreDocumentOutput:
 
 
 @dataclass
+class SetDocumentStatusInput:
+    """Input for the set_document_status activity.
+
+    Used to write best-effort 'processing'/'failed' status transitions
+    during the workflow. ``status`` is a plain string ("processing",
+    "failed", etc.) so it serializes cleanly across Temporal's gRPC.
+    """
+
+    document_id: str
+    workspace_id: str
+    status: str
+    error_message: str | None = None
+
+
+@dataclass
 class UpdateStatsInput:
     """Input for update_workspace_stats activity.
 

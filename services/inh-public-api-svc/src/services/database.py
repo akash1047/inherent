@@ -280,6 +280,147 @@ class DatabaseService:
                 status=row.status,
             )
 
+    # Document writes (upload lifecycle)
+    async def get_document_id_by_filename(
+        self,
+        workspace_id: str,
+        original_filename: str,
+    ) -> str | None:
+        """Return an existing document_id for (workspace_id, original_filename).
+
+        Used for dedup: re-uploading a file with the same name into the same
+        workspace should reuse the existing document_id so ingestion treats it
+        as a reindex rather than creating a brand-new (duplicate) document.
+
+        Returns the most recently created matching document_id, or None.
+        """
+        async with self.session() as session:
+            result = await session.execute(
+                text(
+                    """
+                    SELECT document_id
+                    FROM processed_documents
+                    WHERE workspace_id = :workspace_id
+                      AND original_filename = :original_filename
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """
+                ),
+                {"workspace_id": workspace_id, "original_filename": original_filename},
+            )
+            row = result.fetchone()
+            return str(row.document_id) if row else None
+
+    async def create_or_reset_pending_document(
+        self,
+        *,
+        document_id: str,
+        workspace_id: str,
+        user_id: str,
+        filename: str,
+        original_filename: str,
+        content_type: str,
+        size_bytes: int,
+        storage_backend: str,
+        storage_path: str,
+        storage_bucket: str | None = None,
+        storage_url: str | None = None,
+        metadata: dict | None = None,
+    ) -> None:
+        """Persist (or reset) a 'pending' row in processed_documents.
+
+        This is written at upload time — BEFORE the MQ publish — so that a
+        GET /v1/documents/{id} immediately after upload returns the document
+        with status='pending' instead of 404ing until ingestion completes.
+
+        On conflict (same document_id, e.g. a reindex/re-upload) the row is
+        reset to a clean pending state: status='pending', error_message=NULL,
+        chunk_count=0, and the latest file metadata is applied. tenant_id is
+        left NULL here; the ingestion service backfills it.
+        """
+        import json
+
+        async with self.session() as session:
+            await session.execute(
+                text(
+                    """
+                    INSERT INTO processed_documents (
+                        document_id, workspace_id, user_id,
+                        filename, original_filename, content_type, size_bytes,
+                        storage_backend, storage_path, storage_bucket, storage_url,
+                        status, error_message, chunk_count, metadata
+                    ) VALUES (
+                        :document_id, :workspace_id, :user_id,
+                        :filename, :original_filename, :content_type, :size_bytes,
+                        :storage_backend, :storage_path, :storage_bucket, :storage_url,
+                        'pending', NULL, 0, CAST(:metadata AS JSONB)
+                    )
+                    ON CONFLICT (document_id) DO UPDATE SET
+                        workspace_id = EXCLUDED.workspace_id,
+                        user_id = EXCLUDED.user_id,
+                        filename = EXCLUDED.filename,
+                        original_filename = EXCLUDED.original_filename,
+                        content_type = EXCLUDED.content_type,
+                        size_bytes = EXCLUDED.size_bytes,
+                        storage_backend = EXCLUDED.storage_backend,
+                        storage_path = EXCLUDED.storage_path,
+                        storage_bucket = EXCLUDED.storage_bucket,
+                        storage_url = EXCLUDED.storage_url,
+                        status = 'pending',
+                        error_message = NULL,
+                        chunk_count = 0,
+                        metadata = EXCLUDED.metadata,
+                        updated_at = NOW()
+                    """
+                ),
+                {
+                    "document_id": document_id,
+                    "workspace_id": workspace_id,
+                    "user_id": user_id,
+                    "filename": filename,
+                    "original_filename": original_filename,
+                    "content_type": content_type,
+                    "size_bytes": size_bytes,
+                    "storage_backend": storage_backend,
+                    "storage_path": storage_path,
+                    "storage_bucket": storage_bucket,
+                    "storage_url": storage_url,
+                    "metadata": json.dumps(metadata) if metadata is not None else None,
+                },
+            )
+            await session.commit()
+
+    async def mark_document_failed(
+        self,
+        document_id: str,
+        workspace_id: str,
+        error_message: str,
+    ) -> None:
+        """Mark a pending document as 'failed' with an error message.
+
+        Called when the durable handoff fails (e.g. MQ enqueue failed) so the
+        persisted row reflects reality instead of staying stuck at 'pending'.
+        """
+        async with self.session() as session:
+            await session.execute(
+                text(
+                    """
+                    UPDATE processed_documents
+                    SET status = 'failed',
+                        error_message = :error_message,
+                        updated_at = NOW()
+                    WHERE document_id = :document_id
+                      AND workspace_id = :workspace_id
+                    """
+                ),
+                {
+                    "document_id": document_id,
+                    "workspace_id": workspace_id,
+                    "error_message": error_message,
+                },
+            )
+            await session.commit()
+
     # Document queries
     async def get_documents(
         self,

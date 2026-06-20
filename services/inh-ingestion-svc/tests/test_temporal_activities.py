@@ -7,13 +7,15 @@ Activities use shared_services getters, so we patch those instead of
 constructing service instances directly.
 """
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
 from src.temporal.models import (
     ExtractTextInput,
     ExtractTextOutput,
+    SetDocumentStatusInput,
+    StoreDocumentInput,
 )
 
 
@@ -224,6 +226,200 @@ class TestExtractHelpers:
             # Without bs4, fallback returns raw content
             result = _extract_html_text(html)
             assert "Hello" in result
+
+
+# =========================================================================
+# set_document_status activity tests
+# =========================================================================
+
+
+class TestSetDocumentStatusActivity:
+    """Tests for the set_document_status activity (Fix #7)."""
+
+    @patch("src.temporal.shared_services.get_db_service")
+    @pytest.mark.asyncio
+    async def test_set_status_calls_update_document_status(self, mock_get_db):
+        """Activity should delegate to db.update_document_status with the enum."""
+        from src.services.database import DocumentStatus
+        from src.temporal.activities.status import set_document_status
+
+        mock_db = MagicMock()
+        mock_db.update_document_status = AsyncMock(return_value=True)
+        mock_get_db.return_value = mock_db
+
+        result = await set_document_status(
+            SetDocumentStatusInput(
+                document_id="doc_1",
+                workspace_id="ws_1",
+                status="processing",
+            )
+        )
+
+        assert result is True
+        mock_db.update_document_status.assert_awaited_once_with(
+            document_id="doc_1",
+            status=DocumentStatus.PROCESSING,
+            error_message=None,
+        )
+
+    @patch("src.temporal.shared_services.get_db_service")
+    @pytest.mark.asyncio
+    async def test_set_status_failed_passes_error_message(self, mock_get_db):
+        """Failed status should forward the error message."""
+        from src.services.database import DocumentStatus
+        from src.temporal.activities.status import set_document_status
+
+        mock_db = MagicMock()
+        mock_db.update_document_status = AsyncMock(return_value=True)
+        mock_get_db.return_value = mock_db
+
+        await set_document_status(
+            SetDocumentStatusInput(
+                document_id="doc_1",
+                workspace_id="ws_1",
+                status="failed",
+                error_message="boom",
+            )
+        )
+
+        mock_db.update_document_status.assert_awaited_once_with(
+            document_id="doc_1",
+            status=DocumentStatus.FAILED,
+            error_message="boom",
+        )
+
+    @patch("src.temporal.shared_services.get_db_service")
+    @pytest.mark.asyncio
+    async def test_set_status_noop_when_row_missing(self, mock_get_db):
+        """A missing row (UPDATE affects 0 rows) returns False, not an error."""
+        from src.temporal.activities.status import set_document_status
+
+        mock_db = MagicMock()
+        mock_db.update_document_status = AsyncMock(return_value=False)
+        mock_get_db.return_value = mock_db
+
+        result = await set_document_status(
+            SetDocumentStatusInput(
+                document_id="missing",
+                workspace_id="ws_1",
+                status="processing",
+            )
+        )
+
+        assert result is False
+
+
+# =========================================================================
+# store_in_weaviate idempotent reindex tests (Fix #11)
+# =========================================================================
+
+
+class TestStoreInWeaviateReindex:
+    """store_in_weaviate must delete stale chunks before writing new ones."""
+
+    def _store_input(self):
+        return StoreDocumentInput(
+            workflow_run_id="wf_1",
+            document_id="doc_1",
+            workspace_id="ws_1",
+            user_id="user_1",
+            filename="f.txt",
+            original_filename="f.txt",
+            content_type="text/plain",
+            size_bytes=10,
+            storage_backend="local",
+            storage_path="storage/f.txt",
+            text_length=10,
+            processing_time_ms=5,
+        )
+
+    @patch("src.temporal.shared_services.get_db_service")
+    @patch("src.temporal.shared_services.get_weaviate_service")
+    @patch("src.temporal.shared_services.get_staging_service")
+    @pytest.mark.asyncio
+    async def test_deletes_before_storing(self, mock_get_staging, mock_get_weaviate, mock_get_db):
+        """delete_document_chunks_graceful must be called before store_chunks_with_tenant."""
+        from src.temporal.activities.store import store_in_weaviate
+
+        mock_staging = MagicMock()
+        mock_staging.read_chunks.return_value = [
+            {
+                "document_id": "doc_1",
+                "content": "chunk text",
+                "chunk_index": 0,
+                "start_char": 0,
+                "end_char": 10,
+            }
+        ]
+        mock_get_staging.return_value = mock_staging
+
+        # Track call ordering across both methods via a shared parent mock.
+        manager = MagicMock()
+        weaviate = MagicMock()
+        weaviate.is_connected.return_value = True
+        weaviate.delete_document_chunks_graceful = AsyncMock(return_value=(True, 3))
+        weaviate.store_chunks_with_tenant = AsyncMock(return_value=None)
+        manager.attach_mock(weaviate.delete_document_chunks_graceful, "delete")
+        manager.attach_mock(weaviate.store_chunks_with_tenant, "store")
+        mock_get_weaviate.return_value = weaviate
+
+        mock_db = MagicMock()
+        mock_db.record_ingestion_event = AsyncMock(return_value=None)
+        mock_get_db.return_value = mock_db
+
+        result = await store_in_weaviate(self._store_input())
+
+        assert result.success is True
+        weaviate.delete_document_chunks_graceful.assert_awaited_once_with(
+            workspace_id="ws_1",
+            document_id="doc_1",
+            user_id="user_1",
+        )
+        weaviate.store_chunks_with_tenant.assert_awaited_once()
+        # Assert order: delete first, then store.
+        assert manager.mock_calls[0] == call.delete(
+            workspace_id="ws_1", document_id="doc_1", user_id="user_1"
+        )
+        method_order = [c[0] for c in manager.mock_calls]
+        assert method_order.index("delete") < method_order.index("store")
+
+    @patch("src.temporal.shared_services.get_db_service")
+    @patch("src.temporal.shared_services.get_weaviate_service")
+    @patch("src.temporal.shared_services.get_staging_service")
+    @pytest.mark.asyncio
+    async def test_store_proceeds_when_delete_unavailable(
+        self, mock_get_staging, mock_get_weaviate, mock_get_db
+    ):
+        """A graceful-delete failure (returns False) must not block the write."""
+        from src.temporal.activities.store import store_in_weaviate
+
+        mock_staging = MagicMock()
+        mock_staging.read_chunks.return_value = [
+            {
+                "document_id": "doc_1",
+                "content": "chunk text",
+                "chunk_index": 0,
+                "start_char": 0,
+                "end_char": 10,
+            }
+        ]
+        mock_get_staging.return_value = mock_staging
+
+        weaviate = MagicMock()
+        weaviate.is_connected.return_value = True
+        weaviate.delete_document_chunks_graceful = AsyncMock(return_value=(False, 0))
+        weaviate.store_chunks_with_tenant = AsyncMock(return_value=None)
+        mock_get_weaviate.return_value = weaviate
+
+        mock_db = MagicMock()
+        mock_db.record_ingestion_event = AsyncMock(return_value=None)
+        mock_get_db.return_value = mock_db
+
+        result = await store_in_weaviate(self._store_input())
+
+        assert result.success is True
+        weaviate.delete_document_chunks_graceful.assert_awaited_once()
+        weaviate.store_chunks_with_tenant.assert_awaited_once()
 
 
 # =========================================================================

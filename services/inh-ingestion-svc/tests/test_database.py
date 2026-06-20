@@ -414,6 +414,45 @@ class TestDocumentStatusUpdates:
         assert doc["status"] == DocumentStatus.FAILED.value
         assert doc["error_message"] == "Test error message"
 
+    @pytest.mark.asyncio
+    async def test_update_status_to_processing(
+        self,
+        db_service: DatabaseService,
+        sample_upload_message: dict,
+        sample_chunks: list[DocumentChunk],
+    ):
+        """Updating status to 'processing' should persist."""
+        message = DocumentUploadMessage(**sample_upload_message)
+
+        await db_service.store_processed_document(
+            message=message,
+            chunks=sample_chunks,
+            text_length=120,
+            processing_time_ms=500,
+        )
+
+        updated = await db_service.update_document_status(
+            document_id=message.document_id,
+            status=DocumentStatus.PROCESSING,
+        )
+
+        assert updated is True
+        doc = await db_service.get_document_status(message.document_id)
+        assert doc["status"] == DocumentStatus.PROCESSING.value
+
+    @pytest.mark.asyncio
+    async def test_update_status_missing_row_is_noop(
+        self,
+        db_service: DatabaseService,
+    ):
+        """Updating a non-existent document is a safe no-op (0 rows -> False)."""
+        updated = await db_service.update_document_status(
+            document_id="does-not-exist-xyz",
+            status=DocumentStatus.PROCESSING,
+        )
+
+        assert updated is False
+
 
 class TestProcessingStats:
     """Tests for processing statistics."""
