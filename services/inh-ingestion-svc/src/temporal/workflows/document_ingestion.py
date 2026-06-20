@@ -25,6 +25,7 @@ with workflow.unsafe.imports_passed_through():
     from src.temporal.activities.cleanup import cleanup_staging
     from src.temporal.activities.extract import extract_text
     from src.temporal.activities.fetch import fetch_document
+    from src.temporal.activities.status import set_document_status
     from src.temporal.activities.store import store_in_postgresql, store_in_weaviate
     from src.temporal.activities.tenant import ensure_tenant_ready, update_workspace_stats
     from src.temporal.models import (
@@ -34,6 +35,7 @@ with workflow.unsafe.imports_passed_through():
         EnsureTenantInput,
         ExtractTextInput,
         FetchDocumentInput,
+        SetDocumentStatusInput,
         StoreDocumentInput,
         UpdateStatsInput,
         WorkflowResult,
@@ -73,6 +75,38 @@ class DocumentIngestionWorkflow:
             "tenant_id": self._tenant_id,
         }
 
+    async def _set_status_best_effort(
+        self,
+        document_id: str,
+        workspace_id: str,
+        status: str,
+        error_message: str | None = None,
+    ) -> None:
+        """Write a document status transition without failing the workflow.
+
+        Status writes ('processing'/'failed') are observability signals, not
+        the source of truth, so a failure here is swallowed and logged.
+        """
+        try:
+            await workflow.execute_activity(
+                set_document_status,
+                SetDocumentStatusInput(
+                    document_id=document_id,
+                    workspace_id=workspace_id,
+                    status=status,
+                    error_message=error_message,
+                ),
+                start_to_close_timeout=timedelta(seconds=10),
+                retry_policy=RetryPolicy(
+                    maximum_attempts=2,
+                    initial_interval=timedelta(seconds=1),
+                    maximum_interval=timedelta(seconds=3),
+                    backoff_coefficient=2.0,
+                ),
+            )
+        except Exception:
+            workflow.logger.warning(f"Failed to set document status to '{status}' (non-fatal)")
+
     @workflow.run
     async def run(self, input: DocumentIngestionInput) -> WorkflowResult:
         """Execute the document ingestion workflow.
@@ -87,6 +121,14 @@ class DocumentIngestionWorkflow:
         workflow_run_id = workflow.info().run_id
 
         try:
+            # Mark the document as 'processing' before heavy work begins.
+            # Best-effort: a status-write failure must not fail the workflow.
+            await self._set_status_best_effort(
+                document_id=input.document_id,
+                workspace_id=input.workspace_id,
+                status="processing",
+            )
+
             # Step 1: Ensure tenant infrastructure is ready (10%)
             self._current_step = "ensuring_tenant_ready"
             self._progress_percent = 5
@@ -242,6 +284,12 @@ class DocumentIngestionWorkflow:
             # Check storage results
             if not pg_result.success:
                 # PostgreSQL storage is critical
+                await self._set_status_best_effort(
+                    document_id=input.document_id,
+                    workspace_id=input.workspace_id,
+                    status="failed",
+                    error_message=f"PostgreSQL storage failed: {pg_result.error}",
+                )
                 return WorkflowResult(
                     document_id=input.document_id,
                     success=False,
@@ -261,6 +309,12 @@ class DocumentIngestionWorkflow:
             # than a clear failure.
             if not wv_result.success:
                 workflow.logger.error(f"Weaviate storage failed: {wv_result.error}")
+                await self._set_status_best_effort(
+                    document_id=input.document_id,
+                    workspace_id=input.workspace_id,
+                    status="failed",
+                    error_message=f"Weaviate storage failed: {wv_result.error}",
+                )
                 return WorkflowResult(
                     document_id=input.document_id,
                     success=False,
@@ -308,6 +362,16 @@ class DocumentIngestionWorkflow:
             processing_time_ms = int((workflow.now() - start_time).total_seconds() * 1000)
 
             workflow.logger.error(f"Workflow failed: {str(e)}")
+
+            # Best-effort: mark the document as failed so it isn't stuck
+            # in 'processing'. A status-write failure must not mask the
+            # original error.
+            await self._set_status_best_effort(
+                document_id=input.document_id,
+                workspace_id=input.workspace_id,
+                status="failed",
+                error_message=str(e),
+            )
 
             return WorkflowResult(
                 document_id=input.document_id,
