@@ -12,6 +12,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # cov_fail_under is the OVERALL per-service coverage floor enforced in
+        # the Test step (each service's pyproject addopts already adds --cov).
+        # Values are intentionally conservative so CI stays green today; they
+        # should be ratcheted UP over time. Per-core-module floors are NOT
+        # enforced in CI yet -- the modules to tighten first are:
+        #   public-api:  auth / search / documents
+        #   ingestion:   quality / extract / store / document_ingestion
         include:
           - service: inh-ingestion-svc
             path: services/inh-ingestion-svc
@@ -21,6 +28,7 @@ jobs:
             typecheck: ""
             security: ""
             test: uv run pytest
+            cov_fail_under: 40
           - service: inh-public-api-svc
             path: services/inh-public-api-svc
             python-version: "3.11"
@@ -29,6 +37,7 @@ jobs:
             typecheck: uv run mypy src
             security: uv run bandit -c pyproject.toml -r src
             test: uv run pytest
+            cov_fail_under: 45
 
     services:
       postgres:
@@ -78,8 +87,11 @@ jobs:
         if: ${{ matrix.security }}
         run: ${{ matrix.security }}
 
+      # Each service's pyproject [tool.pytest.ini_options] addopts already adds
+      # --cov; here we enforce the overall coverage floor. Raise cov_fail_under
+      # over time as the core modules listed in the matrix comment gain tests.
       - name: Test
-        run: ${{ matrix.test }}
+        run: ${{ matrix.test }} --cov-fail-under=${{ matrix.cov_fail_under }}
 
   required-tests:
     name: Required tests before merge
