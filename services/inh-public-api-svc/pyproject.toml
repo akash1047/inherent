@@ -63,7 +63,14 @@ packages = ["src"]
 asyncio_mode = "auto"
 testpaths = ["tests"]
 pythonpath = ["src"]
-addopts = "-v --tb=short"
+# Compose-backed tests need the full local stack and are excluded from the
+# default run; the integration CI job opts in with `-m compose`.
+addopts = "-v --tb=short -m 'not compose'"
+markers = [
+    "integration: tests that exercise real service dependencies",
+    "compose: requires a running docker-compose stack (deselected by default)",
+    "slow: slow-running tests",
+]
 
 [tool.ruff]
 line-length = 100

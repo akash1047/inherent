@@ -34,10 +34,36 @@ services:
       - -lc
       - |
         set -e
+        PSQL="psql -h postgres -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-knowledge_base} -v ON_ERROR_STOP=1"
+        # Migration history table: each migration is applied exactly once. This
+        # makes startup idempotent and non-destructive — the destructive DROPs in
+        # 001/007 only ever run once on a fresh database, never on restart (#16).
+        echo "Ensuring _migrations tracking table exists..."
+        $$PSQL -q -c "CREATE TABLE IF NOT EXISTS _migrations (id SERIAL PRIMARY KEY, filename VARCHAR(255) NOT NULL UNIQUE, applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW());"
+        # Safety for pre-tracking databases: if the schema already exists but the
+        # tracking table is empty, this DB was provisioned by the old blind loop.
+        # Backfill the records WITHOUT re-running, so the upgrade itself cannot
+        # trigger a destructive re-apply.
+        schema_present=$$($$PSQL -tA -c "SELECT to_regclass('public.processed_documents') IS NOT NULL;")
+        tracking_count=$$($$PSQL -tA -c "SELECT COUNT(*) FROM _migrations;")
+        if [ "$$schema_present" = "t" ] && [ "$$tracking_count" = "0" ]; then
+          echo "Existing schema with empty tracking detected; backfilling history without re-running."
+          for migration in /migrations/*.sql; do
+            $$PSQL -q -c "INSERT INTO _migrations (filename) VALUES ('$$(basename "$$migration")') ON CONFLICT (filename) DO NOTHING;"
+          done
+        fi
         for migration in /migrations/*.sql; do
-          echo "Applying $${migration}"
-          psql -h postgres -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-knowledge_base} -v ON_ERROR_STOP=1 -f "$${migration}"
+          filename=$$(basename "$$migration")
+          applied=$$($$PSQL -tA -c "SELECT 1 FROM _migrations WHERE filename = '$$filename';")
+          if [ "$$applied" = "1" ]; then
+            echo "Skipping (already applied): $$filename"
+            continue
+          fi
+          echo "Applying $$filename"
+          $$PSQL -f "$$migration"
+          $$PSQL -q -c "INSERT INTO _migrations (filename) VALUES ('$$filename');"
         done
+        echo "Migrations complete."
     networks:
       - inherent-oss
     restart: "no"
