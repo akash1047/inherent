@@ -48,6 +48,7 @@ async def store_in_postgresql(input: StoreDocumentInput) -> StoreDocumentOutput:
                 chunk_index=c["chunk_index"],
                 start_char=c["start_char"],
                 end_char=c["end_char"],
+                token_count=c.get("token_count"),
             )
             for c in chunk_dicts
         ]
@@ -210,6 +211,7 @@ async def store_in_weaviate(input: StoreDocumentInput) -> StoreDocumentOutput:
                 chunk_index=c["chunk_index"],
                 start_char=c["start_char"],
                 end_char=c["end_char"],
+                token_count=c.get("token_count"),
             )
             for c in chunk_dicts
         ]

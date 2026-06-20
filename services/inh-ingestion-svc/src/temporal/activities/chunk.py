@@ -14,6 +14,59 @@ from src.temporal.models import ChunkData, ChunkTextInput, ChunkTextOutput
 
 logger = structlog.get_logger(__name__)
 
+# Characters-per-token assumption used to translate the embedding model's
+# token budget (embedding_max_tokens) into a character budget for the
+# character-based chunkers below. ~4 chars/token is the well-known rule of
+# thumb for English BPE tokenizers and matches the chars/4 branch of
+# estimate_tokens(), keeping the two consistent.
+_CHARS_PER_TOKEN = 4
+
+
+def estimate_tokens(text: str) -> int:
+    """Estimate the number of model tokens in ``text`` without a tokenizer.
+
+    Token-count formula (no new dependencies):
+
+        est_tokens = ceil(max(words * 1.3, chars / 4))
+
+    Rationale:
+    - ``words * 1.3`` captures sub-word splitting: most BPE tokenizers emit a
+      bit more than one token per whitespace word.
+    - ``chars / 4`` is the classic ~4-chars-per-token rule and dominates for
+      text with few spaces (code, long tokens, CJK-ish content).
+    Taking the max of both makes the estimate conservative (it rarely
+    under-counts), which is what we want when enforcing an embedding token
+    budget: better to over-estimate and split than to over-run the model and
+    have TEI silently truncate.
+    """
+    import math
+
+    if not text:
+        return 0
+    words = len(text.split())
+    chars = len(text)
+    return int(math.ceil(max(words * 1.3, chars / _CHARS_PER_TOKEN)))
+
+
+def _token_budget_char_cap(embedding_max_tokens: int) -> int:
+    """Convert an embedding token budget into a max character count per chunk.
+
+    estimate_tokens() takes the max of two branches, so a character cap is only
+    safe if it keeps BOTH branches at or under the budget T:
+
+    - chars branch: chars / 4 <= T  =>  chars <= 4T
+    - words branch: words * 1.3 <= T. The worst case (most words per char) is
+      single-character words separated by spaces, where chars ~= 2*words, i.e.
+      words ~= chars / 2. So 1.3 * chars/2 <= T  =>  chars <= 2T / 1.3.
+
+    The binding constraint is the smaller (words-branch) cap, so we take the min
+    of both. This guarantees estimate_tokens(chunk) <= T for any chunk we emit
+    at or under this character length, instead of relying on TEI truncation.
+    """
+    chars_branch = embedding_max_tokens * _CHARS_PER_TOKEN
+    words_branch = int((2 * embedding_max_tokens) / 1.3)
+    return max(1, min(chars_branch, words_branch))
+
 
 @activity.defn
 async def chunk_text(input: ChunkTextInput) -> ChunkTextOutput:
@@ -51,17 +104,30 @@ async def _chunk_text_inner(input: ChunkTextInput) -> ChunkTextOutput:
     # Read text from staging
     text = staging.read_text(input.workflow_run_id)
 
+    from src.config.settings import get_settings
+
+    settings = get_settings()
+
     document_id = input.document_id
     strategy = input.strategy
-    max_size = input.max_chunk_size
     overlap = input.chunk_overlap
+
+    # Model-aware sizing: never let a single chunk exceed the embedding
+    # model's token budget. We translate embedding_max_tokens into a character
+    # cap (see _token_budget_char_cap) and clamp the requested max_chunk_size
+    # to it, so estimated tokens stay under the budget instead of relying on
+    # TEI's silent server-side truncation.
+    char_cap = _token_budget_char_cap(settings.embedding_max_tokens)
+    max_size = min(input.max_chunk_size, char_cap)
 
     logger.info(
         "Chunking text",
         document_id=document_id,
         strategy=strategy,
         text_length=len(text),
-        max_chunk_size=max_size,
+        requested_max_chunk_size=input.max_chunk_size,
+        effective_max_chunk_size=max_size,
+        embedding_max_tokens=settings.embedding_max_tokens,
     )
 
     if not text:
@@ -76,10 +142,17 @@ async def _chunk_text_inner(input: ChunkTextInput) -> ChunkTextOutput:
     else:  # tokens (default)
         chunks = _chunk_by_size(text, document_id, max_size, overlap)
 
+    # Populate a consistent, model-aware token estimate for every chunk so the
+    # value stored in PostgreSQL/Weaviate matches the budget we enforced above
+    # (replaces the old naive len(content.split()) used at storage time).
+    for c in chunks:
+        c.token_count = estimate_tokens(c.content)
+
     logger.info(
         "Text chunked successfully",
         document_id=document_id,
         chunk_count=len(chunks),
+        max_chunk_token_estimate=max((c.token_count for c in chunks), default=0),
     )
 
     # Run data quality checks on chunks
@@ -106,6 +179,7 @@ async def _chunk_text_inner(input: ChunkTextInput) -> ChunkTextOutput:
             "chunk_index": c.chunk_index,
             "start_char": c.start_char,
             "end_char": c.end_char,
+            "token_count": c.token_count,
         }
         for c in chunks
     ]

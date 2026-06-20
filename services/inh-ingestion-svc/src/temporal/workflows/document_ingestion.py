@@ -21,6 +21,7 @@ from temporalio.common import RetryPolicy
 # Import directly from submodules (not through __init__.py) to avoid
 # sandbox import issues where nested package imports may fail silently.
 with workflow.unsafe.imports_passed_through():
+    from src.config.settings import get_settings
     from src.temporal.activities.chunk import chunk_text
     from src.temporal.activities.cleanup import cleanup_staging
     from src.temporal.activities.extract import extract_text
@@ -208,14 +209,28 @@ class DocumentIngestionWorkflow:
             # Step 4: Chunk text (60%)
             self._current_step = "chunking_text"
 
+            # Resolve chunking config: prefer per-document overrides on the
+            # workflow input, otherwise fall back to application settings.
+            # (Previously these were hardcoded literals that ignored settings.)
+            settings = get_settings()
+            resolved_strategy = input.chunking_strategy or settings.chunking_strategy
+            resolved_max_chunk_size = (
+                input.max_chunk_size
+                if input.max_chunk_size is not None
+                else settings.max_chunk_size
+            )
+            resolved_chunk_overlap = (
+                input.chunk_overlap if input.chunk_overlap is not None else settings.chunk_overlap
+            )
+
             chunk_output = await workflow.execute_activity(
                 chunk_text,
                 ChunkTextInput(
                     workflow_run_id=workflow_run_id,
                     document_id=input.document_id,
-                    strategy="sentences",  # Default, can be made configurable
-                    max_chunk_size=1000,
-                    chunk_overlap=200,
+                    strategy=resolved_strategy,
+                    max_chunk_size=resolved_max_chunk_size,
+                    chunk_overlap=resolved_chunk_overlap,
                     workspace_id=input.workspace_id,
                 ),
                 start_to_close_timeout=timedelta(minutes=2),

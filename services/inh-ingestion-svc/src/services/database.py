@@ -805,6 +805,10 @@ class DatabaseService:
 
                 # Insert new chunks with foreign key and tenant_id
                 if chunks:
+                    # Local import avoids a circular import (chunk activity
+                    # imports modules that ultimately reference this service).
+                    from src.temporal.activities.chunk import estimate_tokens
+
                     chunk_values = [
                         {
                             "processed_document_id": doc_id,
@@ -813,7 +817,14 @@ class DatabaseService:
                             "tenant_id": tenant_id,
                             "chunk_index": chunk.chunk_index,
                             "content": chunk.content,
-                            "token_count": len(chunk.content.split()),
+                            # Prefer the model-aware estimate computed by the
+                            # chunk activity; fall back to the same estimate if
+                            # an older chunk lacks it (no naive word-split).
+                            "token_count": (
+                                chunk.token_count
+                                if chunk.token_count is not None
+                                else estimate_tokens(chunk.content)
+                            ),
                             "start_char": chunk.start_char,
                             "end_char": chunk.end_char,
                             "metadata": chunk.metadata,

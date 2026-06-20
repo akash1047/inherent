@@ -77,6 +77,12 @@ class Settings(BaseSettings):
         alias="EMBEDDING_SERVICE_URL",
     )
     embedding_dim: int = Field(384, alias="EMBEDDING_DIM")
+    # Hard token limit of the embedding model's context window.
+    # Default 512 matches bge-small-en-v1.5 (the default TEI model).
+    # Chunking keeps each chunk's ESTIMATED token count under this budget so
+    # we don't silently rely on TEI's server-side truncation (which would drop
+    # the tail of an oversized chunk and degrade retrieval quality).
+    embedding_max_tokens: int = Field(512, alias="EMBEDDING_MAX_TOKENS")
 
     # Performance Configuration
     max_workers: int = Field(4, alias="MAX_WORKERS")
