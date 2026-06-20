@@ -25,6 +25,7 @@ router = APIRouter()
 async def upload_document(
     file: UploadFile = File(...),
     auth: Annotated[ResolvedAuth, Depends(resolve_workspace_write)] = ...,  # type: ignore[assignment]
+    database: Annotated[DatabaseService, Depends(get_database)] = ...,  # type: ignore[assignment]
 ) -> DocumentUploadResponse:
     """
     Upload a document for ingestion.
@@ -67,8 +68,28 @@ async def upload_document(
             detail="Workspace ID required. Provide X-Workspace-Id header.",
         )
 
-    document_id = str(uuid.uuid4())
     filename = file.filename or "unnamed"
+
+    # --- 3b. Dedup: reuse document_id for same (workspace, filename) ---------
+    # Re-uploading the same file name into the same workspace should reindex
+    # the existing document rather than flood the workspace with duplicates.
+    existing_document_id = await database.get_document_id_by_filename(workspace_id, filename)
+    if existing_document_id:
+        document_id = existing_document_id
+        logger.info(
+            "Reusing existing document_id for re-upload (reindex)",
+            document_id=document_id,
+            workspace_id=workspace_id,
+            filename=filename,
+        )
+    else:
+        document_id = str(uuid.uuid4())
+        logger.info(
+            "Assigning new document_id for upload",
+            document_id=document_id,
+            workspace_id=workspace_id,
+            filename=filename,
+        )
 
     # --- 4. Upload to S3 ----------------------------------------------------
     try:
@@ -83,7 +104,37 @@ async def upload_document(
             detail="Failed to store the uploaded file. Please try again later.",
         ) from exc
 
-    # --- 5. Publish MQ message ----------------------------------------------
+    # --- 5. Persist a durable 'pending' row BEFORE enqueueing ----------------
+    # This makes the upload recoverable and lets GET /v1/documents/{id} return
+    # the document (status='pending') immediately, instead of 404ing until
+    # ingestion finishes. On re-upload of the same document_id, this resets the
+    # row to a clean pending state.
+    try:
+        await database.create_or_reset_pending_document(
+            document_id=document_id,
+            workspace_id=workspace_id,
+            user_id=auth.key_info.user_id,
+            filename=s3_key.rsplit("/", 1)[-1],
+            original_filename=filename,
+            content_type=content_type,
+            size_bytes=size_bytes,
+            storage_backend="s3",
+            storage_path=s3_key,
+            storage_bucket=storage._bucket,
+            storage_url=storage_url,
+        )
+    except Exception as exc:
+        logger.error(
+            "Failed to persist pending document row",
+            error=str(exc),
+            document_id=document_id,
+        )
+        raise ServiceUnavailableError(
+            service_name="database",
+            detail="Failed to record the upload. Please try again later.",
+        ) from exc
+
+    # --- 6. Publish MQ message ----------------------------------------------
     now_iso = datetime.now(timezone.utc).isoformat()
     mq_message = {
         "event_type": "document.uploaded",
@@ -105,15 +156,40 @@ async def upload_document(
         mq = await get_mq_service()
         await mq.publish(settings.mq_topic_document_uploaded, mq_message)
     except Exception as exc:
-        # The file is already in S3, so log but don't fail the request —
-        # a retry mechanism or dead-letter queue should recover this.
+        # The file is in S3 and a durable 'pending' row exists, so the upload
+        # is recoverable. But ingestion was NOT triggered, so we must NOT
+        # report success: mark the row 'failed' and reflect that in the
+        # response. We keep HTTP 201 because the file IS stored.
         logger.error(
-            "MQ publish failed — file stored but ingestion not triggered",
+            "MQ publish failed — file stored but ingestion not enqueued",
             error=str(exc),
             document_id=document_id,
         )
+        enqueue_error = "ingestion enqueue failed"
+        try:
+            await database.mark_document_failed(document_id, workspace_id, enqueue_error)
+        except Exception as mark_exc:
+            logger.error(
+                "Failed to mark document as failed after enqueue failure",
+                error=str(mark_exc),
+                document_id=document_id,
+            )
 
-    # --- 6. Return response --------------------------------------------------
+        return DocumentUploadResponse(
+            document_id=document_id,
+            name=filename,
+            workspace_id=workspace_id,
+            storage_url=storage_url,
+            mime_type=content_type,
+            size_bytes=size_bytes,
+            status="failed",
+            message=(
+                "Document was stored but could not be queued for processing "
+                "(ingestion enqueue failed). Please retry the upload."
+            ),
+        )
+
+    # --- 7. Return response --------------------------------------------------
     logger.info(
         "Document upload accepted",
         document_id=document_id,

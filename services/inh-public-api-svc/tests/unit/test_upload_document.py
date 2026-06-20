@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import io
+import uuid
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -67,7 +69,12 @@ def user_scoped_key():
 
 @pytest.fixture
 def mock_db():
-    return AsyncMock()
+    db = AsyncMock()
+    # Default: no existing document with this (workspace, filename) -> new doc_id.
+    db.get_document_id_by_filename = AsyncMock(return_value=None)
+    db.create_or_reset_pending_document = AsyncMock(return_value=None)
+    db.mark_document_failed = AsyncMock(return_value=None)
+    return db
 
 
 @pytest.fixture
@@ -543,4 +550,239 @@ class TestUploadAllowedMimeTypes:
                 )
 
         assert response.status_code == 400
+        application.dependency_overrides.clear()
+
+
+# ---------------------------------------------------------------------------
+# Durable handoff: pending row persistence + GET visibility + dedup
+# ---------------------------------------------------------------------------
+
+
+class TestUploadPersistsPendingRow:
+    """Fix #7: a 'pending' row is persisted at upload time, before MQ publish."""
+
+    async def test_pending_row_created_before_publish(self, client, mock_db, mock_mq):
+        """create_or_reset_pending_document is called with status-driving fields."""
+        response = await client.post(
+            "/v1/documents",
+            files=_file_payload(),
+            headers={"X-API-Key": "ink_test_key"},
+        )
+        assert response.status_code == 201
+
+        mock_db.create_or_reset_pending_document.assert_awaited_once()
+        kwargs = mock_db.create_or_reset_pending_document.call_args.kwargs
+        assert kwargs["workspace_id"] == "test-workspace-id"
+        assert kwargs["user_id"] == "test-user-id"
+        assert kwargs["original_filename"] == "test.pdf"
+        assert kwargs["content_type"] == "application/pdf"
+        assert kwargs["size_bytes"] == len(b"hello world")
+        assert kwargs["storage_backend"] == "s3"
+        assert kwargs["document_id"] == response.json()["document_id"]
+
+        # The pending row must be persisted BEFORE the MQ publish so the
+        # handoff is durable.
+        mock_db.create_or_reset_pending_document.assert_awaited_once()
+        mock_mq.publish.assert_awaited_once()
+
+    async def test_get_returns_pending_doc_immediately_after_upload(
+        self, write_key, mock_db, mock_storage, mock_mq
+    ):
+        """After upload, GET /v1/documents/{id} returns the doc with status=pending.
+
+        Simulates the persisted pending row by wiring mock_db.get_document to
+        return a pending Document for the uploaded id.
+        """
+        from src.models.document import Document
+        from src.services.auth import resolve_workspace_read
+
+        application = create_app()
+        application.dependency_overrides[get_api_key_info] = lambda: write_key
+        application.dependency_overrides[get_write_permission] = lambda: write_key
+        application.dependency_overrides[resolve_workspace_write] = lambda: ResolvedAuth(
+            key_info=write_key, workspace_id=write_key.workspace_id
+        )
+        application.dependency_overrides[resolve_workspace_read] = lambda: ResolvedAuth(
+            key_info=write_key, workspace_id=write_key.workspace_id
+        )
+        application.dependency_overrides[get_database] = lambda: mock_db
+
+        # Emulate the DB: once a pending row is written, GET can read it back.
+        stored: dict = {}
+
+        async def _create(**kwargs):
+            stored.update(kwargs)
+
+        async def _get(document_id, workspace_id):
+            if stored.get("document_id") == document_id:
+                return Document(
+                    id=document_id,
+                    name=stored["original_filename"],
+                    workspace_id=workspace_id,
+                    source_type=stored["storage_backend"],
+                    mime_type=stored["content_type"],
+                    size_bytes=stored["size_bytes"],
+                    chunk_count=0,
+                    status="pending",
+                    created_at=datetime.now(timezone.utc),
+                    updated_at=datetime.now(timezone.utc),
+                    metadata=None,
+                )
+            return None
+
+        mock_db.create_or_reset_pending_document = AsyncMock(side_effect=_create)
+        mock_db.get_document = AsyncMock(side_effect=_get)
+
+        with (
+            patch("src.api.v1.documents.get_storage_service", return_value=mock_storage),
+            patch(
+                "src.api.v1.documents.get_mq_service",
+                new_callable=AsyncMock,
+                return_value=mock_mq,
+            ),
+        ):
+            transport = ASGITransport(app=application)
+            async with AsyncClient(transport=transport, base_url="http://test") as ac:
+                upload = await ac.post(
+                    "/v1/documents",
+                    files=_file_payload(),
+                    headers={"X-API-Key": "ink_test_key"},
+                )
+                doc_id = upload.json()["document_id"]
+
+                get_resp = await ac.get(
+                    f"/v1/documents/{doc_id}",
+                    headers={"X-API-Key": "ink_test_key"},
+                )
+
+        assert get_resp.status_code == 200
+        body = get_resp.json()
+        assert body["id"] == doc_id
+        assert body["status"] == "pending"
+        application.dependency_overrides.clear()
+
+
+class TestUploadEnqueueFailure:
+    """Fix #6: MQ publish failure must not silently report success."""
+
+    async def test_mq_failure_marks_document_failed(self, write_key, mock_db, mock_storage):
+        failing_mq = AsyncMock()
+        failing_mq.publish = AsyncMock(side_effect=Exception("Redis down"))
+
+        application = create_app()
+        application.dependency_overrides[get_api_key_info] = lambda: write_key
+        application.dependency_overrides[get_write_permission] = lambda: write_key
+        application.dependency_overrides[resolve_workspace_write] = lambda: ResolvedAuth(
+            key_info=write_key, workspace_id=write_key.workspace_id
+        )
+        application.dependency_overrides[get_database] = lambda: mock_db
+
+        with (
+            patch("src.api.v1.documents.get_storage_service", return_value=mock_storage),
+            patch(
+                "src.api.v1.documents.get_mq_service",
+                new_callable=AsyncMock,
+                return_value=failing_mq,
+            ),
+        ):
+            transport = ASGITransport(app=application)
+            async with AsyncClient(transport=transport, base_url="http://test") as ac:
+                response = await ac.post(
+                    "/v1/documents",
+                    files=_file_payload(),
+                    headers={"X-API-Key": "ink_test_key"},
+                )
+
+        # File IS stored, so still 201, but the response must NOT claim pending.
+        assert response.status_code == 201
+        data = response.json()
+        assert data["status"] == "failed"
+        assert "enqueue" in data["message"].lower()
+
+        # The persisted row must be flipped to failed.
+        mock_db.mark_document_failed.assert_awaited_once()
+        args = mock_db.mark_document_failed.call_args.args
+        assert args[0] == data["document_id"]
+        assert args[1] == "test-workspace-id"
+        assert "ingestion enqueue failed" in args[2]
+        application.dependency_overrides.clear()
+
+
+class TestUploadDedup:
+    """Fix #60: re-upload of same (workspace, filename) reuses the document_id."""
+
+    async def test_reupload_reuses_existing_document_id(
+        self, write_key, mock_db, mock_storage, mock_mq
+    ):
+        existing_id = "existing-doc-id-123"
+        mock_db.get_document_id_by_filename = AsyncMock(return_value=existing_id)
+
+        application = create_app()
+        application.dependency_overrides[get_api_key_info] = lambda: write_key
+        application.dependency_overrides[get_write_permission] = lambda: write_key
+        application.dependency_overrides[resolve_workspace_write] = lambda: ResolvedAuth(
+            key_info=write_key, workspace_id=write_key.workspace_id
+        )
+        application.dependency_overrides[get_database] = lambda: mock_db
+
+        with (
+            patch("src.api.v1.documents.get_storage_service", return_value=mock_storage),
+            patch(
+                "src.api.v1.documents.get_mq_service",
+                new_callable=AsyncMock,
+                return_value=mock_mq,
+            ),
+        ):
+            transport = ASGITransport(app=application)
+            async with AsyncClient(transport=transport, base_url="http://test") as ac:
+                response = await ac.post(
+                    "/v1/documents",
+                    files=_file_payload(),
+                    headers={"X-API-Key": "ink_test_key"},
+                )
+
+        assert response.status_code == 201
+        assert response.json()["document_id"] == existing_id
+
+        mock_db.get_document_id_by_filename.assert_awaited_once_with(
+            "test-workspace-id", "test.pdf"
+        )
+        # The pending row + MQ message must carry the reused id.
+        assert (
+            mock_db.create_or_reset_pending_document.call_args.kwargs["document_id"] == existing_id
+        )
+        assert mock_mq.publish.call_args[0][1]["document_id"] == existing_id
+        application.dependency_overrides.clear()
+
+    async def test_new_filename_generates_new_uuid(self, write_key, mock_db, mock_storage, mock_mq):
+        mock_db.get_document_id_by_filename = AsyncMock(return_value=None)
+
+        application = create_app()
+        application.dependency_overrides[get_api_key_info] = lambda: write_key
+        application.dependency_overrides[get_write_permission] = lambda: write_key
+        application.dependency_overrides[resolve_workspace_write] = lambda: ResolvedAuth(
+            key_info=write_key, workspace_id=write_key.workspace_id
+        )
+        application.dependency_overrides[get_database] = lambda: mock_db
+
+        with (
+            patch("src.api.v1.documents.get_storage_service", return_value=mock_storage),
+            patch(
+                "src.api.v1.documents.get_mq_service",
+                new_callable=AsyncMock,
+                return_value=mock_mq,
+            ),
+        ):
+            transport = ASGITransport(app=application)
+            async with AsyncClient(transport=transport, base_url="http://test") as ac:
+                response = await ac.post(
+                    "/v1/documents",
+                    files=_file_payload(),
+                    headers={"X-API-Key": "ink_test_key"},
+                )
+
+        assert response.status_code == 201
+        new_id = response.json()["document_id"]
+        # A freshly generated UUID, not the sentinel reuse value.
+        assert uuid.UUID(new_id)
         application.dependency_overrides.clear()
