@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := help
 
-.PHONY: help setup env install validate up dev down restart ps logs health doctor seed dev-seed check test lint format-check type-check security-check clean
+.PHONY: help setup quickstart env install validate up dev down restart ps logs health doctor bootstrap seed dev-seed check test test-integration lint format-check type-check security-check clean
 
 COMPOSE              ?= docker compose
 PUBLIC_API_URL       ?= http://localhost:18000
@@ -13,10 +13,14 @@ PG_CONTAINER         ?= inherent-oss-postgres
 PG_USER              ?= postgres
 PG_DB                ?= knowledge_base
 
+MONGO_CONTAINER      ?= inherent-oss-mongodb
+MONGO_DB             ?= main
+
 DEV_API_KEY          ?= ink_dev_local_key_001
 DEV_WORKSPACE_ID     ?= ws_local_001
 DEV_USER_ID          ?= local-dev-user
 DEV_KEY_NAME         ?= Local Dev Key
+DEV_WORKSPACE_NAME   ?= Local Dev Workspace
 
 ## help: Show available targets.
 help:
@@ -24,6 +28,24 @@ help:
 
 ## setup: Create .env if needed and install both service dev environments.
 setup: env install
+
+## quickstart: One command from a fresh checkout to a working local stack.
+##             Runs env + install, starts Compose and waits for health,
+##             bootstraps the dev workspace/API key, then prints next steps.
+quickstart: env install
+	@echo "==> Starting local stack (this builds images on first run)..."
+	@$(COMPOSE) up --build -d --wait
+	@$(MAKE) bootstrap
+	@echo "==> Checking service readiness..."
+	@bash scripts/dev/doctor.sh || true
+	@printf '\n========================================\n'
+	@printf 'Inherent is up. Next steps:\n'
+	@printf '  make health         # check API health endpoints\n'
+	@printf '  make logs           # follow stack logs\n'
+	@printf '  make down           # stop the stack\n'
+	@printf '\nLocal smoke test (upload + search) is in the README Quickstart.\n'
+	@printf 'Dev API key: %s   Workspace: %s\n' "$(DEV_API_KEY)" "$(DEV_WORKSPACE_ID)"
+	@printf '========================================\n'
 
 ## env: Create .env from .env.example when .env is missing.
 env:
@@ -47,10 +69,10 @@ validate: env
 up: env
 	@$(COMPOSE) up --build
 
-## dev: Start the stack in the background and seed the local public API key.
+## dev: Start the stack in the background and bootstrap the local workspace + key.
 dev: env
 	@$(COMPOSE) up --build -d --wait
-	@$(MAKE) seed
+	@$(MAKE) bootstrap
 
 ## down: Stop the local Docker Compose stack.
 down:
@@ -84,28 +106,22 @@ health:
 doctor:
 	@bash scripts/dev/doctor.sh
 
-## seed: Insert a local development API key into PostgreSQL.
-##       Safe to re-run. Key value: ink_dev_local_key_001
-seed:
-	@echo "Seeding dev API key into $(PG_DB)..."
-	@docker exec $(PG_CONTAINER) psql -U $(PG_USER) -d $(PG_DB) -c \
-		"INSERT INTO api_keys \
-		  (key_id, key_hash, key_prefix, user_id, workspace_id, name, status, permissions, rate_limit) \
-		VALUES ( \
-		  gen_random_uuid()::text, \
-		  encode(sha256('$(DEV_API_KEY)'::bytea), 'hex'), \
-		  left('$(DEV_API_KEY)', 12), \
-		  '$(DEV_USER_ID)', \
-		  '$(DEV_WORKSPACE_ID)', \
-		  '$(DEV_KEY_NAME)', \
-		  'active', \
-		  '[\"read\",\"write\",\"search\"]', \
-		  1000 \
-		) ON CONFLICT (key_hash) DO NOTHING;"
-	@echo "Done. API key ready: $(DEV_API_KEY)"
+## bootstrap: Create the local dev workspace + API key in BOTH stores
+##            (PostgreSQL api_keys and MongoDB workspaces). Local/dev only.
+##            Safe to re-run. Key value: ink_dev_local_key_001
+bootstrap:
+	@API_KEY="$(DEV_API_KEY)" WORKSPACE_ID="$(DEV_WORKSPACE_ID)" \
+	 USER_ID="$(DEV_USER_ID)" KEY_NAME="$(DEV_KEY_NAME)" \
+	 WORKSPACE_NAME="$(DEV_WORKSPACE_NAME)" \
+	 PG_CONTAINER="$(PG_CONTAINER)" PG_USER="$(PG_USER)" PG_DB="$(PG_DB)" \
+	 MONGO_CONTAINER="$(MONGO_CONTAINER)" MONGO_DB="$(MONGO_DB)" \
+	 bash scripts/dev/bootstrap.sh
 
-## dev-seed: Alias for seed.
-dev-seed: seed
+## seed: Alias for bootstrap (kept for backward compatibility).
+seed: bootstrap
+
+## dev-seed: Alias for bootstrap.
+dev-seed: bootstrap
 
 ## check: Run validation, lint, formatting, typing, security checks, and tests.
 check: validate lint format-check type-check security-check test
@@ -114,6 +130,10 @@ check: validate lint format-check type-check security-check test
 test:
 	@cd $(INGESTION_DIR) && uv run pytest
 	@cd $(PUBLIC_API_DIR) && uv run pytest
+
+## test-integration: Run Compose-backed integration tests (requires a running stack).
+test-integration:
+	@cd $(PUBLIC_API_DIR) && uv run pytest -m compose
 
 ## lint: Run Ruff checks for both services.
 lint:

@@ -5,10 +5,34 @@ Thanks for contributing to the Inherent OSS core.
 ## Before You Start
 
 - Read the root [README.md](README.md) for repository scope.
+- Read [ADR 0001 — Agent Memory Substrate](docs/adr/0001-agent-memory-substrate.md) for the product boundary, guarantees, and non-goals before proposing larger changes. The [org-readiness requirements](docs/maintainers/org-readiness-requirements.md) map the issue backlog to that boundary.
 - Keep changes aligned with the OSS boundary. Do not add internal tooling, secrets, or private operational workflows.
 - Prefer small pull requests with a clear problem statement.
 
 ## Local Setup
+
+### Repository-Level Checks
+
+The shortest path is the repository-root `Makefile`, which runs the documented
+checks for **both** services from one place:
+
+```bash
+make install        # sync dev deps for both services
+make check          # validate + lint + format-check + type-check + security + test
+```
+
+You can also run any single stage across both services:
+
+```bash
+make lint           # Ruff
+make format-check   # Black --check
+make type-check     # mypy (services that enable it)
+make security-check # Bandit (services that enable it)
+make test           # pytest for both services
+```
+
+Run `make help` to list every target. Service-specific commands remain
+available below when you only need to touch one service.
 
 ### Ingestion Service
 
@@ -103,7 +127,7 @@ graphify .
 - Explain the problem and the approach.
 - Update docs when behavior, setup, or repository boundaries change.
 - Keep README and service-specific docs consistent.
-- Run the relevant local checks before opening a PR.
+- Run `make check` (or the relevant service checks) before opening a PR.
 
 ## Issue Reports
 
