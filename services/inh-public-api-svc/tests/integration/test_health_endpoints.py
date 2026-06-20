@@ -10,10 +10,17 @@ from src.main import create_app
 
 @pytest.fixture
 def client():
-    """Create a test client."""
+    """Create a test client with the lifespan's DB init stubbed out.
+
+    The lifespan startup calls ``get_database()`` which opens a real asyncpg
+    connection; offline that raises and aborts startup. We patch the symbol the
+    lifespan imports so the app starts without a live Postgres. Per-test handler
+    mocks (e.g. for the readiness probe) still apply.
+    """
     app = create_app()
-    with TestClient(app) as client:
-        yield client
+    with patch("src.main.get_database", new_callable=AsyncMock):
+        with TestClient(app) as client:
+            yield client
 
 
 class TestHealthEndpoints:
