@@ -287,6 +287,15 @@ uv run pytest
 
 Repository-wide contribution guidance lives in [CONTRIBUTING.md](CONTRIBUTING.md).
 
+## Roadmap and Architecture
+
+Inherent is an **agent memory substrate** — a permission-aware, citeable,
+freshness-aware retrieval layer that an organization's agents query
+continuously. The product boundary, guarantees, and non-goals are defined in
+[ADR 0001](docs/adr/0001-agent-memory-substrate.md). The milestone delivery plan
+mapping the issue backlog to that boundary lives in the
+[org-readiness requirements](docs/maintainers/org-readiness-requirements.md).
+
 ## Security and Support
 
 - Security reports: [SECURITY.md](SECURITY.md)

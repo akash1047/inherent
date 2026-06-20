@@ -5,6 +5,7 @@ Thanks for contributing to the Inherent OSS core.
 ## Before You Start
 
 - Read the root [README.md](README.md) for repository scope.
+- Read [ADR 0001 — Agent Memory Substrate](docs/adr/0001-agent-memory-substrate.md) for the product boundary, guarantees, and non-goals before proposing larger changes. The [org-readiness requirements](docs/maintainers/org-readiness-requirements.md) map the issue backlog to that boundary.
 - Keep changes aligned with the OSS boundary. Do not add internal tooling, secrets, or private operational workflows.
 - Prefer small pull requests with a clear problem statement.
 
