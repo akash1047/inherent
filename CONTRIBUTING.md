@@ -10,6 +10,29 @@ Thanks for contributing to the Inherent OSS core.
 
 ## Local Setup
 
+### Repository-Level Checks
+
+The shortest path is the repository-root `Makefile`, which runs the documented
+checks for **both** services from one place:
+
+```bash
+make install        # sync dev deps for both services
+make check          # validate + lint + format-check + type-check + security + test
+```
+
+You can also run any single stage across both services:
+
+```bash
+make lint           # Ruff
+make format-check   # Black --check
+make type-check     # mypy (services that enable it)
+make security-check # Bandit (services that enable it)
+make test           # pytest for both services
+```
+
+Run `make help` to list every target. Service-specific commands remain
+available below when you only need to touch one service.
+
 ### Ingestion Service
 
 ```bash
@@ -103,7 +126,7 @@ graphify .
 - Explain the problem and the approach.
 - Update docs when behavior, setup, or repository boundaries change.
 - Keep README and service-specific docs consistent.
-- Run the relevant local checks before opening a PR.
+- Run `make check` (or the relevant service checks) before opening a PR.
 
 ## Issue Reports
 
