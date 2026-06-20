@@ -164,17 +164,30 @@ curl -X POST http://localhost:18002/ingest \
 
 ## Quickstart
 
-The Makefile is the shortest path for local development:
+From a fresh checkout, one command gets you a working local stack:
 
 ```bash
-make setup
-make validate
-make dev
-make health
+make quickstart
 ```
 
-This starts the stack in the background and seeds the local API key
-`ink_dev_local_key_001`.
+This creates `.env`, installs both services, starts the Compose stack and waits
+for it to be healthy, bootstraps a local dev workspace and API key, checks
+readiness, and prints the next steps.
+
+Prefer the individual steps? They are still available:
+
+```bash
+make setup      # create .env + install both services
+make validate   # validate local env settings
+make dev        # start the stack and bootstrap the dev workspace/key
+make health     # check API health endpoints
+```
+
+`make bootstrap` (run by `quickstart` and `dev`) is **local/dev only**. It
+creates the dev workspace and API key `ink_dev_local_key_001` in **both** the
+PostgreSQL `api_keys` table and the MongoDB `workspaces` collection — the two
+control-plane records the protected API needs before any upload or search call
+works. It is safe to re-run.
 
 Follow [Getting Started Locally](docs/getting-started/local.md) to upload a
 sample document, wait for ingestion, search indexed content, inspect logs, and
