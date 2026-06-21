@@ -1,0 +1,14 @@
+{"query_id": "q1", "query": "what retrieval modes does Inherent support", "document_id": "sample.txt", "chunk_index": 0, "relevance": 3}
+{"query_id": "q1", "query": "what retrieval modes does Inherent support", "document_id": "sample.md", "chunk_index": 0, "relevance": 2}
+{"query_id": "q2", "query": "how does hybrid search combine BM25 and vectors with alpha", "document_id": "sample.md", "chunk_index": 0, "relevance": 3}
+{"query_id": "q2", "query": "how does hybrid search combine BM25 and vectors with alpha", "document_id": "sample.txt", "chunk_index": 0, "relevance": 2}
+{"query_id": "q3", "query": "what is a workspace", "document_id": "sample.txt", "chunk_index": 0, "relevance": 3}
+{"query_id": "q4", "query": "how are documents turned into chunks and embeddings", "document_id": "sample.txt", "chunk_index": 0, "relevance": 3}
+{"query_id": "q4", "query": "how are documents turned into chunks and embeddings", "document_id": "sample.md", "chunk_index": 0, "relevance": 2}
+{"query_id": "q5", "query": "which file formats can be ingested", "document_id": "sample.json", "chunk_index": 0, "relevance": 3}
+{"query_id": "q5", "query": "which file formats can be ingested", "document_id": "sample.txt", "chunk_index": 0, "relevance": 2}
+{"query_id": "q6", "query": "what is the maximum upload size in bytes", "document_id": "sample.json", "chunk_index": 0, "relevance": 3}
+{"query_id": "q7", "query": "X-API-Key authentication header for /v1/ routes", "document_id": "sample.html", "chunk_index": 0, "relevance": 3}
+{"query_id": "q7", "query": "X-API-Key authentication header for /v1/ routes", "document_id": "sample.md", "chunk_index": 0, "relevance": 2}
+{"query_id": "q8", "query": "Weaviate vector index and Temporal workflows architecture", "document_id": "sample.md", "chunk_index": 0, "relevance": 3}
+{"query_id": "q9", "query": "turning company knowledge into something AI systems can query", "document_id": "sample.txt", "chunk_index": 0, "relevance": 3}
