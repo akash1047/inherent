@@ -248,6 +248,10 @@ class SearchService:
         """
         start_time = time.time()
         results = await self._search_weaviate(workspace_id, user_id, request, query_vector)
+        # Advanced-methods dispatch point (#47). NO-OP by default — when the
+        # experimental flags are off (the default) this returns results
+        # unchanged. See _apply_advanced_methods.
+        results = self._apply_advanced_methods(results, request)
         processing_time = (time.time() - start_time) * 1000
         return SearchResponse(
             results=results,
@@ -256,6 +260,48 @@ class SearchService:
             processing_time_ms=round(processing_time, 2),
             search_mode=request.search_mode,
         )
+
+    def _apply_advanced_methods(
+        self,
+        results: list[SearchResult],
+        request: SearchRequest,
+    ) -> list[SearchResult]:
+        """Dispatch point for advanced retrieval methods (#47) — NO-OP scaffolding.
+
+        Advanced retrieval methods (cross-encoder rerank, GraphRAG-style graph
+        index, hierarchical index) are EXPERIMENTAL, OFF BY DEFAULT, and NOT yet
+        implemented. They are gated by the ``enable_reranker`` /
+        ``enable_graphrag_index`` / ``enable_hierarchy_index`` settings flags and
+        by the eval-gate policy (no method on-by-default without a documented
+        eval improvement vs the hybrid baseline #45 + maintainer approval; see
+        docs/advanced-indexes.md).
+
+        This method is deliberately side-effect-free: when a flag is on it only
+        logs that the method is enabled-but-not-implemented and returns
+        ``results`` UNCHANGED. When every flag is off (the default) it returns
+        ``results`` unchanged without logging. No graph/rerank/hierarchy logic is
+        performed here.
+        """
+        # NOTE: scaffolding only — these branches must NOT mutate ``results``.
+        if settings.enable_reranker:
+            logger.info(
+                "advanced method 'reranker' enabled but not implemented (scaffolding)",
+                search_mode=request.search_mode,
+                issue="#47",
+            )
+        if settings.enable_graphrag_index:
+            logger.info(
+                "advanced method 'graphrag_index' enabled but not implemented (scaffolding)",
+                search_mode=request.search_mode,
+                issue="#47",
+            )
+        if settings.enable_hierarchy_index:
+            logger.info(
+                "advanced method 'hierarchy_index' enabled but not implemented (scaffolding)",
+                search_mode=request.search_mode,
+                issue="#47",
+            )
+        return results
 
     async def _search_weaviate(
         self,

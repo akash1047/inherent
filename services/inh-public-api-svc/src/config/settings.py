@@ -171,6 +171,43 @@ class Settings(BaseSettings):
         ),
     )
 
+    # Advanced retrieval methods (#47) — EXPERIMENTAL, OFF BY DEFAULT.
+    #
+    # Each flag gates an advanced retrieval method that is NOT yet implemented
+    # (scaffolding only). They are opt-in and default to False so the production
+    # default stays the measured hybrid baseline (#45). Per the eval-gate policy
+    # (see docs/advanced-indexes.md), NO method may be turned on by default until
+    # it shows a documented eval improvement over the hybrid baseline on the M4
+    # retrieval evals (tests/evals/) AND has maintainer approval. Enable in dev
+    # only, to experiment.
+    enable_reranker: bool = Field(
+        default=False,
+        description=(
+            "EXPERIMENTAL (#47), off by default. Opt-in cross-encoder reranking of "
+            "assembled results. NOT implemented (scaffolding). Requires a documented "
+            "eval improvement vs the hybrid baseline (#45) + maintainer approval "
+            "before it may default on. See docs/advanced-indexes.md."
+        ),
+    )
+    enable_graphrag_index: bool = Field(
+        default=False,
+        description=(
+            "EXPERIMENTAL (#47), off by default. Opt-in GraphRAG-style graph index "
+            "retrieval. NOT implemented (scaffolding). Requires a documented eval "
+            "improvement vs the hybrid baseline (#45) + maintainer approval before "
+            "it may default on. See docs/advanced-indexes.md."
+        ),
+    )
+    enable_hierarchy_index: bool = Field(
+        default=False,
+        description=(
+            "EXPERIMENTAL (#47), off by default. Opt-in hierarchical (parent/child) "
+            "index retrieval. NOT implemented (scaffolding). Requires a documented "
+            "eval improvement vs the hybrid baseline (#45) + maintainer approval "
+            "before it may default on. See docs/advanced-indexes.md."
+        ),
+    )
+
     # Health Checks
     health_check_timeout_seconds: float = 5.0
 

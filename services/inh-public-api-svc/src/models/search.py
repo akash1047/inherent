@@ -45,6 +45,14 @@ class SearchRequest(BaseModel):
     )
 
     # Search mode (PM-S018)
+    #
+    # These are the STANDARD, production retrieval modes (semantic / hybrid /
+    # keyword). Advanced retrieval methods (cross-encoder rerank, GraphRAG-style
+    # graph index, hierarchical index) are NOT modes here: they are EXPERIMENTAL,
+    # OFF BY DEFAULT, and gated by the enable_reranker / enable_graphrag_index /
+    # enable_hierarchy_index settings flags + the eval-gate policy (#47; see
+    # docs/advanced-indexes.md). Do NOT add them to this Literal until a method
+    # is implemented and clears the eval gate.
     search_mode: Literal["semantic", "hybrid", "keyword"] = Field(
         default="semantic",
         description="Retrieval strategy: semantic (nearText), hybrid (BM25+vector), or keyword (BM25)",
