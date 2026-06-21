@@ -10,7 +10,7 @@ and referenced by workflow_run_id. This keeps every gRPC payload < 1KB
 and avoids the 4MB Temporal limit.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 
@@ -161,6 +161,11 @@ class ChunkData:
     # Defaults to 0 for backward compatibility; the chunk activity always
     # populates it with the model-aware estimate.
     token_count: int = 0
+    # RAG-poisoning / prompt-injection risk signal (#44). Heuristic, NON-BLOCKING:
+    # one of "none" | "low" | "medium" | "high" plus the matched reason codes.
+    # Defaults keep older staged chunks valid; the chunk activity always sets them.
+    content_risk: str = "none"
+    content_risk_reasons: list[str] = field(default_factory=list)
 
 
 @dataclass

@@ -151,6 +151,12 @@ class WeaviateService:
             # Freshness (#42): when the chunk was (re)ingested, so returned
             # evidence can be aged/flagged stale by the public API.
             Property(name="ingested_at", data_type=DataType.DATE),
+            # RAG-poisoning / prompt-injection risk signal (#44): a heuristic,
+            # NON-BLOCKING tag so search can surface and audit can count
+            # suspicious evidence. content_risk is the level ("none".."high");
+            # content_risk_reasons holds the matched reason codes.
+            Property(name="content_risk", data_type=DataType.TEXT),
+            Property(name="content_risk_reasons", data_type=DataType.TEXT_ARRAY),
         ]
 
     def disconnect(self) -> None:
@@ -437,6 +443,13 @@ class WeaviateService:
 
             with tenant_collection.batch.dynamic() as batch:
                 for chunk, vector in zip(chunks, vectors):
+                    # RAG-poisoning risk signal (#44): promote from chunk.metadata
+                    # (set by the store activity) onto Weaviate properties so the
+                    # public API can surface it. Defaults keep benign chunks clean.
+                    chunk_meta = chunk.metadata or {}
+                    content_risk = chunk_meta.get("content_risk") or "none"
+                    content_risk_reasons = list(chunk_meta.get("content_risk_reasons") or [])
+
                     properties = {
                         "document_id": document_id,
                         "workspace_id": workspace_id,
@@ -455,6 +468,9 @@ class WeaviateService:
                         # age returned evidence. Matches the PG document_chunks
                         # ingested_at; a refresh re-stores chunks with a new value.
                         "ingested_at": ingest_time,
+                        # Risk signal (#44): additive, NON-BLOCKING.
+                        "content_risk": content_risk,
+                        "content_risk_reasons": content_risk_reasons,
                     }
 
                     # Generate deterministic UUID

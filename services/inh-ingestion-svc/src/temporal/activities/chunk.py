@@ -148,6 +148,17 @@ async def _chunk_text_inner(input: ChunkTextInput) -> ChunkTextOutput:
     for c in chunks:
         c.token_count = estimate_tokens(c.content)
 
+    # RAG-poisoning / prompt-injection risk signal (#44). Computed per chunk so
+    # individual poisoned chunks can be surfaced even within an otherwise benign
+    # document. NON-BLOCKING: this never raises and never drops a chunk; it only
+    # tags the chunk so search/audit can weigh it.
+    from src.services.quality import compute_content_risk
+
+    for c in chunks:
+        risk_level, risk_reasons = compute_content_risk(c.content)
+        c.content_risk = risk_level
+        c.content_risk_reasons = risk_reasons
+
     logger.info(
         "Text chunked successfully",
         document_id=document_id,
@@ -180,6 +191,9 @@ async def _chunk_text_inner(input: ChunkTextInput) -> ChunkTextOutput:
             "start_char": c.start_char,
             "end_char": c.end_char,
             "token_count": c.token_count,
+            # Risk signal (#44) carried through staging to the store activities.
+            "content_risk": c.content_risk,
+            "content_risk_reasons": c.content_risk_reasons,
         }
         for c in chunks
     ]

@@ -110,10 +110,41 @@ class SearchResult(BaseModel):
     ingested_at: datetime | None = None
     is_stale: bool = False
 
+    # RAG-poisoning / prompt-injection risk (#44) — optional, backward-compatible.
+    # Promoted from the chunk so callers can see (and down-weight) evidence that
+    # was tagged at ingest time. This is a NON-BLOCKING signal: risky chunks are
+    # still returned, only flagged.
+    #   content_risk         — "none" | "low" | "medium" | "high" (None if unknown)
+    #   content_risk_reasons — matched heuristic reason codes (None if unknown)
+    content_risk: str | None = None
+    content_risk_reasons: list[str] | None = None
+
     # Claim-level citation (#39) — optional, backward-compatible. Built from this
     # result's own fields (chunk_id + spans + score + provenance + freshness) so
     # the evidence is citable without a second lookup.
     citation: "Citation | None" = None
+
+
+class QualityVerdict(BaseModel):
+    """Adaptive retrieval quality gate verdict (#43).
+
+    Computed from existing retrieval signals (result count, top score) after a
+    search, so the API can decide whether the evidence is good enough or whether
+    to attempt a single bounded fallback.
+
+    - ``verdict``     — overall judgement:
+        * ``"sufficient"``           — evidence looks good enough to answer.
+        * ``"insufficient_evidence"`` — too little/no evidence to answer well.
+        * ``"low_confidence"``       — there is evidence but it ranks weakly.
+    - ``reason_code`` — machine-readable reason (e.g. ``"no_results"``,
+                        ``"top_score_below_threshold"``, ``"low_result_count"``,
+                        ``"ok"``).
+    - ``confidence``  — coarse [0, 1] confidence proxy derived from the top score.
+    """
+
+    verdict: Literal["sufficient", "insufficient_evidence", "low_confidence"]
+    reason_code: str
+    confidence: float = Field(ge=0.0, le=1.0)
 
 
 class SearchResponse(BaseModel):
@@ -125,6 +156,16 @@ class SearchResponse(BaseModel):
     processing_time_ms: float
     search_mode: Literal["semantic", "hybrid", "keyword"]
     total_tokens: int = 0
+
+    # Adaptive retrieval quality gate (#43) — optional, backward-compatible.
+    #   quality_verdict   — the gate's judgement on the (possibly post-fallback)
+    #                       results; None when not evaluated.
+    #   performed_fallback — True when exactly one bounded fallback retry ran.
+    #   fallback_strategy  — which fallback ran (e.g. "keyword_retry",
+    #                        "broadened_query"); None when no fallback ran.
+    quality_verdict: QualityVerdict | None = None
+    performed_fallback: bool = False
+    fallback_strategy: str | None = None
 
 
 # Resolve the forward reference to Citation (#39). Imported here (not at module

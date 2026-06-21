@@ -348,6 +348,20 @@ class SearchService:
             ingested_at = self._parse_ingested_at(chunk.get("ingested_at"))
             is_stale = self._compute_is_stale(ingested_at)
 
+            # RAG-poisoning risk (#44): promote the heuristic ingest-time signal.
+            # NON-BLOCKING — risky chunks are flagged, never dropped. "none" is
+            # normalised to None so callers only see a level when it's notable.
+            raw_risk = chunk.get("content_risk")
+            content_risk = (
+                raw_risk if isinstance(raw_risk, str) and raw_risk and raw_risk != "none" else None
+            )
+            raw_reasons = chunk.get("content_risk_reasons")
+            content_risk_reasons = (
+                [str(r) for r in raw_reasons]
+                if content_risk and isinstance(raw_reasons, list) and raw_reasons
+                else None
+            )
+
             rounded_score = round(score, 4)
             chunk_id = additional.get("id", "")
             document_id = chunk.get("document_id", "")
@@ -403,6 +417,8 @@ class SearchService:
                     source_uri=source_uri,
                     ingested_at=ingested_at,
                     is_stale=is_stale,
+                    content_risk=content_risk,
+                    content_risk_reasons=content_risk_reasons,
                     citation=citation,
                 )
             )
@@ -471,6 +487,8 @@ class SearchService:
                     content_hash
                     source_uri
                     ingested_at
+                    content_risk
+                    content_risk_reasons
                     _additional {{ id score certainty distance }}
                 }}
             }}
