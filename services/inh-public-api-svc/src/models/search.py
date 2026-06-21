@@ -4,6 +4,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+ScoreSource = Literal["bm25", "vector", "hybrid"]
+
 
 class ContextChunk(BaseModel):
     """A neighbouring chunk supplied as context for a search result."""
@@ -50,7 +52,25 @@ class SearchRequest(BaseModel):
 
 
 class SearchResult(BaseModel):
-    """A single search result."""
+    """A single search result.
+
+    Score provenance (#45)
+    ----------------------
+    ``score`` is the normalised relevance value used for ranking. The optional
+    provenance fields explain *where* that score came from so clients can build
+    a measurable retrieval baseline:
+
+    - ``score_source``      — which signal produced ``score``:
+                              ``"bm25"`` (keyword), ``"vector"`` (semantic), or
+                              ``"hybrid"`` (Weaviate fusion).
+    - ``bm25_score``        — raw BM25 score when available (keyword/hybrid).
+    - ``vector_similarity`` — raw vector similarity (certainty, or the
+                              distance→similarity conversion) for semantic mode.
+    - ``alpha``             — the hybrid fusion weight echoed back for hybrid mode.
+
+    All provenance fields are optional and backward-compatible: existing clients
+    that ignore them are unaffected.
+    """
 
     chunk_id: str
     document_id: str
@@ -60,6 +80,12 @@ class SearchResult(BaseModel):
     metadata: dict | None = None
     context_before: list[ContextChunk] | None = None
     context_after: list[ContextChunk] | None = None
+
+    # Score provenance (#45) — optional, backward-compatible.
+    score_source: ScoreSource | None = None
+    bm25_score: float | None = None
+    vector_similarity: float | None = None
+    alpha: float | None = None
 
 
 class SearchResponse(BaseModel):

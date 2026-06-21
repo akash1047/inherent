@@ -148,6 +148,17 @@ class Settings(BaseSettings):
     )
     embedding_dim: int = Field(384, alias="EMBEDDING_DIM")
 
+    # Search (#13 — multi-workspace retrieval)
+    search_max_workspace_concurrency: int = Field(
+        default=8,
+        ge=1,
+        description=(
+            "Maximum number of workspaces searched concurrently for a single "
+            "multi-workspace search request. Bounds in-flight Weaviate queries "
+            "so a user with many workspaces cannot exhaust the connection pool."
+        ),
+    )
+
     # Health Checks
     health_check_timeout_seconds: float = 5.0
 

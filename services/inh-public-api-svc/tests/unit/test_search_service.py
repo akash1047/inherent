@@ -344,7 +344,11 @@ class TestSearchMethod:
 
             await search_service.search(workspace_id="ws1", user_id="u1", request=request)
 
-            mock_weaviate.assert_called_once_with("ws1", "u1", request)
+            # _search_weaviate now also receives an optional precomputed query
+            # vector (None for a single-workspace call); assert the leading args
+            # without coupling to the new trailing parameter.
+            assert mock_weaviate.call_count == 1
+            assert mock_weaviate.call_args.args[:3] == ("ws1", "u1", request)
 
 
 class TestSemanticScoreFallback:

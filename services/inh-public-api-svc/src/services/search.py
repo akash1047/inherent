@@ -48,7 +48,49 @@ def _get_user_tenant_name(user_id: str) -> str:
 
 
 class SearchService:
-    """Service for semantic search operations."""
+    """Service for semantic search operations.
+
+    Scoring semantics (#45)
+    -----------------------
+    Each search mode derives its relevance ``score`` from a different Weaviate
+    signal. The score is always normalised so results are comparable within a
+    single response (and, for multi-workspace search, across workspaces):
+
+    - ``keyword`` mode → **BM25**. Weaviate returns ``_additional.score`` as a
+      ts_rank-style float (>= 0, unbounded; higher is more relevant).
+      ``score_source = "bm25"`` and the raw value is echoed in ``bm25_score``.
+
+    - ``semantic`` mode → **vector similarity**. ``nearVector`` does not populate
+      ``_additional.score``; instead it returns ``certainty`` (cosine similarity
+      normalised to ``[0, 1]``, higher is better) and/or ``distance`` (cosine
+      distance in ``[0, 2]``, lower is better). We prefer ``certainty`` when
+      present; otherwise we convert distance with::
+
+          similarity = max(0.0, 1.0 - (distance / 2.0))
+
+      which maps distance 0 → 1.0 (identical) and distance 2 → 0.0 (opposite).
+      ``score_source = "vector"`` and the value is echoed in ``vector_similarity``.
+
+    - ``hybrid`` mode → **Weaviate hybrid fusion**. Weaviate fuses BM25 and
+      vector results using ``alpha`` (1.0 = pure vector, 0.0 = pure keyword) and
+      returns the fused score in ``_additional.score``. ``score_source =
+      "hybrid"`` and the fusion ``alpha`` is echoed back on each result. When a
+      raw ``certainty``/``distance`` is also present we surface it in
+      ``vector_similarity`` for transparency.
+
+    Fallback priority for the ranking score (per result): ``score`` (BM25/hybrid)
+    → ``certainty`` → distance→similarity → ``0.0``.
+
+    Permission scoping (#45)
+    ------------------------
+    ``search()`` is always tenant-scoped: every Weaviate query carries the
+    caller's ``tenant`` (derived from ``user_id``) and targets a single
+    workspace collection, so a single-workspace search cannot read another
+    user's data. Multi-workspace search (the API layer) only fans out over the
+    workspace IDs returned by ``get_user_workspace_ids`` — the caller's
+    authorised set — so merged results can never cross authorization. These
+    invariants are enforced upstream; no redundant per-result filter is added.
+    """
 
     def __init__(self, database: DatabaseService, weaviate_url: str):
         self.database = database
@@ -92,11 +134,28 @@ class SearchService:
         except Exception:
             return False
 
+    @staticmethod
+    def embed_query_vector(request: SearchRequest) -> list[float] | None:
+        """Compute the query embedding for a request, or ``None`` for keyword mode.
+
+        Keyword (BM25) search needs no vector, so we skip the embedding call.
+        Computing this once and passing it into :meth:`search` lets a
+        multi-workspace request embed the query a single time and reuse the
+        vector across every workspace (#13), instead of re-embedding per
+        workspace.
+        """
+        if request.search_mode == "keyword":
+            return None
+        from src.services.embedder import embed_query
+
+        return list(embed_query(request.query))
+
     async def search(
         self,
         workspace_id: str,
         user_id: str,
         request: SearchRequest,
+        query_vector: list[float] | None = None,
     ) -> SearchResponse:
         """Perform search scoped to a workspace and user tenant.
 
@@ -105,10 +164,16 @@ class SearchService:
         - hybrid:   hybrid (BM25 + vector with alpha fusion, client-side embedding)
         - keyword:  bm25 (pure keyword)
 
+        ``query_vector`` may be supplied by the caller (e.g. multi-workspace
+        search) to reuse a single precomputed embedding across workspaces (#13).
+        When ``None`` the vector is computed lazily here for semantic/hybrid
+        modes; it is ignored for keyword mode.
+
         Weaviate or network errors propagate to the caller — no silent fallback.
+        See the API layer for the multi-workspace partial-result policy.
         """
         start_time = time.time()
-        results = await self._search_weaviate(workspace_id, user_id, request)
+        results = await self._search_weaviate(workspace_id, user_id, request, query_vector)
         processing_time = (time.time() - start_time) * 1000
         return SearchResponse(
             results=results,
@@ -123,8 +188,15 @@ class SearchService:
         workspace_id: str,
         user_id: str,
         request: SearchRequest,
+        query_vector: list[float] | None = None,
     ) -> list[SearchResult]:
-        """Execute the requested search mode against a workspace-specific Weaviate collection."""
+        """Execute the requested search mode against a workspace-specific Weaviate collection.
+
+        Permission scoping (#45): the query is always tenant-scoped to
+        ``user_id`` and targets only ``workspace_id``'s collection, so results
+        cannot cross authorization (asserted indirectly by the tenant/collection
+        name guards below).
+        """
         client = await self._get_client()
 
         collection_name = _get_workspace_collection_name(workspace_id)
@@ -135,7 +207,7 @@ class SearchService:
         ).isalnum(), f"Unsafe collection name: {collection_name}"
         assert tenant_name.replace("_", "").isalnum(), f"Unsafe tenant name: {tenant_name}"
 
-        graphql_query = self._build_graphql(collection_name, tenant_name, request)
+        graphql_query = self._build_graphql(collection_name, tenant_name, request, query_vector)
 
         try:
             response = await client.post("/v1/graphql", json=graphql_query)
@@ -169,23 +241,64 @@ class SearchService:
                         return 0.0
                 return 0.0
 
-            bm25_score = _to_float(additional.get("score"))
+            raw_score = _to_float(additional.get("score"))
             certainty = _to_float(additional.get("certainty"))
             distance = _to_float(additional.get("distance"))
 
-            if bm25_score > 0:
-                score = bm25_score
+            # Resolve ranking score with the documented fallback priority:
+            #   score (BM25/hybrid) → certainty → distance→similarity → 0.0
+            vector_similarity: float | None = None
+            if raw_score > 0:
+                score = raw_score
             elif certainty > 0:
                 score = certainty
+                vector_similarity = certainty
             elif distance > 0:
-                # cosine distance is in [0, 2]; convert to a similarity in [-1, 1] then
-                # squash to [0, 1] for a comparable score
+                # cosine distance is in [0, 2]; convert to a similarity in [0, 1]
+                # so it is comparable to certainty (see class docstring).
                 score = max(0.0, 1.0 - (distance / 2.0))
+                vector_similarity = score
             else:
                 score = 0.0
 
+            # Score provenance (#45): map the mode to its score source and the
+            # raw signals that produced the score.
+            if request.search_mode == "keyword":
+                score_source = "bm25"
+                bm25_score: float | None = raw_score if raw_score > 0 else None
+                result_alpha: float | None = None
+            elif request.search_mode == "hybrid":
+                score_source = "hybrid"
+                bm25_score = raw_score if raw_score > 0 else None
+                result_alpha = request.alpha
+                # Surface raw vector signal too when Weaviate provides it.
+                if vector_similarity is None and certainty > 0:
+                    vector_similarity = certainty
+            else:  # semantic
+                score_source = "vector"
+                bm25_score = None
+                result_alpha = None
+                if vector_similarity is None and certainty > 0:
+                    vector_similarity = certainty
+
             if score < request.min_score:
                 continue
+
+            # Pass through any extra chunk fields (e.g. freshness metadata) so
+            # downstream consumers keep them (#45). chunk_index is preserved for
+            # backward compatibility; known core fields are not duplicated.
+            metadata: dict[str, Any] = {"chunk_index": chunk.get("chunk_index")}
+            _core_fields = {
+                "document_id",
+                "original_filename",
+                "content",
+                "chunk_index",
+                "_additional",
+            }
+            for key, value in chunk.items():
+                if key not in _core_fields:
+                    metadata[key] = value
+
             results.append(
                 SearchResult(
                     chunk_id=additional.get("id", ""),
@@ -193,7 +306,13 @@ class SearchService:
                     document_name=chunk.get("original_filename", ""),
                     content=chunk.get("content", ""),
                     score=round(score, 4),
-                    metadata={"chunk_index": chunk.get("chunk_index")},
+                    metadata=metadata,
+                    score_source=score_source,
+                    bm25_score=round(bm25_score, 4) if bm25_score is not None else None,
+                    vector_similarity=(
+                        round(vector_similarity, 4) if vector_similarity is not None else None
+                    ),
+                    alpha=result_alpha,
                 )
             )
         return results
@@ -203,8 +322,14 @@ class SearchService:
         collection_name: str,
         tenant_name: str,
         request: SearchRequest,
+        query_vector: list[float] | None = None,
     ) -> dict:
-        """Compose the GraphQL query body for the requested search mode."""
+        """Compose the GraphQL query body for the requested search mode.
+
+        ``query_vector`` is an optional precomputed embedding. When supplied it
+        is reused (avoiding a redundant embedding call); when ``None`` it is
+        computed here for semantic/hybrid modes (#13).
+        """
         escaped_query = request.query.replace("\\", "\\\\").replace('"', '\\"')
         where_clause = ""
         if request.document_ids:
@@ -220,9 +345,14 @@ class SearchService:
         else:
             # Semantic and hybrid both need the query vector computed client-side
             # because Weaviate is configured without a text vectorizer module.
-            from src.services.embedder import embed_query
+            # Reuse the caller's precomputed vector when provided (#13) so a
+            # multi-workspace request embeds the query only once.
+            if query_vector is not None:
+                vector_list = query_vector
+            else:
+                from src.services.embedder import embed_query
 
-            vector_list = list(embed_query(request.query))
+                vector_list = list(embed_query(request.query))
             vector_literal = "[" + ", ".join(f"{v:.6f}" for v in vector_list) + "]"
             if request.search_mode == "hybrid":
                 search_args = (

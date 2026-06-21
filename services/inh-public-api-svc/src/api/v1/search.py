@@ -1,9 +1,12 @@
 """Search endpoint."""
 
+import asyncio
+import time
 from typing import Annotated
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Header
 
+from src.config import settings
 from src.models.search import SearchRequest, SearchResponse, SearchResult
 from src.services.audit_publisher import build_audit_event, publish_audit_event
 from src.services.auth import ResolvedAuth, resolve_workspace_search
@@ -127,6 +130,64 @@ async def _expand_context_and_total_tokens(
     response.total_tokens = _compute_total_tokens(response.results)
 
 
+async def _search_workspaces_concurrently(
+    search_service: SearchService,
+    *,
+    user_id: str,
+    workspace_ids: list[str],
+    request: SearchRequest,
+) -> tuple[list[SearchResult], float]:
+    """Fan out a search across the user's authorised workspaces (#13).
+
+    Behaviour:
+    - The query embedding is computed ONCE and reused across every workspace,
+      instead of re-embedding per workspace.
+    - Workspaces are searched concurrently with ``asyncio.gather`` bounded by an
+      ``asyncio.Semaphore`` sized from ``search_max_workspace_concurrency`` so a
+      user with many workspaces cannot exhaust the Weaviate connection pool.
+    - Per-workspace failure isolation (partial-result policy): if one workspace
+      search raises, the error is logged and that workspace contributes zero
+      results; the remaining workspaces still return. The request only fails if
+      every workspace fails in a way that is surfaced here — single failures
+      degrade to partial results rather than a 5xx.
+
+    Returns the merged (unsorted, unlimited) results and the parallel wall-clock
+    time in milliseconds (measured around the gather, NOT a sum of per-workspace
+    times).
+    """
+    # Embed once, reuse across all workspaces (#13).
+    query_vector = search_service.embed_query_vector(request)
+
+    semaphore = asyncio.Semaphore(settings.search_max_workspace_concurrency)
+
+    async def _search_one(ws_id: str) -> list[SearchResult]:
+        async with semaphore:
+            try:
+                resp = await search_service.search(
+                    workspace_id=ws_id,
+                    user_id=user_id,
+                    request=request,
+                    query_vector=query_vector,
+                )
+                return resp.results
+            except Exception as exc:  # noqa: BLE001 — partial-result isolation
+                logger.warning(
+                    "multi_workspace_search_partial_failure",
+                    workspace_id=ws_id,
+                    error=str(exc),
+                )
+                return []
+
+    start = time.time()
+    per_workspace_results = await asyncio.gather(*(_search_one(ws_id) for ws_id in workspace_ids))
+    wall_clock_ms = (time.time() - start) * 1000
+
+    merged: list[SearchResult] = []
+    for ws_results in per_workspace_results:
+        merged.extend(ws_results)
+    return merged, wall_clock_ms
+
+
 @router.post("/search", response_model=SearchResponse)
 async def search_documents(
     request: SearchRequest,
@@ -192,26 +253,28 @@ async def search_documents(
         )
         return response
 
-    all_results = []
-    total_time = 0.0
-    for ws_id in user_workspaces:
-        resp = await search_service.search(
-            workspace_id=ws_id,
-            user_id=auth.key_info.user_id,
-            request=request,
-        )
-        all_results.extend(resp.results)
-        total_time += resp.processing_time_ms
+    # #13: concurrent, bounded fan-out with per-workspace failure isolation.
+    # Permission scoping (#45): user_workspaces == get_user_workspace_ids, the
+    # caller's authorised set, so merged results cannot cross authorization.
+    all_results, wall_clock_ms = await _search_workspaces_concurrently(
+        search_service,
+        user_id=auth.key_info.user_id,
+        workspace_ids=user_workspaces,
+        request=request,
+    )
 
-    # Sort by score descending and limit
-    all_results.sort(key=lambda r: r.score, reverse=True)
+    # Deterministic global top-k: sort by descending score with a stable
+    # tiebreaker on (chunk_id, document_id) so equal scores rank consistently
+    # across requests, then truncate to the requested limit (#13).
+    all_results.sort(key=lambda r: (-r.score, r.chunk_id, r.document_id))
     limited = all_results[: request.limit]
 
     response = SearchResponse(
         results=limited,
         query=request.query,
         total_results=len(limited),
-        processing_time_ms=round(total_time, 2),
+        # Parallel wall-clock, not the sum of per-workspace times (#13).
+        processing_time_ms=round(wall_clock_ms, 2),
         search_mode=request.search_mode,
     )
     # PM-S019: for multi-workspace, use primary workspace when unambiguous
