@@ -159,6 +159,38 @@ class WeaviateService:
             Property(name="content_risk_reasons", data_type=DataType.TEXT_ARRAY),
         ]
 
+    def _reconcile_collection_properties(self, collection_name: str) -> None:
+        """Add any missing chunk properties to an EXISTING collection.
+
+        Collections created before a property was introduced (e.g. the
+        provenance/freshness/risk fields from #41/#42/#44) lack it. Because the
+        public-API search GraphQL-selects those fields, a missing property makes
+        the whole query fail with "Cannot query field ... on type ...". Weaviate
+        supports adding properties to an existing class, so we reconcile the live
+        schema against _get_chunk_properties() and add whatever is missing.
+        Idempotent and best-effort (logged, never raises).
+        """
+        if not self.client:
+            return
+        try:
+            collection = self.client.collections.get(collection_name)
+            existing = {p.name for p in collection.config.get().properties}
+            for prop in self._get_chunk_properties():
+                if prop.name not in existing:
+                    collection.config.add_property(prop)
+                    logger.info(
+                        "Added missing Weaviate property to existing collection",
+                        collection=collection_name,
+                        property_name=prop.name,
+                    )
+        except Exception as e:
+            logger.warning(
+                "Failed to reconcile collection properties; "
+                "search selecting new fields may fail until fixed",
+                collection=collection_name,
+                error=str(e),
+            )
+
     def disconnect(self) -> None:
         """Disconnect from Weaviate."""
         if self.client:
@@ -199,6 +231,10 @@ class WeaviateService:
 
         try:
             if self.client.collections.exists(collection_name):
+                # Reconcile schema so collections created before newer chunk
+                # properties (provenance/freshness/risk) gain them; otherwise a
+                # search selecting those fields fails on the old schema.
+                self._reconcile_collection_properties(collection_name)
                 self._collection_cache.add(collection_name)
                 logger.debug("Workspace collection exists", collection=collection_name)
                 return collection_name
