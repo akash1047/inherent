@@ -2,15 +2,26 @@
 
 import asyncio
 import time
+from collections.abc import Awaitable, Callable
 from typing import Annotated
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Header
 
 from src.config import settings
-from src.models.search import SearchRequest, SearchResponse, SearchResult
-from src.services.audit_publisher import build_audit_event, publish_audit_event
+from src.models.search import (
+    QualityVerdict,
+    SearchRequest,
+    SearchResponse,
+    SearchResult,
+)
+from src.services.audit_publisher import (
+    build_audit_event,
+    count_results_by_risk,
+    publish_audit_event,
+)
 from src.services.auth import ResolvedAuth, resolve_workspace_search
 from src.services.database import get_database
+from src.services.quality_gate import evaluate as evaluate_quality
 from src.services.search import SearchService, get_search_service
 from src.utils import get_logger
 
@@ -104,7 +115,15 @@ def _schedule_audit(
         include_context=request.include_context,
         context_window=request.context_window,
         alpha=request.alpha,
+        # RAG-poisoning visibility (#44): counts of returned chunks by risk level.
+        risk_counts=count_results_by_risk(response.results),
     )
+    # Adaptive retrieval quality gate (#43): record verdict + any fallback so the
+    # audit trail shows when retrieval was weak / a fallback ran.
+    if response.quality_verdict is not None:
+        event["quality_verdict"] = response.quality_verdict.model_dump()
+    event["performed_fallback"] = response.performed_fallback
+    event["fallback_strategy"] = response.fallback_strategy
     background_tasks.add_task(publish_audit_event, event)
 
 
@@ -195,6 +214,93 @@ async def _search_workspaces_concurrently(
     return merged, wall_clock_ms
 
 
+# A retrieval callable: given a (possibly modified) request, return the matched
+# results plus the processing time in ms. Both the single-workspace and the
+# multi-workspace paths provide one of these so the quality gate + fallback
+# logic is shared and path-agnostic (#43).
+RetrieveFn = Callable[[SearchRequest], Awaitable[tuple[list[SearchResult], float]]]
+
+
+def _build_fallback_request(
+    request: SearchRequest, verdict: QualityVerdict
+) -> SearchRequest | None:
+    """Derive ONE bounded fallback request from a non-sufficient verdict (#43).
+
+    Strategy:
+    - low_confidence        → retry in keyword (BM25) mode. A weak top score in
+                              semantic/hybrid mode often means a lexical match is
+                              the better signal for this query.
+    - insufficient_evidence → broaden the query: drop ``min_score`` to 0 and
+                              widen ``limit`` so more candidates can surface.
+
+    Returns the modified request, or ``None`` when no meaningful fallback applies
+    (e.g. low_confidence already in keyword mode, or a broaden that changes
+    nothing) so the caller skips the retry. The retry is always a SINGLE attempt;
+    its result is never re-fed into the fallback (the caller enforces this).
+    """
+    if verdict.verdict == "low_confidence":
+        if request.search_mode == "keyword":
+            return None  # already keyword; a keyword retry would be identical
+        return request.model_copy(update={"search_mode": "keyword"})
+
+    if verdict.verdict == "insufficient_evidence":
+        broadened_limit = min(max(request.limit * 2, request.limit), 100)
+        if request.min_score <= 0.0 and broadened_limit == request.limit:
+            return None  # nothing left to broaden
+        return request.model_copy(update={"min_score": 0.0, "limit": broadened_limit})
+
+    return None
+
+
+def _fallback_strategy_name(request: SearchRequest, verdict: QualityVerdict) -> str:
+    """Human-readable label for the fallback that ran, for response + audit."""
+    if verdict.verdict == "low_confidence":
+        return "keyword_retry"
+    return "broadened_query"
+
+
+async def _apply_quality_gate_and_fallback(
+    response: SearchResponse,
+    request: SearchRequest,
+    retrieve: RetrieveFn,
+) -> None:
+    """Evaluate retrieval quality and, if needed, do ONE bounded fallback (#43).
+
+    Mutates *response* in place: sets ``quality_verdict`` and, when a fallback
+    runs, ``performed_fallback`` / ``fallback_strategy`` and replaces
+    ``results`` / ``total_results`` / ``processing_time_ms`` with the retry's.
+
+    Loop-safety: the fallback is attempted at most ONCE. The retry's verdict is
+    recomputed and attached, but it never triggers another fallback — there is
+    no recursion and no loop here, by construction.
+    """
+    verdict = evaluate_quality(response.results, request)
+    response.quality_verdict = verdict
+
+    if verdict.verdict == "sufficient":
+        return
+
+    fallback_request = _build_fallback_request(request, verdict)
+    if fallback_request is None:
+        return
+
+    strategy = _fallback_strategy_name(request, verdict)
+    try:
+        fb_results, fb_ms = await retrieve(fallback_request)
+    except Exception as exc:  # noqa: BLE001 — fallback must never fail the request
+        logger.warning("quality_gate_fallback_failed", strategy=strategy, error=str(exc))
+        return
+
+    response.results = fb_results
+    response.total_results = len(fb_results)
+    response.processing_time_ms = round(response.processing_time_ms + fb_ms, 2)
+    response.performed_fallback = True
+    response.fallback_strategy = strategy
+    # Re-evaluate on the post-fallback results. This is the FINAL verdict; it is
+    # NOT used to trigger another fallback (single bounded retry, see docstring).
+    response.quality_verdict = evaluate_quality(fb_results, fallback_request)
+
+
 @router.post("/search", response_model=SearchResponse)
 async def search_documents(
     request: SearchRequest,
@@ -223,6 +329,18 @@ async def search_documents(
             user_id=auth.key_info.user_id,
             request=request,
         )
+
+        # Adaptive retrieval quality gate + single bounded fallback (#43).
+        async def _retrieve_single(req: SearchRequest) -> tuple[list[SearchResult], float]:
+            resp = await search_service.search(
+                workspace_id=workspace_id,
+                user_id=auth.key_info.user_id,
+                request=req,
+            )
+            return resp.results, resp.processing_time_ms
+
+        await _apply_quality_gate_and_fallback(response, request, _retrieve_single)
+
         # PM-S019: expand context windows and compute total_tokens
         await _expand_context_and_total_tokens(
             response, request, workspace_id, auth.key_info.user_id
@@ -249,6 +367,9 @@ async def search_documents(
             processing_time_ms=0.0,
             search_mode=request.search_mode,
         )
+        # Quality gate (#43): no workspaces means no evidence; record the verdict
+        # but there is nothing to fall back to.
+        response.quality_verdict = evaluate_quality(response.results, request)
         # PM-S019: no results, total_tokens stays 0; context expansion skipped
         await _expand_context_and_total_tokens(response, request, "", auth.key_info.user_id)
         _record_search_metrics(request, None)
@@ -265,18 +386,22 @@ async def search_documents(
     # #13: concurrent, bounded fan-out with per-workspace failure isolation.
     # Permission scoping (#45): user_workspaces == get_user_workspace_ids, the
     # caller's authorised set, so merged results cannot cross authorization.
-    all_results, wall_clock_ms = await _search_workspaces_concurrently(
-        search_service,
-        user_id=auth.key_info.user_id,
-        workspace_ids=user_workspaces,
-        request=request,
-    )
+    # Wrapped as a retrieve callable so the quality gate can re-run it once for a
+    # bounded fallback (#43) over the SAME authorised workspace set.
+    async def _retrieve_multi(req: SearchRequest) -> tuple[list[SearchResult], float]:
+        merged, wall_ms = await _search_workspaces_concurrently(
+            search_service,
+            user_id=auth.key_info.user_id,
+            workspace_ids=user_workspaces,
+            request=req,
+        )
+        # Deterministic global top-k: sort by descending score with a stable
+        # tiebreaker on (chunk_id, document_id) so equal scores rank consistently
+        # across requests, then truncate to the requested limit (#13).
+        merged.sort(key=lambda r: (-r.score, r.chunk_id, r.document_id))
+        return merged[: req.limit], wall_ms
 
-    # Deterministic global top-k: sort by descending score with a stable
-    # tiebreaker on (chunk_id, document_id) so equal scores rank consistently
-    # across requests, then truncate to the requested limit (#13).
-    all_results.sort(key=lambda r: (-r.score, r.chunk_id, r.document_id))
-    limited = all_results[: request.limit]
+    limited, wall_clock_ms = await _retrieve_multi(request)
 
     response = SearchResponse(
         results=limited,
@@ -286,6 +411,10 @@ async def search_documents(
         processing_time_ms=round(wall_clock_ms, 2),
         search_mode=request.search_mode,
     )
+    # Adaptive retrieval quality gate + single bounded fallback (#43), reusing the
+    # same authorised fan-out so a fallback can never widen the workspace scope.
+    await _apply_quality_gate_and_fallback(response, request, _retrieve_multi)
+
     # PM-S019: for multi-workspace, use primary workspace when unambiguous
     ctx_ws = user_workspaces[0] if len(user_workspaces) == 1 else ""
     await _expand_context_and_total_tokens(response, request, ctx_ws, auth.key_info.user_id)
