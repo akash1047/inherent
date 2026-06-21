@@ -9,22 +9,29 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends tesseract-ocr \
     && rm -rf /var/lib/apt/lists/*
 
-# Set working directory
-WORKDIR /app
+# NOTE: this image expects the build context to be the REPO ROOT (set in
+# docker-compose.yml via `context: .`), so the sibling shared package
+# services/inh-contracts is visible and the `../inh-contracts` uv path
+# dependency resolves.
 
-# Ensure Python resolves the src package from /app (the local source),
-# not from a stale installed wheel in site-packages.
-# PYTHONPATH entries come before site-packages in sys.path.
-ENV PYTHONPATH=/app
+# Copy the shared contracts package first (separate layer; changes rarely).
+COPY services/inh-contracts /app/services/inh-contracts
 
-# Copy dependency files (including Readme.md required by pyproject.toml)
-COPY pyproject.toml Readme.md ./
+# Copy this service's dependency files + source (Readme.md is required by
+# pyproject.toml; hatchling needs src/ present at install time).
+COPY services/inh-ingestion-svc/pyproject.toml services/inh-ingestion-svc/Readme.md /app/services/inh-ingestion-svc/
+COPY services/inh-ingestion-svc/src /app/services/inh-ingestion-svc/src
 
-# Copy source code before install (required for package install)
-COPY src/ ./src/
+WORKDIR /app/services/inh-ingestion-svc
+
+# Ensure Python resolves the src package from the service dir (the local
+# source), not from a stale installed wheel in site-packages. PYTHONPATH
+# entries come before site-packages in sys.path.
+ENV PYTHONPATH=/app/services/inh-ingestion-svc
 
 # Install dependencies and the package, including the optional 'ocr' extra
-# (pytesseract + Pillow) so PNG OCR works in the Compose stack.
+# (pytesseract + Pillow) so PNG OCR works in the Compose stack. The
+# `../inh-contracts` path dependency resolves relative to this WORKDIR.
 RUN uv pip install --system ".[ocr]"
 
 # Create non-root user

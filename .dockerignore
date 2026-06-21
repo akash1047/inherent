@@ -1,0 +1,30 @@
+# The Docker build context is now the repo root (so the shared
+# services/inh-contracts package is visible). Keep the context small by
+# excluding everything the image builds don't need.
+
+# VCS
+.git
+.gitignore
+
+# Knowledge-graph / tooling output
+graphify-out
+
+# Python virtualenvs and caches
+**/.venv
+.venv
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+**/.mypy_cache
+**/.ruff_cache
+**/.coverage
+**/htmlcov
+
+# Local env files
+**/.env
+**/.env.*
+
+# Editor / OS cruft
+**/.DS_Store
+.idea
+.vscode

@@ -5,6 +5,8 @@ description = "Customer-facing API and MCP server for Inherent Knowledge Base"
 readme = "Readme.md"
 requires-python = ">=3.11"
 dependencies = [
+    # Shared cross-service contracts (naming + event schemas)
+    "inh-contracts",
     # Web framework
     "fastapi>=0.115.0",
     "uvicorn[standard]>=0.32.0",
@@ -55,6 +57,9 @@ dev = [
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.uv.sources]
+inh-contracts = { path = "../inh-contracts" }
 
 [tool.hatch.build.targets.wheel]
 packages = ["src"]

@@ -6,6 +6,11 @@ import time
 from typing import Any
 
 import httpx
+from inh_contracts.naming import (
+    WORKSPACE_COLLECTION_PREFIX,
+    get_user_tenant_name,
+    get_workspace_collection_name,
+)
 
 from src.config import settings
 from src.models.search import SearchRequest, SearchResponse, SearchResult
@@ -14,27 +19,32 @@ from src.utils import get_logger
 
 logger = get_logger(__name__)
 
-WORKSPACE_COLLECTION_PREFIX = "Workspace_"
+# Re-exported for backward compatibility (the WORKSPACE_COLLECTION_PREFIX
+# constant and the naming helpers now live in the shared contracts package).
+__all__ = [
+    "WORKSPACE_COLLECTION_PREFIX",
+    "SearchService",
+    "get_search_service",
+    "close_search_service",
+]
 
 
 def _get_workspace_collection_name(workspace_id: str) -> str:
     """Return the Weaviate collection name for a workspace.
 
-    Matches the ingestion service naming convention:
-    ``Workspace_`` + workspace_id with non-alphanumeric chars removed.
+    Thin wrapper over the shared contracts helper (single source of truth, #12),
+    kept under its existing private name so callers and golden tests still work.
     """
-    safe_id = re.sub(r"[^a-zA-Z0-9]", "", workspace_id)
-    return f"{WORKSPACE_COLLECTION_PREFIX}{safe_id}"
+    return get_workspace_collection_name(workspace_id)
 
 
 def _get_user_tenant_name(user_id: str) -> str:
     """Return the Weaviate tenant name for a user.
 
-    Matches the ingestion service naming convention:
-    ``User_`` + user_id with non-alphanumeric chars removed.
+    Thin wrapper over the shared contracts helper (single source of truth, #12),
+    kept under its existing private name so callers and golden tests still work.
     """
-    safe_id = re.sub(r"[^a-zA-Z0-9]", "", user_id)
-    return f"User_{safe_id}"
+    return get_user_tenant_name(user_id)
 
 
 class SearchService:

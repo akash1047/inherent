@@ -6,13 +6,21 @@ Multi-tenancy Design:
 - This enables efficient per-user data isolation within workspace-level organization
 """
 
-import re
 import uuid
 from datetime import UTC, datetime
 from typing import Any
 
 import structlog
 import weaviate
+
+# Weaviate naming now lives in the shared contracts package (single source of
+# truth, #12). Re-exported here so existing imports keep working:
+#   from src.services.weaviate import get_workspace_collection_name
+from inh_contracts.naming import (
+    WORKSPACE_COLLECTION_PREFIX,
+    get_user_tenant_name,
+    get_workspace_collection_name,
+)
 from weaviate.classes.config import Configure, DataType, Property
 from weaviate.classes.init import Auth
 from weaviate.classes.query import Filter, MetadataQuery
@@ -21,32 +29,18 @@ from weaviate.classes.tenants import Tenant, TenantActivityStatus
 from src.config.settings import Settings
 from src.models.document import DocumentChunk
 
+__all__ = [
+    "WeaviateService",
+    "DOCUMENT_CHUNKS_COLLECTION",
+    "WORKSPACE_COLLECTION_PREFIX",
+    "get_workspace_collection_name",
+    "get_user_tenant_name",
+]
+
 logger = structlog.get_logger(__name__)
 
 # Legacy collection name (kept for backward compatibility)
 DOCUMENT_CHUNKS_COLLECTION = "DocumentChunk"
-
-# Multi-tenant collection prefix
-WORKSPACE_COLLECTION_PREFIX = "Workspace_"
-
-
-def get_workspace_collection_name(workspace_id: str) -> str:
-    """Generate a valid Weaviate collection name from workspace ID.
-
-    Weaviate collection names must:
-    - Start with an uppercase letter
-    - Only contain alphanumeric characters and underscores
-    """
-    # Remove any non-alphanumeric characters from workspace_id
-    safe_id = re.sub(r"[^a-zA-Z0-9]", "", workspace_id)
-    return f"{WORKSPACE_COLLECTION_PREFIX}{safe_id}"
-
-
-def get_user_tenant_name(user_id: str) -> str:
-    """Generate a valid Weaviate tenant name from user ID."""
-    # Remove any non-alphanumeric characters from user_id
-    safe_id = re.sub(r"[^a-zA-Z0-9]", "", user_id)
-    return f"User_{safe_id}"
 
 
 class WeaviateService:
