@@ -26,6 +26,25 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 
+def _merge_chunk_provenance(row) -> dict:
+    """Fold the document_chunks provenance/freshness COLUMNS into the chunk's
+    metadata dict so consumers that read metadata (e.g. explain_lineage, #40)
+    see the real values stored by #41/#42. Existing metadata keys win.
+    """
+    meta = dict(row.metadata or {})
+    if getattr(row, "content_hash", None) is not None:
+        meta.setdefault("content_hash", row.content_hash)
+    if getattr(row, "source_uri", None) is not None:
+        meta.setdefault("source_uri", row.source_uri)
+    ingested = getattr(row, "ingested_at", None)
+    if ingested is not None:
+        meta.setdefault(
+            "ingested_at",
+            ingested.isoformat() if hasattr(ingested, "isoformat") else ingested,
+        )
+    return meta
+
+
 class DatabaseService:
     """Read-only database service for PostgreSQL.
 
@@ -562,7 +581,8 @@ class DatabaseService:
             result = await session.execute(
                 text(
                     """
-                    SELECT id, document_id, content, chunk_index, token_count, metadata
+                    SELECT id, document_id, content, chunk_index, token_count, metadata,
+                           content_hash, source_uri, ingested_at
                     FROM document_chunks
                     WHERE document_id = :document_id
                     ORDER BY chunk_index ASC
@@ -579,7 +599,9 @@ class DatabaseService:
                     content=row.content,
                     chunk_index=row.chunk_index,
                     token_count=row.token_count or 0,
-                    metadata=row.metadata,
+                    # Surface provenance/freshness columns (#41/#42) into metadata
+                    # so consumers like explain_lineage (#40) read real values.
+                    metadata=_merge_chunk_provenance(row),
                 )
                 for row in rows
             ]
@@ -757,7 +779,8 @@ class DatabaseService:
             result = await session.execute(
                 text(
                     """
-                    SELECT id, document_id, content, chunk_index, token_count, metadata
+                    SELECT id, document_id, content, chunk_index, token_count, metadata,
+                           content_hash, source_uri, ingested_at
                     FROM document_chunks
                     WHERE document_id = :document_id
                     ORDER BY chunk_index ASC
@@ -774,7 +797,9 @@ class DatabaseService:
                     content=row.content,
                     chunk_index=row.chunk_index,
                     token_count=row.token_count or 0,
-                    metadata=row.metadata,
+                    # Surface provenance/freshness columns (#41/#42) into metadata
+                    # so consumers like explain_lineage (#40) read real values.
+                    metadata=_merge_chunk_provenance(row),
                 )
                 for row in rows
             ]
