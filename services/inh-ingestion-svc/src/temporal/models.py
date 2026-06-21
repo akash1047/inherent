@@ -54,6 +54,24 @@ class WorkflowResult:
     processing_time_ms: int = 0
 
 
+@dataclass
+class RecordDeadLetterInput:
+    """Input for the record_dead_letter activity (#8 dead-letter recording).
+
+    Carries everything needed to write a dead_letter_jobs row and to
+    reconstruct the original MQ message so the retry API can re-publish it
+    faithfully. ``original_message`` is the full upload-event payload dict.
+    """
+
+    document_id: str
+    workspace_id: str
+    user_id: str
+    workflow_run_id: str | None
+    original_message: dict
+    error_message: str
+    error_type: str
+
+
 # =============================================================================
 # Activity Input/Output Models
 # =============================================================================

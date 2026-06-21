@@ -24,6 +24,7 @@ with workflow.unsafe.imports_passed_through():
     from src.config.settings import get_settings
     from src.temporal.activities.chunk import chunk_text
     from src.temporal.activities.cleanup import cleanup_staging
+    from src.temporal.activities.dead_letter import record_dead_letter
     from src.temporal.activities.extract import extract_text
     from src.temporal.activities.fetch import fetch_document
     from src.temporal.activities.status import set_document_status
@@ -36,6 +37,7 @@ with workflow.unsafe.imports_passed_through():
         EnsureTenantInput,
         ExtractTextInput,
         FetchDocumentInput,
+        RecordDeadLetterInput,
         SetDocumentStatusInput,
         StoreDocumentInput,
         UpdateStatsInput,
@@ -107,6 +109,84 @@ class DocumentIngestionWorkflow:
             )
         except Exception:
             workflow.logger.warning(f"Failed to set document status to '{status}' (non-fatal)")
+
+    @staticmethod
+    def _classify_error(error_message: str) -> str:
+        """Classify an error message into an error type for dead-letter tracking.
+
+        Mirrors TemporalWorkflowTrigger._classify_error so dead-letter rows have
+        a consistent error_type regardless of where they were recorded.
+        """
+        lower = error_message.lower()
+        if "extract" in lower or "parse" in lower:
+            return "extraction_failed"
+        if "storage" in lower or "postgresql" in lower or "weaviate" in lower:
+            return "storage_failed"
+        if "timeout" in lower or "timed out" in lower:
+            return "timeout"
+        if "validation" in lower or "invalid" in lower:
+            return "validation_failed"
+        if "fetch" in lower or "not found" in lower or "download" in lower:
+            return "fetch_failed"
+        return "unknown"
+
+    @staticmethod
+    def _reconstruct_original_message(input: DocumentIngestionInput) -> dict:
+        """Rebuild the original upload-event message from the workflow input.
+
+        The dead-letter retry API re-publishes ``original_message`` to start a
+        fresh workflow, so the shape must match DocumentUploadMessage (the
+        upload-event contract).
+        """
+        return {
+            "event_type": "document.uploaded",
+            "document_id": input.document_id,
+            "workspace_id": input.workspace_id,
+            "user_id": input.user_id,
+            "filename": input.filename,
+            "original_filename": input.original_filename,
+            "content_type": input.content_type,
+            "size_bytes": input.size_bytes,
+            "storage_backend": input.storage_backend,
+            "storage_path": input.storage_path,
+            "storage_bucket": input.storage_bucket,
+            "storage_url": input.storage_url,
+            "timestamp": input.timestamp,
+        }
+
+    async def _record_dead_letter_best_effort(
+        self,
+        input: DocumentIngestionInput,
+        workflow_run_id: str,
+        error_message: str,
+    ) -> None:
+        """Record a terminal failure in the dead-letter table (best-effort).
+
+        Must never raise: a failure to record the dead-letter row must not mask
+        the original workflow error (#8). Swallows and logs any exception.
+        """
+        try:
+            await workflow.execute_activity(
+                record_dead_letter,
+                RecordDeadLetterInput(
+                    document_id=input.document_id,
+                    workspace_id=input.workspace_id,
+                    user_id=input.user_id,
+                    workflow_run_id=workflow_run_id,
+                    original_message=self._reconstruct_original_message(input),
+                    error_message=error_message,
+                    error_type=self._classify_error(error_message),
+                ),
+                start_to_close_timeout=timedelta(seconds=15),
+                retry_policy=RetryPolicy(
+                    maximum_attempts=2,
+                    initial_interval=timedelta(seconds=1),
+                    maximum_interval=timedelta(seconds=5),
+                    backoff_coefficient=2.0,
+                ),
+            )
+        except Exception:
+            workflow.logger.warning("Failed to record dead-letter job (non-fatal)")
 
     @workflow.run
     async def run(self, input: DocumentIngestionInput) -> WorkflowResult:
@@ -299,16 +379,22 @@ class DocumentIngestionWorkflow:
             # Check storage results
             if not pg_result.success:
                 # PostgreSQL storage is critical
+                pg_error = f"PostgreSQL storage failed: {pg_result.error}"
                 await self._set_status_best_effort(
                     document_id=input.document_id,
                     workspace_id=input.workspace_id,
                     status="failed",
-                    error_message=f"PostgreSQL storage failed: {pg_result.error}",
+                    error_message=pg_error,
+                )
+                await self._record_dead_letter_best_effort(
+                    input=input,
+                    workflow_run_id=workflow_run_id,
+                    error_message=pg_error,
                 )
                 return WorkflowResult(
                     document_id=input.document_id,
                     success=False,
-                    error=f"PostgreSQL storage failed: {pg_result.error}",
+                    error=pg_error,
                     processing_time_ms=processing_time_ms,
                 )
 
@@ -323,17 +409,23 @@ class DocumentIngestionWorkflow:
             # the problem in the dashboard. PG-only "ghost" docs are worse
             # than a clear failure.
             if not wv_result.success:
-                workflow.logger.error(f"Weaviate storage failed: {wv_result.error}")
+                wv_error = f"Weaviate storage failed: {wv_result.error}"
+                workflow.logger.error(wv_error)
                 await self._set_status_best_effort(
                     document_id=input.document_id,
                     workspace_id=input.workspace_id,
                     status="failed",
-                    error_message=f"Weaviate storage failed: {wv_result.error}",
+                    error_message=wv_error,
+                )
+                await self._record_dead_letter_best_effort(
+                    input=input,
+                    workflow_run_id=workflow_run_id,
+                    error_message=wv_error,
                 )
                 return WorkflowResult(
                     document_id=input.document_id,
                     success=False,
-                    error=f"Weaviate storage failed: {wv_result.error}",
+                    error=wv_error,
                     processing_time_ms=processing_time_ms,
                 )
 
@@ -385,6 +477,15 @@ class DocumentIngestionWorkflow:
                 document_id=input.document_id,
                 workspace_id=input.workspace_id,
                 status="failed",
+                error_message=str(e),
+            )
+
+            # Best-effort: record the terminal failure in the dead-letter table
+            # so it can be retried via the dead-letter API (#8). Must not mask
+            # the original error.
+            await self._record_dead_letter_best_effort(
+                input=input,
+                workflow_run_id=workflow_run_id,
                 error_message=str(e),
             )
 

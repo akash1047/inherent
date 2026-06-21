@@ -23,6 +23,7 @@ from src.temporal.activities import (
     ensure_tenant_ready,
     extract_text,
     fetch_document,
+    record_dead_letter,
     set_document_status,
     store_in_postgresql,
     store_in_weaviate,
@@ -59,6 +60,7 @@ _ALL_ACTIVITIES: list[Callable[..., Any]] = [
     cleanup_staging,
     update_chunk_postgresql,
     update_chunk_weaviate,
+    record_dead_letter,
 ]
 
 # All workflows registered with the ingestion worker
@@ -177,12 +179,18 @@ async def run_worker(
 
     client = await create_temporal_client(settings)
 
-    # Create ingestion worker
+    # Create ingestion worker.
+    # Concurrency limits (#18 backpressure): cap in-flight activities and
+    # workflow tasks so a burst of async workflow starts can't overwhelm the
+    # worker. This is the real throughput bound now that MQ consumption is
+    # non-blocking.
     ingestion_worker = Worker(
         client,
         task_queue=settings.temporal_task_queue,
         workflows=_ALL_WORKFLOWS,
         activities=_ALL_ACTIVITIES,
+        max_concurrent_activities=settings.temporal_max_concurrent_activities,
+        max_concurrent_workflow_tasks=settings.temporal_max_concurrent_workflow_tasks,
     )
 
     logger.info(
@@ -294,6 +302,8 @@ class TemporalWorkerManager:
             task_queue=self.settings.temporal_task_queue,
             workflows=_ALL_WORKFLOWS,
             activities=_ALL_ACTIVITIES,
+            max_concurrent_activities=self.settings.temporal_max_concurrent_activities,
+            max_concurrent_workflow_tasks=self.settings.temporal_max_concurrent_workflow_tasks,
         )
 
         self._audit_worker = Worker(
