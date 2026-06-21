@@ -113,7 +113,7 @@ ignore_errors = true
 # Gradual typing adoption - ignore errors in existing modules
 [[tool.mypy.overrides]]
 module = [
-    "src.mcp.*",
+    "src.mcp_server.*",
     "src.utils.logger",
     "src.core.problem_details",
     "src.services.database",

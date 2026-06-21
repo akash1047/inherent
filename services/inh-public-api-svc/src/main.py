@@ -130,7 +130,7 @@ async def run_api_server() -> None:
 
 async def run_mcp_server() -> None:
     """Run the MCP server."""
-    from src.mcp.server import run_mcp_server
+    from src.mcp_server.server import run_mcp_server
 
     await run_mcp_server()
 

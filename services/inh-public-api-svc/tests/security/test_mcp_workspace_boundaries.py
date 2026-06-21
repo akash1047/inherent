@@ -15,31 +15,12 @@ import pytest
 from src.models.api_key import APIKeyInfo
 from src.models.document import Document
 
-# Importing the MCP server is unreliable under the test runner: pytest's
-# ``pythonpath = ["src"]`` puts the local ``src/mcp`` package ahead of the
-# installed third-party ``mcp`` SDK, so ``src/mcp/server.py``'s
-# ``import mcp.server.stdio`` resolves to the local package and fails. We import
-# it defensively and skip (with a clear reason) when that collision is in
-# effect, rather than fail collection. When the import succeeds, the full
-# boundary checks run offline.
-try:
-    from src.mcp import server as mcp_server
+# The MCP package was renamed src/mcp -> src/mcp_server so it no longer shadows
+# the third-party ``mcp`` SDK under pytest's ``pythonpath = ["src"]``; these
+# boundary checks now run offline (no skip).
+from src.mcp_server import server as mcp_server
 
-    _MCP_IMPORT_ERROR: str | None = None
-except Exception as exc:  # pragma: no cover - environment-dependent
-    mcp_server = None  # type: ignore[assignment]
-    _MCP_IMPORT_ERROR = str(exc)
-
-pytestmark = [
-    pytest.mark.security,
-    pytest.mark.skipif(
-        mcp_server is None,
-        reason=(
-            "MCP server not importable under pytest (local 'src/mcp' shadows the "
-            f"third-party 'mcp' SDK): {_MCP_IMPORT_ERROR}"
-        ),
-    ),
-]
+pytestmark = [pytest.mark.security]
 
 
 def _key(user_id: str = "user-1") -> APIKeyInfo:
