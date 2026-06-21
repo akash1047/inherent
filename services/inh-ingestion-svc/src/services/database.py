@@ -224,6 +224,15 @@ class DatabaseService:
                 nullable=False,
                 default=lambda: datetime.now(UTC),
             ),
+            # Freshness (#42): when this chunk was (re)ingested. Defaulted/additive
+            # (see migration 009). Promoted onto SearchResult so aged evidence can
+            # be flagged is_stale (the API does not drop it).
+            Column(
+                "ingested_at",
+                DateTime(timezone=True),
+                nullable=True,
+                default=lambda: datetime.now(UTC),
+            ),
             UniqueConstraint(
                 "processed_document_id", "chunk_index", name="uq_document_chunks_doc_idx"
             ),
@@ -845,6 +854,11 @@ class DatabaseService:
                             ).hexdigest(),
                             "source_uri": source_uri,
                             "created_at": now,
+                            # Freshness (#42): stamp ingest time so the API can age
+                            # returned evidence. On re-ingestion (refresh path) the
+                            # old chunks are deleted above and re-inserted with a
+                            # fresh ingested_at, so a refresh resets staleness.
+                            "ingested_at": now,
                         }
                         for chunk in chunks
                     ]

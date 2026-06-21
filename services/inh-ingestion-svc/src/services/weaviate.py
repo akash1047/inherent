@@ -148,6 +148,9 @@ class WeaviateService:
             # Provenance (#41): auditable evidence trail for returned chunks.
             Property(name="content_hash", data_type=DataType.TEXT),
             Property(name="source_uri", data_type=DataType.TEXT),
+            # Freshness (#42): when the chunk was (re)ingested, so returned
+            # evidence can be aged/flagged stale by the public API.
+            Property(name="ingested_at", data_type=DataType.DATE),
         ]
 
     def disconnect(self) -> None:
@@ -428,6 +431,10 @@ class WeaviateService:
             chunk_texts = [c.content for c in chunks]
             vectors = embed_texts(chunk_texts)
 
+            # Single ingest timestamp for this store call (#42): all chunks of a
+            # document share one ingested_at so freshness is consistent per store.
+            ingest_time = datetime.now(UTC)
+
             with tenant_collection.batch.dynamic() as batch:
                 for chunk, vector in zip(chunks, vectors):
                     properties = {
@@ -440,10 +447,14 @@ class WeaviateService:
                         "end_char": chunk.end_char,
                         "original_filename": original_filename,
                         "content_type": content_type,
-                        "created_at": datetime.now(UTC),
+                        "created_at": ingest_time,
                         # Provenance (#41): auditable evidence trail.
                         "content_hash": hashlib.sha256(chunk.content.encode("utf-8")).hexdigest(),
                         "source_uri": source_uri,
+                        # Freshness (#42): stamp ingest time so the public API can
+                        # age returned evidence. Matches the PG document_chunks
+                        # ingested_at; a refresh re-stores chunks with a new value.
+                        "ingested_at": ingest_time,
                     }
 
                     # Generate deterministic UUID

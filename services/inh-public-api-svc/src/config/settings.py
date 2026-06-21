@@ -159,6 +159,18 @@ class Settings(BaseSettings):
         ),
     )
 
+    # Freshness (#42) — stale-evidence policy
+    freshness_max_age_days: int = Field(
+        default=90,
+        ge=1,
+        description=(
+            "Evidence older than this many days is flagged is_stale=true on each "
+            "SearchResult. Stale evidence is NOT filtered out — it is returned with "
+            "the flag so callers can decide how to treat it (and can trigger a "
+            "refresh/re-ingestion). Compared against the chunk's ingested_at."
+        ),
+    )
+
     # Health Checks
     health_check_timeout_seconds: float = 5.0
 

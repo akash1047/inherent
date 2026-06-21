@@ -3,6 +3,7 @@
 import json
 import re
 import time
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx
@@ -13,6 +14,7 @@ from inh_contracts.naming import (
 )
 
 from src.config import settings
+from src.models.citation import Citation
 from src.models.search import SearchRequest, SearchResponse, SearchResult
 from src.services.database import DatabaseService, get_database
 from src.utils import get_logger
@@ -133,6 +135,41 @@ class SearchService:
             return response.status_code == 200
         except Exception:
             return False
+
+    @staticmethod
+    def _parse_ingested_at(value: object) -> datetime | None:
+        """Parse a Weaviate DATE / ISO-8601 string into an aware datetime.
+
+        Weaviate returns DATE properties as RFC-3339 strings (e.g.
+        ``2024-01-01T00:00:00Z``). Returns ``None`` for missing/unparseable
+        values so freshness is simply unknown rather than an error.
+        """
+        if isinstance(value, datetime):
+            return value if value.tzinfo else value.replace(tzinfo=UTC)
+        if isinstance(value, str) and value:
+            try:
+                # Python's fromisoformat handles the trailing 'Z' from 3.11+.
+                parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+            except ValueError:
+                return None
+        return None
+
+    @staticmethod
+    def _compute_is_stale(ingested_at: datetime | None, *, now: datetime | None = None) -> bool:
+        """Return True when ``ingested_at`` is older than the freshness window.
+
+        Stale-evidence policy (#42): a result is stale when
+        ``ingested_at < now - freshness_max_age_days``. When ``ingested_at`` is
+        unknown (``None``) the result is treated as NOT stale (we never flag
+        evidence we cannot age). Callers still receive stale results — they are
+        only flagged, never dropped.
+        """
+        if ingested_at is None:
+            return False
+        reference = now or datetime.now(UTC)
+        cutoff = reference - timedelta(days=settings.freshness_max_age_days)
+        return ingested_at < cutoff
 
     @staticmethod
     def embed_query_vector(request: SearchRequest) -> list[float] | None:
@@ -304,14 +341,57 @@ class SearchService:
             # metadata too (passthrough), and are simply None when absent.
             content_hash = chunk.get("content_hash")
             source_uri = chunk.get("source_uri")
+            source_uri = source_uri if isinstance(source_uri, str) else None
+
+            # Freshness (#42): promote ingested_at and compute staleness. Stale
+            # results are flagged, not dropped (see _compute_is_stale).
+            ingested_at = self._parse_ingested_at(chunk.get("ingested_at"))
+            is_stale = self._compute_is_stale(ingested_at)
+
+            rounded_score = round(score, 4)
+            chunk_id = additional.get("id", "")
+            document_id = chunk.get("document_id", "")
+            document_name = chunk.get("original_filename", "")
+            content = chunk.get("content", "")
+
+            def _to_int(value: object) -> int | None:
+                if isinstance(value, bool):
+                    return None
+                if isinstance(value, int):
+                    return value
+                if isinstance(value, (float, str)):
+                    try:
+                        return int(value)
+                    except (ValueError, TypeError):
+                        return None
+                return None
+
+            start_char = _to_int(chunk.get("start_char"))
+            end_char = _to_int(chunk.get("end_char"))
+
+            # Claim-level citation (#39): built purely from this result's own
+            # fields so the evidence is citable without a second lookup.
+            citation = Citation(
+                chunk_id=chunk_id,
+                document_id=document_id,
+                document_name=document_name,
+                content=content,
+                start_char=start_char,
+                end_char=end_char,
+                score=rounded_score,
+                score_source=score_source,
+                source_uri=source_uri,
+                ingested_at=ingested_at,
+                is_stale=is_stale,
+            )
 
             results.append(
                 SearchResult(
-                    chunk_id=additional.get("id", ""),
-                    document_id=chunk.get("document_id", ""),
-                    document_name=chunk.get("original_filename", ""),
-                    content=chunk.get("content", ""),
-                    score=round(score, 4),
+                    chunk_id=chunk_id,
+                    document_id=document_id,
+                    document_name=document_name,
+                    content=content,
+                    score=rounded_score,
                     metadata=metadata,
                     score_source=score_source,
                     bm25_score=round(bm25_score, 4) if bm25_score is not None else None,
@@ -320,7 +400,10 @@ class SearchService:
                     ),
                     alpha=result_alpha,
                     content_hash=content_hash if isinstance(content_hash, str) else None,
-                    source_uri=source_uri if isinstance(source_uri, str) else None,
+                    source_uri=source_uri,
+                    ingested_at=ingested_at,
+                    is_stale=is_stale,
+                    citation=citation,
                 )
             )
         return results
@@ -383,8 +466,11 @@ class SearchService:
                     original_filename
                     content
                     chunk_index
+                    start_char
+                    end_char
                     content_hash
                     source_uri
+                    ingested_at
                     _additional {{ id score certainty distance }}
                 }}
             }}

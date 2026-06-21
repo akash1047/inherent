@@ -516,6 +516,33 @@ class DatabaseService:
                 metadata=row.metadata,
             )
 
+    async def get_document_upload_fields(self, document_id: str, workspace_id: str) -> dict | None:
+        """Return the stored fields needed to rebuild an upload event (#42 refresh).
+
+        Reads the durable ``processed_documents`` row for ``(document_id,
+        workspace_id)`` and returns the storage + identity fields that the
+        original ``document.uploaded`` MQ message carried. Returns ``None`` when
+        the row does not exist (or is not in this workspace), so the caller can
+        404 without leaking cross-workspace existence.
+        """
+        async with self.session() as session:
+            result = await session.execute(
+                text(
+                    """
+                    SELECT document_id, workspace_id, user_id,
+                           filename, original_filename, content_type, size_bytes,
+                           storage_backend, storage_path, storage_bucket, storage_url
+                    FROM processed_documents
+                    WHERE document_id = :document_id AND workspace_id = :workspace_id
+                """
+                ),
+                {"document_id": document_id, "workspace_id": workspace_id},
+            )
+            row = result.fetchone()
+            if not row:
+                return None
+            return dict(row._mapping)
+
     async def get_document_chunks(self, document_id: str, workspace_id: str) -> list[DocumentChunk]:
         """Get all chunks for a document."""
         async with self.session() as session:

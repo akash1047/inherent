@@ -1,8 +1,14 @@
 """Search-related models."""
 
-from typing import Literal
+from __future__ import annotations
+
+from datetime import datetime
+from typing import TYPE_CHECKING, Literal
 
 from pydantic import BaseModel, Field
+
+if TYPE_CHECKING:
+    from src.models.citation import Citation
 
 ScoreSource = Literal["bm25", "vector", "hybrid"]
 
@@ -94,6 +100,21 @@ class SearchResult(BaseModel):
     content_hash: str | None = None
     source_uri: str | None = None
 
+    # Freshness (#42) — optional, backward-compatible. Promoted from the chunk
+    # so callers can age returned evidence:
+    #   ingested_at — when the chunk was (re)ingested (None if unknown)
+    #   is_stale    — True when ingested_at < now - freshness_max_age_days.
+    # Stale-evidence policy: stale results are NOT dropped; they are returned
+    # with is_stale=True so the caller decides how to treat aged sources (and
+    # can hit POST /v1/documents/{id}/refresh to re-ingest).
+    ingested_at: datetime | None = None
+    is_stale: bool = False
+
+    # Claim-level citation (#39) — optional, backward-compatible. Built from this
+    # result's own fields (chunk_id + spans + score + provenance + freshness) so
+    # the evidence is citable without a second lookup.
+    citation: "Citation | None" = None
+
 
 class SearchResponse(BaseModel):
     """Response model for search endpoint."""
@@ -104,3 +125,11 @@ class SearchResponse(BaseModel):
     processing_time_ms: float
     search_mode: Literal["semantic", "hybrid", "keyword"]
     total_tokens: int = 0
+
+
+# Resolve the forward reference to Citation (#39). Imported here (not at module
+# top) to avoid a circular import: citation.py imports ScoreSource from this
+# module. The rebuild lets ``SearchResult.citation`` validate the real type.
+from src.models.citation import Citation  # noqa: E402
+
+SearchResult.model_rebuild()
