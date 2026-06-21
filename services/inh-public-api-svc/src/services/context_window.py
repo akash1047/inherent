@@ -13,7 +13,7 @@ logger = get_logger(__name__)
 
 class _ContextCapableDatabase(Protocol):
     async def get_context_chunks(
-        self, workspace_id: str, ranges: list[tuple[str, int, int]]
+        self, workspace_id: str, user_id: str, ranges: list[tuple[str, int, int]]
     ) -> list[DocumentChunk]: ...
 
 
@@ -98,8 +98,15 @@ class ContextWindowBuilder:
         self,
         matches: list[SearchResult],
         workspace_id: str,
+        user_id: str,
         k: int,
     ) -> None:
+        """Expand each match with neighbouring chunks.
+
+        Cross-tenant safety (#41): ``user_id`` is threaded through to
+        ``get_context_chunks`` so neighbour chunks are scoped to the requesting
+        user, not just the (possibly multi-user) workspace.
+        """
         if not matches:
             return
         if k == 0:
@@ -111,11 +118,12 @@ class ContextWindowBuilder:
         if not ranges:
             return
         try:
-            rows = await self._db.get_context_chunks(workspace_id, ranges)
+            rows = await self._db.get_context_chunks(workspace_id, user_id, ranges)
         except Exception as exc:
             logger.error(
                 "context_window_fetch_failed",
                 workspace_id=workspace_id,
+                user_id=user_id,
                 error=str(exc),
             )
             return

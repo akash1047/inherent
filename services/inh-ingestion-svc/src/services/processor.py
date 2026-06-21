@@ -721,6 +721,8 @@ class DocumentProcessor:
                     user_id=message.user_id,
                     original_filename=message.original_filename,
                     content_type=message.content_type,
+                    # Provenance (#41): record where the source bytes live.
+                    source_uri=message.storage_path or message.storage_url,
                 )
                 logger.info(
                     "Stored in Weaviate with multi-tenancy",

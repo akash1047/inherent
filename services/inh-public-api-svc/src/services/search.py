@@ -299,6 +299,12 @@ class SearchService:
                 if key not in _core_fields:
                     metadata[key] = value
 
+            # Chunk provenance (#41): promote these from the chunk metadata onto
+            # the result so clients can audit returned evidence. They remain in
+            # metadata too (passthrough), and are simply None when absent.
+            content_hash = chunk.get("content_hash")
+            source_uri = chunk.get("source_uri")
+
             results.append(
                 SearchResult(
                     chunk_id=additional.get("id", ""),
@@ -313,6 +319,8 @@ class SearchService:
                         round(vector_similarity, 4) if vector_similarity is not None else None
                     ),
                     alpha=result_alpha,
+                    content_hash=content_hash if isinstance(content_hash, str) else None,
+                    source_uri=source_uri if isinstance(source_uri, str) else None,
                 )
             )
         return results
@@ -375,6 +383,8 @@ class SearchService:
                     original_filename
                     content
                     chunk_index
+                    content_hash
+                    source_uri
                     _additional {{ id score certainty distance }}
                 }}
             }}

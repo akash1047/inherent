@@ -755,6 +755,7 @@ class DatabaseService:
     async def get_context_chunks(
         self,
         workspace_id: str,
+        user_id: str,
         ranges: list[tuple[str, int, int]],
     ) -> list[DocumentChunk]:
         """Fetch chunks whose (document_id, chunk_index) lies in any of the given ranges.
@@ -762,6 +763,14 @@ class DatabaseService:
         One batched query: one round-trip regardless of how many ranges are passed.
         Indexed by uq_document_chunks_doc_idx constraint.
         Empty ranges short-circuits — returns [] without a DB call.
+
+        Cross-tenant safety (#41): neighbour chunks are scoped to BOTH
+        ``workspace_id`` AND the requesting ``user_id``. ``document_chunks`` has
+        no ``user_id`` column, so ownership is enforced via a join to
+        ``processed_documents.user_id`` (which is the per-user owner of each
+        document). Without this join, a workspace shared by multiple Weaviate
+        tenants could leak another user's neighbour chunks during context
+        expansion.
         """
         if not ranges:
             return []
@@ -776,9 +785,15 @@ class DatabaseService:
             column("metadata"),
             column("workspace_id"),
         )
+        processed_documents = table(
+            "processed_documents",
+            column("document_id"),
+            column("workspace_id"),
+            column("user_id"),
+        )
 
         clauses = []
-        params: dict[str, object] = {"workspace_id": workspace_id}
+        params: dict[str, object] = {"workspace_id": workspace_id, "user_id": user_id}
         for i, (doc_id, lo, hi) in enumerate(ranges):
             doc_param = f"doc_{i}"
             lo_param = f"lo_{i}"
@@ -796,6 +811,10 @@ class DatabaseService:
             params[lo_param] = lo
             params[hi_param] = hi
 
+        # Join document_chunks → processed_documents on (document_id,
+        # workspace_id) and require the parent document to be owned by the
+        # requesting user. This guarantees every returned neighbour belongs to
+        # the caller, not just to the (multi-user) workspace.
         query = (
             select(
                 document_chunks.c.id,
@@ -805,7 +824,17 @@ class DatabaseService:
                 document_chunks.c.token_count,
                 document_chunks.c.metadata,
             )
+            .select_from(
+                document_chunks.join(
+                    processed_documents,
+                    and_(
+                        document_chunks.c.document_id == processed_documents.c.document_id,
+                        document_chunks.c.workspace_id == processed_documents.c.workspace_id,
+                    ),
+                )
+            )
             .where(document_chunks.c.workspace_id == bindparam("workspace_id"))
+            .where(processed_documents.c.user_id == bindparam("user_id"))
             .where(or_(*clauses))
             .order_by(document_chunks.c.document_id, document_chunks.c.chunk_index)
         )

@@ -13,7 +13,7 @@ async def test_empty_ranges_returns_empty_without_db_call() -> None:
     # We instantiate without a real engine; the method must return []
     # before any session is opened when ranges is empty.
     db = DatabaseService.__new__(DatabaseService)  # bypass __init__
-    rows = await db.get_context_chunks(workspace_id="ws-any", ranges=[])
+    rows = await db.get_context_chunks(workspace_id="ws-any", user_id="user-any", ranges=[])
     assert rows == []
 
 

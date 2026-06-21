@@ -49,6 +49,7 @@ def build_audit_event(
     query_filters: dict[str, Any] | None = None,
     result_count: int,
     result_snippets: list[dict[str, Any]] | None = None,
+    returned_chunk_ids: list[str] | None = None,
     llm_response: str | None = None,
     response_time_ms: float,
     request_id: str | None = None,
@@ -94,6 +95,9 @@ def build_audit_event(
         "query_filters": query_filters or {},
         "result_count": result_count,
         "result_snippets": safe_snippets,
+        # Provenance (#41): the chunk_ids of the evidence actually returned, so
+        # an audit record can be tied back to specific chunks.
+        "returned_chunk_ids": list(returned_chunk_ids) if returned_chunk_ids else [],
         "llm_response": llm_response,
         "response_time_ms": response_time_ms,
         "request_id": request_id or str(uuid.uuid4()),

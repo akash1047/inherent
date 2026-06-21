@@ -6,6 +6,7 @@ Multi-tenancy Design:
 - This enables efficient per-user data isolation within workspace-level organization
 """
 
+import hashlib
 import uuid
 from datetime import UTC, datetime
 from typing import Any
@@ -144,6 +145,9 @@ class WeaviateService:
             Property(name="original_filename", data_type=DataType.TEXT),
             Property(name="content_type", data_type=DataType.TEXT),
             Property(name="created_at", data_type=DataType.DATE),
+            # Provenance (#41): auditable evidence trail for returned chunks.
+            Property(name="content_hash", data_type=DataType.TEXT),
+            Property(name="source_uri", data_type=DataType.TEXT),
         ]
 
     def disconnect(self) -> None:
@@ -387,6 +391,7 @@ class WeaviateService:
         user_id: str,
         original_filename: str,
         content_type: str,
+        source_uri: str | None = None,
     ) -> int:
         """Store document chunks in a workspace collection with user tenant.
 
@@ -397,6 +402,8 @@ class WeaviateService:
             user_id: User ID (determines tenant)
             original_filename: Original filename
             content_type: MIME type
+            source_uri: Provenance (#41) — where the source bytes live
+                (storage_path / storage_url). Optional/backward-compatible.
 
         Returns:
             Number of chunks stored
@@ -434,6 +441,9 @@ class WeaviateService:
                         "original_filename": original_filename,
                         "content_type": content_type,
                         "created_at": datetime.now(UTC),
+                        # Provenance (#41): auditable evidence trail.
+                        "content_hash": hashlib.sha256(chunk.content.encode("utf-8")).hexdigest(),
+                        "source_uri": source_uri,
                     }
 
                     # Generate deterministic UUID
@@ -723,6 +733,7 @@ class WeaviateService:
         user_id: str,
         original_filename: str,
         content_type: str,
+        source_uri: str | None = None,
     ) -> int:
         """Store document chunks - routes to multi-tenant storage.
 
@@ -735,6 +746,7 @@ class WeaviateService:
             user_id=user_id,
             original_filename=original_filename,
             content_type=content_type,
+            source_uri=source_uri,
         )
 
     async def delete_document_chunks(self, document_id: str) -> int:

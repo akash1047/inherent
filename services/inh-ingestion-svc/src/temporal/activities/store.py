@@ -242,6 +242,8 @@ async def store_in_weaviate(input: StoreDocumentInput) -> StoreDocumentOutput:
             user_id=input.user_id,
             original_filename=input.original_filename,
             content_type=input.content_type,
+            # Provenance (#41): record where the source bytes live.
+            source_uri=input.storage_path,
         )
 
         duration_ms = int((time.monotonic() - start) * 1000)

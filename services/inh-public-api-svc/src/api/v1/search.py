@@ -96,6 +96,8 @@ def _schedule_audit(
         query_filters={"document_ids": request.document_ids} if request.document_ids else None,
         result_count=response.total_results,
         result_snippets=_build_result_snippets(response.results),
+        # Provenance (#41): record the chunk_ids actually returned.
+        returned_chunk_ids=[r.chunk_id for r in response.results if r.chunk_id],
         response_time_ms=response.processing_time_ms,
         # PM-S018 / PM-S019 — search mode & context metadata
         search_mode=request.search_mode,
@@ -110,12 +112,16 @@ async def _expand_context_and_total_tokens(
     response: SearchResponse,
     request: SearchRequest,
     ctx_workspace_id: str,
+    user_id: str,
 ) -> None:
     """Expand context windows (if requested) and set response.total_tokens.
 
     Mutates *response* in-place.  Best-effort: if the context fetch fails the
     error is swallowed inside ContextWindowBuilder.expand(); total_tokens is
     still computed from whatever data is available.
+
+    Cross-tenant safety (#41): ``user_id`` is threaded into the context fetch so
+    neighbour chunks are scoped to the requesting user, not just the workspace.
     """
     if request.include_context and response.results and ctx_workspace_id:
         from src.services.context_window import ContextWindowBuilder
@@ -125,6 +131,7 @@ async def _expand_context_and_total_tokens(
         await builder.expand(
             matches=response.results,
             workspace_id=ctx_workspace_id,
+            user_id=user_id,
             k=request.context_window,
         )
     response.total_tokens = _compute_total_tokens(response.results)
@@ -217,7 +224,9 @@ async def search_documents(
             request=request,
         )
         # PM-S019: expand context windows and compute total_tokens
-        await _expand_context_and_total_tokens(response, request, workspace_id)
+        await _expand_context_and_total_tokens(
+            response, request, workspace_id, auth.key_info.user_id
+        )
         _record_search_metrics(request, workspace_id)
         _schedule_audit(
             background_tasks,
@@ -241,7 +250,7 @@ async def search_documents(
             search_mode=request.search_mode,
         )
         # PM-S019: no results, total_tokens stays 0; context expansion skipped
-        await _expand_context_and_total_tokens(response, request, "")
+        await _expand_context_and_total_tokens(response, request, "", auth.key_info.user_id)
         _record_search_metrics(request, None)
         _schedule_audit(
             background_tasks,
@@ -279,7 +288,7 @@ async def search_documents(
     )
     # PM-S019: for multi-workspace, use primary workspace when unambiguous
     ctx_ws = user_workspaces[0] if len(user_workspaces) == 1 else ""
-    await _expand_context_and_total_tokens(response, request, ctx_ws)
+    await _expand_context_and_total_tokens(response, request, ctx_ws, auth.key_info.user_id)
     _record_search_metrics(request, None)
     _schedule_audit(
         background_tasks,

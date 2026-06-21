@@ -87,6 +87,13 @@ class SearchResult(BaseModel):
     vector_similarity: float | None = None
     alpha: float | None = None
 
+    # Chunk provenance (#41) — optional, backward-compatible. Promoted from the
+    # chunk's metadata passthrough so returned evidence is auditable:
+    #   content_hash — sha256 hex digest of the chunk's content
+    #   source_uri   — where the chunk's source bytes live
+    content_hash: str | None = None
+    source_uri: str | None = None
+
 
 class SearchResponse(BaseModel):
     """Response model for search endpoint."""
