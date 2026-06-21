@@ -77,6 +77,7 @@ markers = [
     "slow: slow-running tests",
     "retrieval_eval: retrieval quality and ranking regression benchmarks",
     "benchmark: latency/throughput benchmarks (loose SLO regression guards)",
+    "security: auth/tenancy security regression tests (offline; #32)",
 ]
 
 [tool.ruff]
