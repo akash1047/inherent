@@ -31,6 +31,13 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Optional OCR support for PNG image uploads. Requires BOTH this extra and the
+# 'tesseract' system binary (e.g. apt-get install tesseract-ocr). When absent,
+# image extraction falls back gracefully to a placeholder (see extract.py).
+ocr = [
+    "pytesseract>=0.3.10",
+    "pillow>=10.0.0",
+]
 dev = [
     "pytest>=7.4.0",
     "pytest-asyncio>=0.21.0",

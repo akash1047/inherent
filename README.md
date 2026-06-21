@@ -18,7 +18,7 @@ Build your private company brain.
 
 Inherent is the backend for turning company knowledge into something AI systems can actually query.
 
-You connect sources like plain text, Markdown, CSV, HTML, JSON, PDF, and DOCX (plain-text and code files are ingested as text). Inherent extracts the content, chunks it, generates embeddings, stores it, and exposes retrieval over REST and MCP-friendly patterns.
+You connect sources like plain text, Markdown, CSV, HTML, JSON, PDF, DOCX, and PNG images (plain-text and code files are ingested as text; PNG images are read via OCR). Inherent extracts the content, chunks it, generates embeddings, stores it, and exposes retrieval over REST and MCP-friendly patterns.
 
 In practical terms, this repository is the ingestion, indexing, storage, and retrieval layer of a private RAG system.
 
@@ -36,7 +36,7 @@ It gives you:
 
 ## Why Use It
 
-- Bring your own documents: ingest plain text, Markdown, CSV, HTML, JSON, PDF, and DOCX (code files are ingested as text).
+- Bring your own documents: ingest plain text, Markdown, CSV, HTML, JSON, PDF, DOCX, and PNG images (code files are ingested as text; PNG images are read via OCR, which requires the ingestion service's optional `ocr` extra and the `tesseract` system binary).
 - Run locally: the repo ships with a Compose stack for the required databases and supporting services.
 - Separate ingestion from retrieval: one service writes and indexes data, another serves search requests.
 - Build on standard components: FastAPI, PostgreSQL, Weaviate, Temporal, Redis/Valkey, and S3-compatible storage.
@@ -50,7 +50,7 @@ It gives you:
 
 ## Key Features
 
-- Multi-format ingestion for plain text, Markdown, CSV, HTML, JSON, PDF, and DOCX (code files ingested as text)
+- Multi-format ingestion for plain text, Markdown, CSV, HTML, JSON, PDF, DOCX, and PNG images (code files ingested as text; PNG images via OCR, which requires the optional `ocr` extra plus the `tesseract` system binary)
 - Chunking and embedding generation for semantic retrieval
 - PostgreSQL as structured storage for documents and chunks
 - Weaviate as vector index for similarity search

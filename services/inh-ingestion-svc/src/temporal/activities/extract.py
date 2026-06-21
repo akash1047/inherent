@@ -25,6 +25,8 @@ async def extract_text(input: ExtractTextInput) -> ExtractTextOutput:
     - PDF: Extract via pypdf/PyPDF2
     - DOCX: Extract via python-docx
     - HTML: Strip tags via BeautifulSoup
+    - PNG images: OCR via pytesseract/Pillow (graceful fallback to a
+      placeholder when OCR is unavailable, so the pipeline never crashes)
 
     The activity fetches file content from storage itself (avoiding the
     4MB gRPC limit) and writes extracted text to the staging table.
@@ -122,6 +124,10 @@ async def _extract_text_inner(input: ExtractTextInput) -> ExtractTextOutput:
     elif content_type == "text/html" or filename.endswith(".html"):
         text = _extract_html_text(content)
 
+    # PNG images (OCR with graceful fallback)
+    elif content_type == "image/png" or filename.endswith(".png"):
+        text = _extract_image_text(content, input.original_filename)
+
     # Default: try to decode as text
     else:
         text = content.decode("utf-8", errors="ignore")
@@ -192,6 +198,66 @@ def _extract_docx_text(content: bytes) -> str:
     doc = Document(io.BytesIO(content))
     paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
     return "\n\n".join(paragraphs)
+
+
+def _extract_image_text(content: bytes, original_filename: str) -> str:
+    """Extract text from a PNG image via Tesseract OCR with graceful fallback.
+
+    OCR is an optional capability (requires the ``ocr`` extra plus the
+    ``tesseract`` system binary). When OCR is unavailable -- the libraries
+    are not installed, the tesseract binary is missing, or the image simply
+    contains no readable text -- this returns a minimal placeholder instead
+    of raising. The placeholder keeps the document flowing through the
+    pipeline (0 useful chunks, but not a hard failure) so a missing OCR
+    install never crashes ingestion.
+
+    Args:
+        content: Raw PNG bytes.
+        original_filename: Original filename, used in the fallback placeholder.
+
+    Returns:
+        OCR-extracted text, or a placeholder string when OCR yields nothing
+        or is unavailable.
+    """
+    placeholder = f"[image: {original_filename}, no text extracted]"
+
+    try:
+        import pytesseract
+        from PIL import Image
+    except ImportError:
+        logger.warning(
+            "OCR libraries not available (install the 'ocr' extra: pytesseract, pillow); "
+            "returning placeholder for image",
+            filename=original_filename,
+        )
+        return placeholder
+
+    try:
+        image = Image.open(io.BytesIO(content))
+        text = pytesseract.image_to_string(image)
+    except pytesseract.TesseractNotFoundError:
+        logger.warning(
+            "Tesseract binary not found; install the 'tesseract-ocr' system package. "
+            "Returning placeholder for image",
+            filename=original_filename,
+        )
+        return placeholder
+    except Exception as e:
+        logger.warning(
+            "OCR failed for image; returning placeholder",
+            filename=original_filename,
+            error=str(e),
+        )
+        return placeholder
+
+    if not text.strip():
+        logger.warning(
+            "OCR produced no text for image; returning placeholder",
+            filename=original_filename,
+        )
+        return placeholder
+
+    return text
 
 
 def _extract_html_text(content: bytes) -> str:

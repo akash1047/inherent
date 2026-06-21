@@ -87,6 +87,7 @@ ALLOWED_MIME_TYPES: Final[list[str]] = [
     "application/pdf",
     "application/json",
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document",  # .docx
+    "image/png",  # OCR via Tesseract (graceful fallback when OCR unavailable)
 ]
 
 # Search constraints
