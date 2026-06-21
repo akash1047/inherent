@@ -43,8 +43,14 @@ jobs:
       - name: Bootstrap dev workspace and API key
         run: make bootstrap
 
-      - name: Run integration test
+      - name: Run public-api compose tests (integration + retrieval evals + benchmarks)
         working-directory: services/inh-public-api-svc
+        run: |
+          uv sync --frozen --extra dev --group dev
+          uv run pytest -m compose
+
+      - name: Run ingestion compose benchmarks
+        working-directory: services/inh-ingestion-svc
         run: |
           uv sync --frozen --extra dev --group dev
           uv run pytest -m compose

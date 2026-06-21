@@ -75,6 +75,8 @@ markers = [
     "integration: tests that exercise real service dependencies",
     "compose: requires a running docker-compose stack (deselected by default)",
     "slow: slow-running tests",
+    "retrieval_eval: retrieval quality and ranking regression benchmarks",
+    "benchmark: latency/throughput benchmarks (loose SLO regression guards)",
 ]
 
 [tool.ruff]

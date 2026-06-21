@@ -83,10 +83,12 @@ python_files = ["test_*.py", "*_test.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
 asyncio_mode = "auto"
-addopts = "--cov=src --cov-report=term-missing"
+addopts = "--cov=src --cov-report=term-missing -m 'not compose'"
 markers = [
     "failure_injection: intentional dependency-failure tests",
     "eval: fixture-backed extraction/chunking quality evaluations",
+    "benchmark: latency/throughput benchmarks (loose SLO regression guards)",
+    "compose: requires a running docker-compose stack (deselected by default)",
 ]
 
 [tool.coverage.run]
