@@ -1,0 +1,112 @@
+# Repo-root pre-commit config — canonical for the whole monorepo (M7 #20).
+#
+# Covers shared file hygiene plus per-service Ruff + Black (and mypy/Bandit for
+# the public API). Each Python hook is scoped to its service directory so a
+# change in one service does not trigger another service's toolchain.
+#
+# Install once:
+#   uv --project services/inh-public-api-svc run pre-commit install
+#   # (any service venv works; pre-commit is a normalized dev dep everywhere)
+# Run on demand:
+#   uv --project services/inh-public-api-svc run pre-commit run --all-files
+#
+# Tool versions are pinned in each service pyproject.toml and resolved via uv;
+# the `local` hooks below intentionally shell out to `uv run` so they always
+# match the versions documented in docs/developer/dependencies.md.
+
+default_language_version:
+  python: python3
+
+repos:
+  # ---- Shared file hygiene (whole repo) ----
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.5.0
+    hooks:
+      - id: trailing-whitespace
+        args: [--markdown-linebreak-ext=md]
+      - id: end-of-file-fixer
+      - id: check-yaml
+        args: [--unsafe]
+      - id: check-toml
+      - id: check-json
+      - id: check-added-large-files
+        args: [--maxkb=1000]
+      - id: check-merge-conflict
+      - id: check-case-conflict
+      - id: detect-private-key
+      - id: debug-statements
+
+  # ---- inh-public-api-svc ----
+  - repo: local
+    hooks:
+      - id: ruff-public-api
+        name: ruff (inh-public-api-svc)
+        entry: bash -c 'cd services/inh-public-api-svc && uv run ruff check src/ tests/'
+        language: system
+        types: [python]
+        pass_filenames: false
+        files: ^services/inh-public-api-svc/(src|tests)/
+      - id: black-public-api
+        name: black (inh-public-api-svc)
+        entry: bash -c 'cd services/inh-public-api-svc && uv run black --check src/ tests/'
+        language: system
+        types: [python]
+        pass_filenames: false
+        files: ^services/inh-public-api-svc/(src|tests)/
+      - id: mypy-public-api
+        name: mypy (inh-public-api-svc)
+        entry: bash -c 'cd services/inh-public-api-svc && uv run mypy --ignore-missing-imports --no-error-summary src/'
+        language: system
+        types: [python]
+        pass_filenames: false
+        files: ^services/inh-public-api-svc/src/
+      - id: bandit-public-api
+        name: bandit (inh-public-api-svc)
+        entry: bash -c 'cd services/inh-public-api-svc && uv run bandit -c pyproject.toml -r src/'
+        language: system
+        types: [python]
+        pass_filenames: false
+        files: ^services/inh-public-api-svc/src/
+
+  # ---- inh-ingestion-svc ----
+  - repo: local
+    hooks:
+      - id: ruff-ingestion
+        name: ruff (inh-ingestion-svc)
+        entry: bash -c 'cd services/inh-ingestion-svc && uv run ruff check src/ tests/'
+        language: system
+        types: [python]
+        pass_filenames: false
+        files: ^services/inh-ingestion-svc/(src|tests)/
+      - id: black-ingestion
+        name: black (inh-ingestion-svc)
+        entry: bash -c 'cd services/inh-ingestion-svc && uv run black --check src/ tests/'
+        language: system
+        types: [python]
+        pass_filenames: false
+        files: ^services/inh-ingestion-svc/(src|tests)/
+
+  # ---- inh-contracts ----
+  - repo: local
+    hooks:
+      - id: ruff-contracts
+        name: ruff (inh-contracts)
+        entry: bash -c 'cd services/inh-contracts && uv run ruff check src/ tests/'
+        language: system
+        types: [python]
+        pass_filenames: false
+        files: ^services/inh-contracts/(src|tests)/
+      - id: black-contracts
+        name: black (inh-contracts)
+        entry: bash -c 'cd services/inh-contracts && uv run black --check src/ tests/'
+        language: system
+        types: [python]
+        pass_filenames: false
+        files: ^services/inh-contracts/(src|tests)/
+
+# pre-commit.ci configuration (no-op locally; honored if the GitHub app is enabled)
+ci:
+  autofix_commit_msg: "style: auto-fix by pre-commit hooks"
+  autofix_prs: true
+  autoupdate_commit_msg: "chore: update pre-commit hooks"
+  autoupdate_schedule: weekly

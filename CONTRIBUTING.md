@@ -34,6 +34,44 @@ make test           # pytest for both services
 Run `make help` to list every target. Service-specific commands remain
 available below when you only need to touch one service.
 
+### Pre-commit Hooks
+
+The repository root has a canonical [`.pre-commit-config.yaml`](.pre-commit-config.yaml)
+that runs shared file hygiene plus per-service Ruff + Black (and mypy + Bandit
+for the public API), each scoped to its service directory. Hooks shell out to
+`uv run`, so they use the pinned tool versions documented in
+[docs/developer/dependencies.md](docs/developer/dependencies.md).
+
+Install the git hook once (any service venv works — `pre-commit` is a dev dep in
+all of them):
+
+```bash
+make install        # ensure dev deps are synced first
+uv --project services/inh-public-api-svc run pre-commit install
+```
+
+Run all hooks on demand (e.g. before opening a PR):
+
+```bash
+uv --project services/inh-public-api-svc run pre-commit run --all-files
+```
+
+After installation, the hooks run automatically on `git commit` against the
+files you changed.
+
+### Testing Profiles
+
+See [docs/testing.md](docs/testing.md) for the full test profiles and markers
+(fast unit, default offline, Compose e2e, and the specialized
+security/contract/eval/benchmark/retrieval_eval/failure_injection markers).
+Quick reference:
+
+```bash
+make test-fast      # fast offline unit profile for both services
+make test           # default offline pytest for both services
+make test-integration  # Compose e2e (requires a running stack)
+```
+
 ### Ingestion Service
 
 ```bash
