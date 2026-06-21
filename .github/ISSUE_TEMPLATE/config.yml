@@ -6,3 +6,6 @@ contact_links:
   - name: Support guidance
     url: https://github.com/inherent-prime/inherent/blob/main/SUPPORT.md
     about: Read the support routes before opening a new issue.
+  - name: Contributing guide
+    url: https://github.com/inherent-prime/inherent/blob/main/CONTRIBUTING.md
+    about: How to set up your environment, run checks, and submit changes.

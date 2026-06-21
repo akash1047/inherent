@@ -1,0 +1,18 @@
+{
+  "_comment": "Retrieval eval baseline (#37). Per-mode mean metrics over the golden corpus, seeded at the loose floor as a documented starting point. This is REPORTING/governance only: the compose retrieval eval prints a baseline-vs-current diff but does NOT hard-fail on regression beyond the existing loose recall@5 assertion. Ratchet these values up toward measured numbers as retrieval stabilizes.",
+  "semantic": {
+    "recall@5": 0.0,
+    "mrr": 0.0,
+    "ndcg@5": 0.0
+  },
+  "hybrid": {
+    "recall@5": 0.0,
+    "mrr": 0.0,
+    "ndcg@5": 0.0
+  },
+  "keyword": {
+    "recall@5": 0.0,
+    "mrr": 0.0,
+    "ndcg@5": 0.0
+  }
+}

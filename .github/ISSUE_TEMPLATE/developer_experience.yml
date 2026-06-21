@@ -1,0 +1,38 @@
+name: Developer experience
+description: Propose an improvement to the contributor workflow (CI, pre-commit, docs, testing, deps)
+title: "[DX]: "
+labels:
+  - developer-experience
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Friction in the contributor workflow? Tell us where it hurts and what it costs.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      description: Which part of the developer experience does this concern?
+      options:
+        - CI
+        - pre-commit
+        - docs
+        - testing
+        - deps
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: What is the friction or proposed improvement? Be concrete.
+    validations:
+      required: true
+  - type: textarea
+    id: impact
+    attributes:
+      label: Impact
+      description: Who is affected and how (time lost, confusion, flaky results, onboarding)?
+    validations:
+      required: true

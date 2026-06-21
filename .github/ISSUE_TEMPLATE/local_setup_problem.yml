@@ -1,0 +1,81 @@
+name: Local setup problem
+description: Report trouble getting the project running locally (install, make dev, compose, health checks)
+title: "[Setup]: "
+labels:
+  - setup
+  - developer-experience
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Trouble getting the stack running locally? Before filing, run `make doctor`
+        and paste its output below -- it catches most environment issues.
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      description: e.g. macOS 14.5 (arm64), Ubuntu 22.04, Windows 11 + WSL2
+    validations:
+      required: true
+  - type: input
+    id: python-version
+    attributes:
+      label: Python version
+      description: Output of `python --version` (or `uv python list`).
+    validations:
+      required: true
+  - type: input
+    id: docker-version
+    attributes:
+      label: Docker version
+      description: Output of `docker --version` and `docker compose version`.
+    validations:
+      required: true
+  - type: dropdown
+    id: service
+    attributes:
+      label: Service
+      description: Which service or area is affected?
+      options:
+        - inh-public-api-svc
+        - inh-ingestion-svc
+        - inh-contracts
+        - Compose stack / whole project
+        - Not sure
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Command run
+      description: The exact command(s) you ran (e.g. `make dev`, `docker compose up --wait`).
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected result
+      description: What did you expect to happen?
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual result
+      description: What actually happened?
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / output
+      description: Relevant logs, error output, or `make doctor` results.
+      render: shell
+  - type: checkboxes
+    id: doctor
+    attributes:
+      label: Diagnostics
+      options:
+        - label: I ran `make doctor` and included relevant output above.
+          required: false

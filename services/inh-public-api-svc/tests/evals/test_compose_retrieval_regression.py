@@ -11,8 +11,10 @@ live stack with: ``make dev`` then ``uv run pytest -m 'retrieval_eval and compos
 
 from __future__ import annotations
 
+import json
 import os
 import time
+from pathlib import Path
 
 import httpx
 import pytest
@@ -20,6 +22,50 @@ import pytest
 from tests.evals.metrics import mrr, ndcg_at_k, recall_at_k
 
 pytestmark = [pytest.mark.retrieval_eval, pytest.mark.compose]
+
+# Where per-mode metrics are written for downstream reporting (#37). CI sets
+# EVAL_REPORT; locally it defaults beside this test so a stray run is obvious.
+EVAL_REPORT_PATH = os.environ.get(
+    "EVAL_REPORT", str(Path(__file__).resolve().parent / "eval-report.json")
+)
+# Committed governance baseline (reporting only -- the diff is printed, not a
+# new gate). See corpus/retrieval_baseline.json for the documented shape.
+BASELINE_PATH = Path(__file__).resolve().parent / "corpus" / "retrieval_baseline.json"
+
+
+def _load_baseline() -> dict[str, dict[str, float]]:
+    try:
+        raw = json.loads(BASELINE_PATH.read_text())
+    except (OSError, ValueError):
+        return {}
+    # Drop documentation keys (anything starting with "_").
+    return {k: v for k, v in raw.items() if not k.startswith("_") and isinstance(v, dict)}
+
+
+def _write_and_summarize(summary: dict[str, dict[str, float]]) -> None:
+    """Persist metrics to EVAL_REPORT and print a baseline-vs-current diff.
+
+    Best-effort: never raises, so it cannot break the eval run itself.
+    """
+    try:
+        Path(EVAL_REPORT_PATH).write_text(json.dumps(summary, indent=2, sort_keys=True))
+        print(f"[retrieval-eval] wrote report to {EVAL_REPORT_PATH}")
+    except OSError as exc:  # pragma: no cover - reporting is non-fatal
+        print(f"[retrieval-eval] could not write report to {EVAL_REPORT_PATH}: {exc}")
+
+    baseline = _load_baseline()
+    print("[retrieval-eval] summary (current vs baseline):")
+    for mode in sorted(summary):
+        for metric in sorted(summary[mode]):
+            cur = summary[mode][metric]
+            base = baseline.get(mode, {}).get(metric)
+            if base is None:
+                print(f"  {mode}.{metric}: {cur:.3f} (no baseline)")
+            else:
+                delta = cur - base
+                sign = "+" if delta >= 0 else ""
+                print(f"  {mode}.{metric}: {cur:.3f} (baseline {base:.3f}, {sign}{delta:.3f})")
+
 
 API_URL = os.environ.get("PUBLIC_API_URL", "http://localhost:18000").rstrip("/")
 API_KEY = os.environ.get("INTEGRATION_API_KEY", "ink_dev_local_key_001")
@@ -112,6 +158,11 @@ def test_ranking_regression_against_golden_corpus(client, golden_corpus):
             "ndcg@5": sum(ndcgs) / n,
         }
         print(f"[retrieval-eval] {mode}: {summary[mode]}")
+
+    # Reporting/governance (#37): persist metrics + print a baseline diff. This
+    # is best-effort and does NOT introduce a new gate -- the only hard check is
+    # the loose recall assertion below.
+    _write_and_summarize(summary)
 
     # The best mode must clear the loose recall baseline.
     best_recall = max(s["recall@5"] for s in summary.values())
