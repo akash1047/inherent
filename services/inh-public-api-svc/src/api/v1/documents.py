@@ -12,6 +12,7 @@ from src.core.exceptions import BadRequestError, ServiceUnavailableError
 from src.models.document import Document, DocumentListResponse, DocumentUploadResponse
 from src.services.auth import ResolvedAuth, resolve_workspace_read, resolve_workspace_write
 from src.services.database import DatabaseService, get_database
+from src.services.lineage import LineageResponse, build_lineage
 from src.services.mq import get_mq_service
 from src.services.storage import get_storage_service
 from src.utils import get_logger
@@ -282,6 +283,48 @@ async def get_document(
         raise HTTPException(status_code=404, detail="Document not found")
 
     return document
+
+
+@router.get("/documents/{document_id}/lineage", response_model=LineageResponse)
+async def get_document_lineage(
+    document_id: str,
+    auth: Annotated[ResolvedAuth, Depends(resolve_workspace_read)],
+    database: Annotated[DatabaseService, Depends(get_database)],
+    chunk_id: str | None = Query(
+        default=None, description="Optional chunk ID for chunk-level provenance"
+    ),
+) -> LineageResponse:
+    """Explain a document's (or chunk's) provenance and freshness (#40).
+
+    Returns ``source_uri``, ``content_hash``, ``ingested_at``, ``is_stale`` and
+    ``document_name`` projected from already-ingested data. ``is_stale`` is
+    computed with the same freshness logic the search path uses, so lineage and
+    search agree. Requires an API key with **read** permission.
+    """
+    if auth.workspace_id:
+        document = await database.get_document(
+            document_id=document_id,
+            workspace_id=auth.workspace_id,
+        )
+    else:
+        user_workspaces = await database.get_user_workspace_ids(auth.key_info.user_id)
+        document = None
+        for ws_id in user_workspaces:
+            document = await database.get_document(document_id=document_id, workspace_id=ws_id)
+            if document:
+                break
+
+    if not document:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    chunks = await database.get_document_chunks(document_id, document.workspace_id)
+    try:
+        return build_lineage(document, chunks, chunk_id=chunk_id)
+    except KeyError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Chunk '{chunk_id}' not found in document '{document_id}'",
+        ) from exc
 
 
 @router.post("/documents/{document_id}/refresh", response_model=DocumentUploadResponse)

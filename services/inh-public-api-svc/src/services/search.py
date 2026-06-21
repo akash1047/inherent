@@ -28,7 +28,44 @@ __all__ = [
     "SearchService",
     "get_search_service",
     "close_search_service",
+    "build_search_request",
 ]
+
+
+# The full set of fields a caller may supply to construct a SearchRequest.
+# Anything outside this set is ignored so transport-only keys (e.g. the MCP
+# ``api_key`` / ``workspace_id`` arguments) don't leak into the model.
+_SEARCH_REQUEST_FIELDS: tuple[str, ...] = (
+    "query",
+    "limit",
+    "min_score",
+    "document_ids",
+    "include_context",
+    "context_window",
+    "search_mode",
+    "alpha",
+)
+
+
+def build_search_request(params: dict[str, Any]) -> SearchRequest:
+    """Construct a :class:`SearchRequest` from a flat dict of parameters.
+
+    Single source of truth (no drift): BOTH the REST search route and the MCP
+    ``search_documents`` / ``search_memory`` tools build their ``SearchRequest``
+    through this helper, so the two surfaces always accept the same parameters
+    with the same validation and defaults.
+
+    Only the known search fields are read from ``params``; any extra keys (such
+    as the MCP transport keys ``api_key`` and ``workspace_id``) are ignored.
+    Keys whose value is ``None`` are dropped so the model's own defaults apply.
+    Validation (ranges, required ``query``) is delegated to the Pydantic model.
+    """
+    kwargs = {
+        field: params[field]
+        for field in _SEARCH_REQUEST_FIELDS
+        if field in params and params[field] is not None
+    }
+    return SearchRequest(**kwargs)
 
 
 def _get_workspace_collection_name(workspace_id: str) -> str:

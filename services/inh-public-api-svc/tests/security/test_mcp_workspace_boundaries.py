@@ -12,13 +12,12 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from src.models.api_key import APIKeyInfo
-from src.models.document import Document
-
 # The MCP package was renamed src/mcp -> src/mcp_server so it no longer shadows
 # the third-party ``mcp`` SDK under pytest's ``pythonpath = ["src"]``; these
 # boundary checks now run offline (no skip).
 from src.mcp_server import server as mcp_server
+from src.models.api_key import APIKeyInfo
+from src.models.document import Document
 
 pytestmark = [pytest.mark.security]
 
