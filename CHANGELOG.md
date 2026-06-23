@@ -1,0 +1,77 @@
+# Changelog
+
+All notable changes to Inherent are documented here. The format follows
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project has not
+yet cut a tagged release, so everything sits under **Unreleased**.
+
+## [Unreleased] — Org-readiness program
+
+A milestone-by-milestone push to make Inherent a self-hostable, permission-aware
+agent **memory substrate** an organization can run on day one. Delivered as a
+stack of reviewable PRs (merge order: #65 → #66 → #67 → #68 → #69 → #70, on top
+of the already-merged M0–M2 #62/#63/#64). See
+[docs/maintainers/org-readiness-requirements.md](docs/maintainers/org-readiness-requirements.md)
+and [ADR 0001](docs/adr/0001-agent-memory-substrate.md).
+
+### M0–M2 (merged: #62, #63, #64)
+- **Boundary** — agent-memory-substrate ADR + org-readiness plan (#46).
+- **Foundation** — one-command `make quickstart`; OSS bootstrap creating the
+  workspace in both Postgres + MongoDB; idempotent/non-destructive migrations;
+  repo-level `make check`; Compose ingestion→search integration test
+  (#3, #16, #5, #19, #15).
+- **Durable ingestion** — document lifecycle status (no more 404-while-pending),
+  durable upload→ingestion handoff, idempotent reindex + duplicate-chunk fix,
+  failure-injection coverage (#7, #6, #60, #11, #31).
+
+### M3 — Content fidelity (#65)
+- README/upload/extraction format alignment + pdf/docx fixtures (#9).
+- Configurable, model-aware chunking with a documented token budget (#10).
+- Extraction & chunking quality evals (#34); coverage reporting added to CI.
+
+### Deferred follow-ups (#66)
+- Non-blocking ingestion with backpressure + dead-letter recording (#8, #18).
+- PNG upload via OCR (Tesseract, optional extra, graceful fallback) (#61).
+- Shared `inh-contracts` package for Weaviate naming + event schemas; both
+  Docker build contexts moved to the repo root (#12, #17).
+
+### M4 — Measurable retrieval (#67)
+- Measurable hybrid baseline with documented scoring + score provenance (#45).
+- Concurrent, bounded, ranking-safe multi-workspace search (#13).
+- Golden corpus + ranking regression evals (recall@k/MRR/nDCG) (#33, #35).
+- Latency/throughput benchmarks with loose SLO guards (#36).
+
+### M5 — Trust (#68)
+- Chunk-level authorization + provenance; **fixed a context-window
+  cross-tenant leak** (neighbour chunks now scoped to the requesting user) (#41).
+- Auth/tenancy/permission regression suite (#32).
+- Freshness-aware memory (`is_stale`) + source refresh endpoint (#42).
+- Claim-level citations + lexical `verify_claim` + `/v1/verify-claim` (#39).
+- RAG poisoning / prompt-injection risk signals (non-blocking) (#44).
+- Adaptive retrieval quality gate + bounded fallback (#43).
+- Fix: reconcile Weaviate chunk-property schema on existing collections so
+  search doesn't break on upgraded deployments (caught by the live E2E).
+
+### M6 — Agent surface (#69)
+- Renamed `src/mcp` → `src/mcp_server` (stopped shadowing the `mcp` SDK).
+- MCP permission + feature parity with REST; shared `build_search_request` (#14).
+- Memory primitive tools over MCP + REST: `search_memory`, `get_citations`,
+  `verify_claim`, `explain_lineage`, `refresh_stale_source`; lineage endpoint (#40).
+- REST/MCP contract regression suite (#30).
+- Fix: `explain_lineage` reads provenance from the chunk columns (live-caught).
+
+### M7 — Governance + DX (#70)
+- Eval result reporting + baseline (#37); per-core-module coverage floors (#38);
+  release acceptance matrix + `make release-check` (#29).
+- Eval-gated advanced-index **scaffolding** (graph/hierarchy/rerank), off by
+  default, no implementation (#47).
+- Root pre-commit (#20); normalized dev-tool pins across services (#21);
+  documented pytest markers + test profiles (#22); CI caching + step summaries
+  (#27); developer-experience / local-setup issue templates (#28).
+
+### Notes
+- Every milestone was validated by a live `docker compose` end-to-end run
+  (upload → ingest → embed → index → search, plus dedup/status/ranking/benchmark)
+  in addition to offline suites.
+- MVP-by-intent: heuristic poisoning risk (#44), lexical `verify_claim` (#39),
+  and advanced indexes (#47, scaffolding only) are deliberate starting points to
+  tighten behind the eval gates.
