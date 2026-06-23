@@ -34,6 +34,14 @@ class DocumentIngestionInput:
     storage_url: str | None = None
     timestamp: str = ""
 
+    # Optional per-document chunking overrides. When None, the workflow
+    # resolves each value from application settings (see settings.py:
+    # chunking_strategy / max_chunk_size / chunk_overlap). This lets a
+    # caller tune chunking per upload without changing global config.
+    chunking_strategy: Literal["tokens", "sentences", "paragraphs"] | None = None
+    max_chunk_size: int | None = None
+    chunk_overlap: int | None = None
+
 
 @dataclass
 class WorkflowResult:
@@ -131,6 +139,10 @@ class ChunkData:
     chunk_index: int
     start_char: int
     end_char: int
+    # Estimated token count for this chunk (see chunk.estimate_tokens).
+    # Defaults to 0 for backward compatibility; the chunk activity always
+    # populates it with the model-aware estimate.
+    token_count: int = 0
 
 
 @dataclass

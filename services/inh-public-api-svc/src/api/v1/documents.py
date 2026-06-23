@@ -150,6 +150,7 @@ async def upload_document(
         "storage_bucket": storage._bucket,
         "storage_url": storage_url,
         "timestamp": now_iso,
+        "contract_version": "1.0.0",
     }
 
     try:

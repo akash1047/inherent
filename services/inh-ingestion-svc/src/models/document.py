@@ -32,6 +32,7 @@ class DocumentChunk(BaseModel):
     chunk_index: int
     start_char: int = 0
     end_char: int = 0
+    token_count: int | None = None
     embedding: list[float] | None = None
     metadata: dict[str, Any] | None = None
     created_at: datetime | None = None
@@ -61,6 +62,11 @@ class DocumentUploadMessage(BaseModel):
         None, description="Public or signed URL to the file (if available)"
     )
     timestamp: str = Field(..., description="ISO 8601 timestamp of the upload event")
+    contract_version: str = Field(
+        "1.0.0",
+        description="Semantic version of the upload-event contract. Defaults so "
+        "older messages produced without it still validate.",
+    )
 
     @field_validator("storage_bucket", "storage_url", mode="before")
     @classmethod
@@ -143,3 +149,9 @@ class DocumentCompletionMessage(BaseModel):
     storage_path: str | None = Field(None, description="Path in storage")
     storage_bucket: str | None = Field(None, description="Storage bucket name")
     storage_url: str | None = Field(None, description="Full storage URL")
+
+    contract_version: str = Field(
+        "1.0.0",
+        description="Semantic version of the completion-event contract. Defaults "
+        "so older messages produced without it still validate.",
+    )
