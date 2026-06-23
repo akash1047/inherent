@@ -5,6 +5,8 @@
 
 set -e
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 echo "==> Cleaning up existing stack..."
 cd "$(git rev-parse --show-toplevel)"
 make clean
@@ -16,7 +18,6 @@ echo "==> Starting fresh stack with bootstrap..."
 make dev
 
 echo "==> Creating separate workspaces for test scenarios..."
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 bash "$SCRIPT_DIR/setup-workspaces.sh"
 
 echo ""
