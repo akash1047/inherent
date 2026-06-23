@@ -281,6 +281,12 @@ class TemporalWorkflowTrigger:
         Returns:
             Workflow ID for tracking
         """
+        import time
+
+        from src.services.metrics import WORKFLOW_START_LATENCY
+
+        receive_time = time.perf_counter()
+
         if not self._initialized:
             await self.initialize()
 
@@ -308,12 +314,18 @@ class TemporalWorkflowTrigger:
 
         workflow_id = f"ingest-{upload_message.document_id}"
 
+        # Start the workflow without awaiting its result. If Temporal is
+        # transiently unavailable this raises and propagates so the MQ
+        # consumer does NOT ack the message (it stays pending → redelivered).
         await self._client.start_workflow(
             DocumentIngestionWorkflow.run,
             workflow_input,
             id=workflow_id,
             task_queue=self.settings.temporal_task_queue,
         )
+
+        # Record admission latency: MQ-receive → Temporal-accepted.
+        WORKFLOW_START_LATENCY.observe(time.perf_counter() - receive_time)
 
         logger.info(
             "Temporal workflow started (async)",
@@ -363,18 +375,23 @@ _workflow_trigger: TemporalWorkflowTrigger | None = None
 
 
 def get_workflow_trigger(
-    settings: Settings, mq_service: BaseMQService | None = None
+    settings: Settings,
+    mq_service: BaseMQService | None = None,
+    db_service: DatabaseService | None = None,
 ) -> TemporalWorkflowTrigger:
     """Get or create the global workflow trigger.
 
     Args:
         settings: Application settings
         mq_service: Optional MQ service for publishing completion notifications
+        db_service: Optional database service for dead-letter recording
 
     Returns:
         TemporalWorkflowTrigger instance
     """
     global _workflow_trigger
     if _workflow_trigger is None:
-        _workflow_trigger = TemporalWorkflowTrigger(settings, mq_service=mq_service)
+        _workflow_trigger = TemporalWorkflowTrigger(
+            settings, mq_service=mq_service, db_service=db_service
+        )
     return _workflow_trigger

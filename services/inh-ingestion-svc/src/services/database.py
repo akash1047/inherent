@@ -1,6 +1,7 @@
 """Database service for PostgreSQL with document storage and multi-tenancy support."""
 
 import enum
+import hashlib
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from typing import Any
@@ -214,10 +215,22 @@ class DatabaseService:
             Column("start_char", Integer, default=0),
             Column("end_char", Integer, default=0),
             Column("metadata", JSONB, nullable=True),
+            # Provenance (#41): nullable, additive. See migration 008.
+            Column("content_hash", String(64), nullable=True),
+            Column("source_uri", String(2000), nullable=True),
             Column(
                 "created_at",
                 DateTime(timezone=True),
                 nullable=False,
+                default=lambda: datetime.now(UTC),
+            ),
+            # Freshness (#42): when this chunk was (re)ingested. Defaulted/additive
+            # (see migration 009). Promoted onto SearchResult so aged evidence can
+            # be flagged is_stale (the API does not drop it).
+            Column(
+                "ingested_at",
+                DateTime(timezone=True),
+                nullable=True,
                 default=lambda: datetime.now(UTC),
             ),
             UniqueConstraint(
@@ -809,6 +822,11 @@ class DatabaseService:
                     # imports modules that ultimately reference this service).
                     from src.temporal.activities.chunk import estimate_tokens
 
+                    # Provenance (#41): source_uri points at where the chunk's
+                    # source bytes live. Prefer the storage_path, fall back to a
+                    # remote storage_url; NULL when neither is known.
+                    source_uri = message.storage_path or message.storage_url
+
                     chunk_values = [
                         {
                             "processed_document_id": doc_id,
@@ -828,7 +846,19 @@ class DatabaseService:
                             "start_char": chunk.start_char,
                             "end_char": chunk.end_char,
                             "metadata": chunk.metadata,
+                            # Provenance (#41): content_hash makes returned
+                            # evidence auditable/verifiable; source_uri records
+                            # where it came from. Both are nullable (migration 008).
+                            "content_hash": hashlib.sha256(
+                                chunk.content.encode("utf-8")
+                            ).hexdigest(),
+                            "source_uri": source_uri,
                             "created_at": now,
+                            # Freshness (#42): stamp ingest time so the API can age
+                            # returned evidence. On re-ingestion (refresh path) the
+                            # old chunks are deleted above and re-inserted with a
+                            # fresh ingested_at, so a refresh resets staleness.
+                            "ingested_at": now,
                         }
                         for chunk in chunks
                     ]

@@ -10,7 +10,7 @@ and referenced by workflow_run_id. This keeps every gRPC payload < 1KB
 and avoids the 4MB Temporal limit.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 
@@ -52,6 +52,24 @@ class WorkflowResult:
     chunks_created: int = 0
     error: str | None = None
     processing_time_ms: int = 0
+
+
+@dataclass
+class RecordDeadLetterInput:
+    """Input for the record_dead_letter activity (#8 dead-letter recording).
+
+    Carries everything needed to write a dead_letter_jobs row and to
+    reconstruct the original MQ message so the retry API can re-publish it
+    faithfully. ``original_message`` is the full upload-event payload dict.
+    """
+
+    document_id: str
+    workspace_id: str
+    user_id: str
+    workflow_run_id: str | None
+    original_message: dict
+    error_message: str
+    error_type: str
 
 
 # =============================================================================
@@ -143,6 +161,11 @@ class ChunkData:
     # Defaults to 0 for backward compatibility; the chunk activity always
     # populates it with the model-aware estimate.
     token_count: int = 0
+    # RAG-poisoning / prompt-injection risk signal (#44). Heuristic, NON-BLOCKING:
+    # one of "none" | "low" | "medium" | "high" plus the matched reason codes.
+    # Defaults keep older staged chunks valid; the chunk activity always sets them.
+    content_risk: str = "none"
+    content_risk_reasons: list[str] = field(default_factory=list)
 
 
 @dataclass

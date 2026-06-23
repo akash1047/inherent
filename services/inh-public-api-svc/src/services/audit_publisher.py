@@ -49,6 +49,7 @@ def build_audit_event(
     query_filters: dict[str, Any] | None = None,
     result_count: int,
     result_snippets: list[dict[str, Any]] | None = None,
+    returned_chunk_ids: list[str] | None = None,
     llm_response: str | None = None,
     response_time_ms: float,
     request_id: str | None = None,
@@ -57,6 +58,7 @@ def build_audit_event(
     include_context: bool | None = None,
     context_window: int | None = None,
     alpha: float | None = None,
+    risk_counts: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     """Construct an audit event dict ready for MQ publishing.
 
@@ -94,6 +96,9 @@ def build_audit_event(
         "query_filters": query_filters or {},
         "result_count": result_count,
         "result_snippets": safe_snippets,
+        # Provenance (#41): the chunk_ids of the evidence actually returned, so
+        # an audit record can be tied back to specific chunks.
+        "returned_chunk_ids": list(returned_chunk_ids) if returned_chunk_ids else [],
         "llm_response": llm_response,
         "response_time_ms": response_time_ms,
         "request_id": request_id or str(uuid.uuid4()),
@@ -109,8 +114,28 @@ def build_audit_event(
         event["context_window"] = context_window
     if alpha is not None:
         event["alpha"] = alpha
+    # RAG-poisoning visibility (#44): counts of returned chunks by risk level so
+    # an auditor can spot when risky evidence is surfacing in answers.
+    if risk_counts is not None:
+        event["risk_counts"] = risk_counts
 
     return event
+
+
+def count_results_by_risk(results: list[Any]) -> dict[str, int]:
+    """Tally returned search results by their content_risk level (#44).
+
+    Buckets every result into one of "none" | "low" | "medium" | "high". A
+    missing/unknown ``content_risk`` counts as "none" so the totals always sum
+    to the number of returned results.
+    """
+    counts = {"none": 0, "low": 0, "medium": 0, "high": 0}
+    for r in results:
+        level = getattr(r, "content_risk", None) or "none"
+        if level not in counts:
+            level = "none"
+        counts[level] += 1
+    return counts
 
 
 # ---------------------------------------------------------------------------

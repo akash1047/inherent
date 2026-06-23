@@ -205,8 +205,10 @@ services:
 
   inh-ingestion-svc:
     build:
-      context: ./services/inh-ingestion-svc
-      dockerfile: Dockerfile
+      # Build from the repo root so the sibling shared package
+      # (services/inh-contracts) is visible to the build context.
+      context: .
+      dockerfile: services/inh-ingestion-svc/Dockerfile
     container_name: inherent-oss-ingestion
     restart: unless-stopped
     ports:
@@ -263,8 +265,10 @@ services:
 
   inh-public-api-svc:
     build:
-      context: ./services/inh-public-api-svc
-      dockerfile: Dockerfile
+      # Build from the repo root so the sibling shared package
+      # (services/inh-contracts) is visible to the build context.
+      context: .
+      dockerfile: services/inh-public-api-svc/Dockerfile
     container_name: inherent-oss-public-api
     restart: unless-stopped
     ports:

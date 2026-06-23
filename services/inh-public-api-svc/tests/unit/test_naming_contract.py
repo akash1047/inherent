@@ -13,6 +13,9 @@ import pytest
 
 from src.services.search import _get_user_tenant_name, _get_workspace_collection_name
 
+# Part of the selectable contract-regression surface (M6 #30).
+pytestmark = [pytest.mark.contract]
+
 
 @pytest.mark.parametrize(
     ("workspace_id", "expected"),

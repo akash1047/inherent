@@ -6,13 +6,22 @@ Multi-tenancy Design:
 - This enables efficient per-user data isolation within workspace-level organization
 """
 
-import re
+import hashlib
 import uuid
 from datetime import UTC, datetime
 from typing import Any
 
 import structlog
 import weaviate
+
+# Weaviate naming now lives in the shared contracts package (single source of
+# truth, #12). Re-exported here so existing imports keep working:
+#   from src.services.weaviate import get_workspace_collection_name
+from inh_contracts.naming import (
+    WORKSPACE_COLLECTION_PREFIX,
+    get_user_tenant_name,
+    get_workspace_collection_name,
+)
 from weaviate.classes.config import Configure, DataType, Property
 from weaviate.classes.init import Auth
 from weaviate.classes.query import Filter, MetadataQuery
@@ -21,32 +30,18 @@ from weaviate.classes.tenants import Tenant, TenantActivityStatus
 from src.config.settings import Settings
 from src.models.document import DocumentChunk
 
+__all__ = [
+    "WeaviateService",
+    "DOCUMENT_CHUNKS_COLLECTION",
+    "WORKSPACE_COLLECTION_PREFIX",
+    "get_workspace_collection_name",
+    "get_user_tenant_name",
+]
+
 logger = structlog.get_logger(__name__)
 
 # Legacy collection name (kept for backward compatibility)
 DOCUMENT_CHUNKS_COLLECTION = "DocumentChunk"
-
-# Multi-tenant collection prefix
-WORKSPACE_COLLECTION_PREFIX = "Workspace_"
-
-
-def get_workspace_collection_name(workspace_id: str) -> str:
-    """Generate a valid Weaviate collection name from workspace ID.
-
-    Weaviate collection names must:
-    - Start with an uppercase letter
-    - Only contain alphanumeric characters and underscores
-    """
-    # Remove any non-alphanumeric characters from workspace_id
-    safe_id = re.sub(r"[^a-zA-Z0-9]", "", workspace_id)
-    return f"{WORKSPACE_COLLECTION_PREFIX}{safe_id}"
-
-
-def get_user_tenant_name(user_id: str) -> str:
-    """Generate a valid Weaviate tenant name from user ID."""
-    # Remove any non-alphanumeric characters from user_id
-    safe_id = re.sub(r"[^a-zA-Z0-9]", "", user_id)
-    return f"User_{safe_id}"
 
 
 class WeaviateService:
@@ -150,7 +145,51 @@ class WeaviateService:
             Property(name="original_filename", data_type=DataType.TEXT),
             Property(name="content_type", data_type=DataType.TEXT),
             Property(name="created_at", data_type=DataType.DATE),
+            # Provenance (#41): auditable evidence trail for returned chunks.
+            Property(name="content_hash", data_type=DataType.TEXT),
+            Property(name="source_uri", data_type=DataType.TEXT),
+            # Freshness (#42): when the chunk was (re)ingested, so returned
+            # evidence can be aged/flagged stale by the public API.
+            Property(name="ingested_at", data_type=DataType.DATE),
+            # RAG-poisoning / prompt-injection risk signal (#44): a heuristic,
+            # NON-BLOCKING tag so search can surface and audit can count
+            # suspicious evidence. content_risk is the level ("none".."high");
+            # content_risk_reasons holds the matched reason codes.
+            Property(name="content_risk", data_type=DataType.TEXT),
+            Property(name="content_risk_reasons", data_type=DataType.TEXT_ARRAY),
         ]
+
+    def _reconcile_collection_properties(self, collection_name: str) -> None:
+        """Add any missing chunk properties to an EXISTING collection.
+
+        Collections created before a property was introduced (e.g. the
+        provenance/freshness/risk fields from #41/#42/#44) lack it. Because the
+        public-API search GraphQL-selects those fields, a missing property makes
+        the whole query fail with "Cannot query field ... on type ...". Weaviate
+        supports adding properties to an existing class, so we reconcile the live
+        schema against _get_chunk_properties() and add whatever is missing.
+        Idempotent and best-effort (logged, never raises).
+        """
+        if not self.client:
+            return
+        try:
+            collection = self.client.collections.get(collection_name)
+            existing = {p.name for p in collection.config.get().properties}
+            for prop in self._get_chunk_properties():
+                if prop.name not in existing:
+                    collection.config.add_property(prop)
+                    logger.info(
+                        "Added missing Weaviate property to existing collection",
+                        collection=collection_name,
+                        property_name=prop.name,
+                    )
+        except Exception as e:
+            logger.warning(
+                "Failed to reconcile collection properties; "
+                "search selecting new fields may fail until fixed",
+                collection=collection_name,
+                error=str(e),
+            )
 
     def disconnect(self) -> None:
         """Disconnect from Weaviate."""
@@ -192,6 +231,10 @@ class WeaviateService:
 
         try:
             if self.client.collections.exists(collection_name):
+                # Reconcile schema so collections created before newer chunk
+                # properties (provenance/freshness/risk) gain them; otherwise a
+                # search selecting those fields fails on the old schema.
+                self._reconcile_collection_properties(collection_name)
                 self._collection_cache.add(collection_name)
                 logger.debug("Workspace collection exists", collection=collection_name)
                 return collection_name
@@ -393,6 +436,7 @@ class WeaviateService:
         user_id: str,
         original_filename: str,
         content_type: str,
+        source_uri: str | None = None,
     ) -> int:
         """Store document chunks in a workspace collection with user tenant.
 
@@ -403,6 +447,8 @@ class WeaviateService:
             user_id: User ID (determines tenant)
             original_filename: Original filename
             content_type: MIME type
+            source_uri: Provenance (#41) — where the source bytes live
+                (storage_path / storage_url). Optional/backward-compatible.
 
         Returns:
             Number of chunks stored
@@ -427,8 +473,19 @@ class WeaviateService:
             chunk_texts = [c.content for c in chunks]
             vectors = embed_texts(chunk_texts)
 
+            # Single ingest timestamp for this store call (#42): all chunks of a
+            # document share one ingested_at so freshness is consistent per store.
+            ingest_time = datetime.now(UTC)
+
             with tenant_collection.batch.dynamic() as batch:
                 for chunk, vector in zip(chunks, vectors):
+                    # RAG-poisoning risk signal (#44): promote from chunk.metadata
+                    # (set by the store activity) onto Weaviate properties so the
+                    # public API can surface it. Defaults keep benign chunks clean.
+                    chunk_meta = chunk.metadata or {}
+                    content_risk = chunk_meta.get("content_risk") or "none"
+                    content_risk_reasons = list(chunk_meta.get("content_risk_reasons") or [])
+
                     properties = {
                         "document_id": document_id,
                         "workspace_id": workspace_id,
@@ -439,7 +496,17 @@ class WeaviateService:
                         "end_char": chunk.end_char,
                         "original_filename": original_filename,
                         "content_type": content_type,
-                        "created_at": datetime.now(UTC),
+                        "created_at": ingest_time,
+                        # Provenance (#41): auditable evidence trail.
+                        "content_hash": hashlib.sha256(chunk.content.encode("utf-8")).hexdigest(),
+                        "source_uri": source_uri,
+                        # Freshness (#42): stamp ingest time so the public API can
+                        # age returned evidence. Matches the PG document_chunks
+                        # ingested_at; a refresh re-stores chunks with a new value.
+                        "ingested_at": ingest_time,
+                        # Risk signal (#44): additive, NON-BLOCKING.
+                        "content_risk": content_risk,
+                        "content_risk_reasons": content_risk_reasons,
                     }
 
                     # Generate deterministic UUID
@@ -729,6 +796,7 @@ class WeaviateService:
         user_id: str,
         original_filename: str,
         content_type: str,
+        source_uri: str | None = None,
     ) -> int:
         """Store document chunks - routes to multi-tenant storage.
 
@@ -741,6 +809,7 @@ class WeaviateService:
             user_id=user_id,
             original_filename=original_filename,
             content_type=content_type,
+            source_uri=source_uri,
         )
 
     async def delete_document_chunks(self, document_id: str) -> int:

@@ -163,6 +163,14 @@ def create_app(settings: Settings) -> FastAPI:
         app.state.worker_manager = manager
         app.state.settings = settings
 
+        # Expose the workflow trigger so the dead-letter retry endpoint can
+        # re-publish/restart failed jobs (#8). In worker mode this returns the
+        # already-initialized global trigger; in api-only mode it self-initializes
+        # on first use.
+        from src.temporal.trigger import get_workflow_trigger
+
+        app.state.trigger = get_workflow_trigger(settings)
+
         logger.info(
             "Standalone API ready",
             task_queue=settings.temporal_task_queue,

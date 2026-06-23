@@ -268,11 +268,45 @@ class TestUploadDocumentValidation:
             async with AsyncClient(transport=transport, base_url="http://test") as ac:
                 response = await ac.post(
                     "/v1/documents",
-                    files=_file_payload(content_type="image/png"),
+                    files=_file_payload(content_type="application/x-msdownload"),
                     headers={"X-API-Key": "ink_test_key"},
                 )
 
         assert response.status_code == 400
+        application.dependency_overrides.clear()
+
+    async def test_png_image_accepted(self, write_key, mock_db, mock_storage, mock_mq):
+        """PNG images are now accepted (read via OCR in ingestion, #61)."""
+        application = create_app()
+        application.dependency_overrides[get_api_key_info] = lambda: write_key
+        application.dependency_overrides[get_write_permission] = lambda: write_key
+        application.dependency_overrides[resolve_workspace_write] = lambda: ResolvedAuth(
+            key_info=write_key, workspace_id=write_key.workspace_id
+        )
+        application.dependency_overrides[get_database] = lambda: mock_db
+
+        with (
+            patch("src.api.v1.documents.get_storage_service", return_value=mock_storage),
+            patch(
+                "src.api.v1.documents.get_mq_service",
+                new_callable=AsyncMock,
+                return_value=mock_mq,
+            ),
+        ):
+            transport = ASGITransport(app=application)
+            async with AsyncClient(transport=transport, base_url="http://test") as ac:
+                response = await ac.post(
+                    "/v1/documents",
+                    files=_file_payload(
+                        content=b"\x89PNG\r\n\x1a\n fake png bytes",
+                        filename="scan.png",
+                        content_type="image/png",
+                    ),
+                    headers={"X-API-Key": "ink_test_key"},
+                )
+
+        assert response.status_code == 201, f"PNG should be accepted but got {response.status_code}"
+        assert response.json()["mime_type"] == "image/png"
         application.dependency_overrides.clear()
 
     async def test_empty_file(self, write_key, mock_db, mock_storage, mock_mq):

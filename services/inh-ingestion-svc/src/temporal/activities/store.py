@@ -15,6 +15,22 @@ from src.temporal.models import StoreDocumentInput, StoreDocumentOutput
 logger = structlog.get_logger(__name__)
 
 
+def _risk_metadata(chunk_dict: dict) -> dict | None:
+    """Build chunk metadata carrying the RAG-poisoning risk signal (#44).
+
+    Only emitted when a risk level is present in the staged chunk so benign
+    chunks keep a clean/None metadata payload. Additive: any future metadata
+    keys can be merged here.
+    """
+    risk = chunk_dict.get("content_risk")
+    if not risk or risk == "none":
+        return None
+    return {
+        "content_risk": risk,
+        "content_risk_reasons": list(chunk_dict.get("content_risk_reasons") or []),
+    }
+
+
 @activity.defn
 async def store_in_postgresql(input: StoreDocumentInput) -> StoreDocumentOutput:
     """Store processed document and chunks in PostgreSQL.
@@ -40,7 +56,9 @@ async def store_in_postgresql(input: StoreDocumentInput) -> StoreDocumentOutput:
     start = time.monotonic()
 
     try:
-        # Convert chunk dicts to DocumentChunk objects
+        # Convert chunk dicts to DocumentChunk objects. The per-chunk risk
+        # signal (#44) is carried in metadata so it lands in the document_chunks
+        # metadata JSONB column without a new migration.
         chunks = [
             DocumentChunk(
                 document_id=c["document_id"],
@@ -49,6 +67,7 @@ async def store_in_postgresql(input: StoreDocumentInput) -> StoreDocumentOutput:
                 start_char=c["start_char"],
                 end_char=c["end_char"],
                 token_count=c.get("token_count"),
+                metadata=_risk_metadata(c),
             )
             for c in chunk_dicts
         ]
@@ -203,7 +222,8 @@ async def store_in_weaviate(input: StoreDocumentInput) -> StoreDocumentOutput:
                 error="Weaviate not connected",
             )
 
-        # Convert chunk dicts to DocumentChunk objects
+        # Convert chunk dicts to DocumentChunk objects. metadata carries the
+        # per-chunk risk signal (#44) so it can be written as Weaviate properties.
         chunks = [
             DocumentChunk(
                 document_id=c["document_id"],
@@ -212,6 +232,7 @@ async def store_in_weaviate(input: StoreDocumentInput) -> StoreDocumentOutput:
                 start_char=c["start_char"],
                 end_char=c["end_char"],
                 token_count=c.get("token_count"),
+                metadata=_risk_metadata(c),
             )
             for c in chunk_dicts
         ]
@@ -242,6 +263,8 @@ async def store_in_weaviate(input: StoreDocumentInput) -> StoreDocumentOutput:
             user_id=input.user_id,
             original_filename=input.original_filename,
             content_type=input.content_type,
+            # Provenance (#41): record where the source bytes live.
+            source_uri=input.storage_path,
         )
 
         duration_ms = int((time.monotonic() - start) * 1000)

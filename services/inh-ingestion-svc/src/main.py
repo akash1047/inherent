@@ -87,10 +87,14 @@ async def run_worker(settings: Settings) -> None:
     await trigger.initialize()
     logger.info("Temporal trigger initialized")
 
-    # 3. Subscribe to upload topic
+    # 3. Subscribe to upload topic.
+    # Use the NON-BLOCKING async start (#18 backpressure): the handler returns
+    # once Temporal accepts the workflow start, freeing the consumer instead of
+    # blocking until the workflow finishes. Processing concurrency is bounded by
+    # the Temporal worker; the consume loop is bounded by mq_max_concurrent.
     await mq_service.subscribe(
         topic=settings.mq_upload_topic,
-        handler=trigger.trigger_workflow,  # type: ignore[arg-type]
+        handler=trigger.trigger_workflow_async,  # type: ignore[arg-type]
         group_id=settings.mq_consumer_group,
     )
     logger.info(

@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := help
 
-.PHONY: help setup quickstart env install validate up dev down restart ps logs health doctor bootstrap seed dev-seed check test test-integration lint format-check type-check security-check clean
+.PHONY: help setup quickstart env install validate up dev down restart ps logs health doctor bootstrap seed dev-seed check test test-fast test-integration release-check lint format-check type-check security-check clean
 
 COMPOSE              ?= docker compose
 PUBLIC_API_URL       ?= http://localhost:18000
@@ -131,9 +131,28 @@ test:
 	@cd $(INGESTION_DIR) && uv run pytest
 	@cd $(PUBLIC_API_DIR) && uv run pytest
 
+## test-fast: Fast offline unit profile for both services (no compose/slow/benchmark).
+test-fast:
+	@cd $(INGESTION_DIR) && uv run pytest -m 'not compose and not slow and not benchmark'
+	@cd $(PUBLIC_API_DIR) && uv run pytest -m 'not compose and not slow and not benchmark'
+
 ## test-integration: Run Compose-backed integration tests (requires a running stack).
 test-integration:
 	@cd $(PUBLIC_API_DIR) && uv run pytest -m compose
+
+## release-check: Run the offline release-acceptance suites across both services.
+##                Excludes the slow Compose e2e gate (run via integration.yml /
+##                `make test-integration`). See docs/maintainers/release_acceptance_matrix.md.
+release-check: check
+	@echo "==> public-api contract suite"
+	@cd $(PUBLIC_API_DIR) && uv run pytest -m contract
+	@echo "==> public-api security suite"
+	@cd $(PUBLIC_API_DIR) && uv run pytest -m security
+	@echo "==> ingestion eval suite"
+	@cd $(INGESTION_DIR) && uv run pytest -m eval
+	@echo "==> ingestion failure-injection suite"
+	@cd $(INGESTION_DIR) && uv run pytest -m failure_injection
+	@echo "==> Offline release-acceptance suites passed. Confirm the Compose e2e gate (integration.yml) before tagging."
 
 ## lint: Run Ruff checks for both services.
 lint:

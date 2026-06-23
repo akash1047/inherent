@@ -148,6 +148,66 @@ class Settings(BaseSettings):
     )
     embedding_dim: int = Field(384, alias="EMBEDDING_DIM")
 
+    # Search (#13 — multi-workspace retrieval)
+    search_max_workspace_concurrency: int = Field(
+        default=8,
+        ge=1,
+        description=(
+            "Maximum number of workspaces searched concurrently for a single "
+            "multi-workspace search request. Bounds in-flight Weaviate queries "
+            "so a user with many workspaces cannot exhaust the connection pool."
+        ),
+    )
+
+    # Freshness (#42) — stale-evidence policy
+    freshness_max_age_days: int = Field(
+        default=90,
+        ge=1,
+        description=(
+            "Evidence older than this many days is flagged is_stale=true on each "
+            "SearchResult. Stale evidence is NOT filtered out — it is returned with "
+            "the flag so callers can decide how to treat it (and can trigger a "
+            "refresh/re-ingestion). Compared against the chunk's ingested_at."
+        ),
+    )
+
+    # Advanced retrieval methods (#47) — EXPERIMENTAL, OFF BY DEFAULT.
+    #
+    # Each flag gates an advanced retrieval method that is NOT yet implemented
+    # (scaffolding only). They are opt-in and default to False so the production
+    # default stays the measured hybrid baseline (#45). Per the eval-gate policy
+    # (see docs/advanced-indexes.md), NO method may be turned on by default until
+    # it shows a documented eval improvement over the hybrid baseline on the M4
+    # retrieval evals (tests/evals/) AND has maintainer approval. Enable in dev
+    # only, to experiment.
+    enable_reranker: bool = Field(
+        default=False,
+        description=(
+            "EXPERIMENTAL (#47), off by default. Opt-in cross-encoder reranking of "
+            "assembled results. NOT implemented (scaffolding). Requires a documented "
+            "eval improvement vs the hybrid baseline (#45) + maintainer approval "
+            "before it may default on. See docs/advanced-indexes.md."
+        ),
+    )
+    enable_graphrag_index: bool = Field(
+        default=False,
+        description=(
+            "EXPERIMENTAL (#47), off by default. Opt-in GraphRAG-style graph index "
+            "retrieval. NOT implemented (scaffolding). Requires a documented eval "
+            "improvement vs the hybrid baseline (#45) + maintainer approval before "
+            "it may default on. See docs/advanced-indexes.md."
+        ),
+    )
+    enable_hierarchy_index: bool = Field(
+        default=False,
+        description=(
+            "EXPERIMENTAL (#47), off by default. Opt-in hierarchical (parent/child) "
+            "index retrieval. NOT implemented (scaffolding). Requires a documented "
+            "eval improvement vs the hybrid baseline (#45) + maintainer approval "
+            "before it may default on. See docs/advanced-indexes.md."
+        ),
+    )
+
     # Health Checks
     health_check_timeout_seconds: float = 5.0
 

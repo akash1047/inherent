@@ -365,6 +365,10 @@ class DocumentProcessor:
             if content_type == "text/html" or filename.endswith(".html"):
                 return self._extract_html_text(content)
 
+            # PNG images (OCR with graceful fallback)
+            if content_type == "image/png" or filename.endswith(".png"):
+                return self._extract_image_text(content, message.original_filename)
+
             # Default: try to decode as text
             try:
                 return content.decode("utf-8", errors="ignore")
@@ -433,6 +437,58 @@ class DocumentProcessor:
         except Exception as e:
             logger.error("DOCX extraction failed", error=str(e))
             return ""
+
+    def _extract_image_text(self, content: bytes, original_filename: str) -> str:
+        """Extract text from a PNG image via Tesseract OCR with graceful fallback.
+
+        OCR is optional (requires the ``ocr`` extra plus the ``tesseract``
+        system binary). When OCR is unavailable -- libraries not installed,
+        the tesseract binary is missing, or no readable text in the image --
+        this returns a minimal placeholder instead of raising, so a missing
+        OCR install never crashes ingestion (0 useful chunks, not a hard
+        failure).
+        """
+        placeholder = f"[image: {original_filename}, no text extracted]"
+
+        try:
+            import io
+
+            import pytesseract
+            from PIL import Image
+        except ImportError:
+            logger.warning(
+                "OCR libraries not available (install the 'ocr' extra: pytesseract, pillow); "
+                "returning placeholder for image",
+                filename=original_filename,
+            )
+            return placeholder
+
+        try:
+            image = Image.open(io.BytesIO(content))
+            text = pytesseract.image_to_string(image)
+        except pytesseract.TesseractNotFoundError:
+            logger.warning(
+                "Tesseract binary not found; install the 'tesseract-ocr' system package. "
+                "Returning placeholder for image",
+                filename=original_filename,
+            )
+            return placeholder
+        except Exception as e:
+            logger.warning(
+                "OCR failed for image; returning placeholder",
+                filename=original_filename,
+                error=str(e),
+            )
+            return placeholder
+
+        if not text.strip():
+            logger.warning(
+                "OCR produced no text for image; returning placeholder",
+                filename=original_filename,
+            )
+            return placeholder
+
+        return text
 
     def _extract_html_text(self, content: bytes) -> str:
         """Extract text from HTML content."""
@@ -665,6 +721,8 @@ class DocumentProcessor:
                     user_id=message.user_id,
                     original_filename=message.original_filename,
                     content_type=message.content_type,
+                    # Provenance (#41): record where the source bytes live.
+                    source_uri=message.storage_path or message.storage_url,
                 )
                 logger.info(
                     "Stored in Weaviate with multi-tenancy",

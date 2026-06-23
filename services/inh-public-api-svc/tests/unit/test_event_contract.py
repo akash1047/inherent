@@ -24,6 +24,9 @@ from src.services.auth import (
 )
 from src.services.database import get_database
 
+# Part of the selectable contract-regression surface (M6 #30).
+pytestmark = [pytest.mark.contract]
+
 # The canonical v1 event contract key set. This is the single source of truth on
 # the producer side and must match the ingestion consumer's expectation exactly.
 CANONICAL_V1_KEYS = {

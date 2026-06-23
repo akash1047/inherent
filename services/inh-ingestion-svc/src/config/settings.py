@@ -89,6 +89,12 @@ class Settings(BaseSettings):
     max_retries: int = Field(3, alias="MAX_RETRIES")
     retry_delay_seconds: int = Field(5, alias="RETRY_DELAY_SECONDS")
 
+    # Backpressure: max number of MQ messages whose Temporal workflow-starts
+    # may be in flight concurrently in the consume loop. Defaults to max_workers.
+    # See #18: this bounds async workflow starts so the consumer doesn't fan out
+    # unbounded; actual processing concurrency is bounded by the Temporal worker.
+    mq_max_concurrent: int = Field(0, alias="MQ_MAX_CONCURRENT")
+
     # Configuration Path
     config_path: str = Field("config/sources.yaml", alias="CONFIG_PATH")
 
@@ -117,6 +123,14 @@ class Settings(BaseSettings):
 
     # Task queue name for document ingestion workflows
     temporal_task_queue: str = Field("document-ingestion", alias="TEMPORAL_TASK_QUEUE")
+
+    # Temporal worker concurrency limits (#18 backpressure). These cap how many
+    # activities / workflow tasks the worker will execute concurrently, which is
+    # the real bound on processing throughput once MQ consumption is non-blocking.
+    temporal_max_concurrent_activities: int = Field(10, alias="TEMPORAL_MAX_CONCURRENT_ACTIVITIES")
+    temporal_max_concurrent_workflow_tasks: int = Field(
+        10, alias="TEMPORAL_MAX_CONCURRENT_WORKFLOW_TASKS"
+    )
 
     # =========================================================================
     # Multi-Tenancy Configuration
@@ -159,6 +173,16 @@ class Settings(BaseSettings):
 
     # Port for Prometheus metrics server (worker mode only; standalone uses /metrics route)
     metrics_port: int = Field(9090, alias="METRICS_PORT")
+
+    @property
+    def resolved_mq_max_concurrent(self) -> int:
+        """Effective MQ consume-loop concurrency bound.
+
+        Falls back to ``max_workers`` when ``mq_max_concurrent`` is unset
+        (<= 0), and never returns less than 1.
+        """
+        value = self.mq_max_concurrent if self.mq_max_concurrent > 0 else self.max_workers
+        return max(1, value)
 
 
 @lru_cache

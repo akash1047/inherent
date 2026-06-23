@@ -46,6 +46,26 @@ DOCUMENTS_PROCESSED_TOTAL = Counter(
     ["content_type"],
 )
 
+# ── Backpressure / MQ Metrics (#18) ──────────────────────────────────
+
+# Latency from receiving a message off the MQ to Temporal accepting the
+# workflow start (i.e. the async start returns). This is the "admission"
+# latency, NOT end-to-end processing time (see WORKFLOW_DURATION for that).
+WORKFLOW_START_LATENCY = Histogram(
+    "ingestion_workflow_start_latency_seconds",
+    "Latency from MQ message receive to Temporal accepting the workflow start",
+    buckets=[0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0],
+)
+
+# Number of pending (delivered-but-unACKed) messages on an MQ stream/group.
+# A persistently growing value indicates the consumer is falling behind
+# (backpressure building up). Set best-effort via XPENDING.
+MQ_STREAM_PENDING = Gauge(
+    "ingestion_mq_stream_pending",
+    "Number of pending (unacknowledged) messages on the MQ stream",
+    ["stream", "group"],
+)
+
 # ── Database Metrics ─────────────────────────────────────────────────
 
 POSTGRES_QUERY_DURATION = Histogram(

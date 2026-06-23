@@ -355,8 +355,11 @@ class TestSearchDocuments:
             json={"query": "test", "limit": 50},
             headers={"X-API-Key": "ink_test_key"},
         )
-        call_args = mock_search_svc.search.call_args
-        request_arg = call_args.kwargs["request"]
+        # The FIRST search call carries the caller's limit. (Empty results now
+        # trigger a single broadened-query fallback (#43) that may re-call search
+        # with a widened limit, so we assert on the initial call specifically.)
+        first_call = mock_search_svc.search.call_args_list[0]
+        request_arg = first_call.kwargs["request"]
         assert request_arg.limit == 50
 
     async def test_search_invalid_body_not_json(self, client):

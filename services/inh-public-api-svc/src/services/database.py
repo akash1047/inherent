@@ -26,6 +26,25 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 
+def _merge_chunk_provenance(row) -> dict:
+    """Fold the document_chunks provenance/freshness COLUMNS into the chunk's
+    metadata dict so consumers that read metadata (e.g. explain_lineage, #40)
+    see the real values stored by #41/#42. Existing metadata keys win.
+    """
+    meta = dict(row.metadata or {})
+    if getattr(row, "content_hash", None) is not None:
+        meta.setdefault("content_hash", row.content_hash)
+    if getattr(row, "source_uri", None) is not None:
+        meta.setdefault("source_uri", row.source_uri)
+    ingested = getattr(row, "ingested_at", None)
+    if ingested is not None:
+        meta.setdefault(
+            "ingested_at",
+            ingested.isoformat() if hasattr(ingested, "isoformat") else ingested,
+        )
+    return meta
+
+
 class DatabaseService:
     """Read-only database service for PostgreSQL.
 
@@ -516,6 +535,33 @@ class DatabaseService:
                 metadata=row.metadata,
             )
 
+    async def get_document_upload_fields(self, document_id: str, workspace_id: str) -> dict | None:
+        """Return the stored fields needed to rebuild an upload event (#42 refresh).
+
+        Reads the durable ``processed_documents`` row for ``(document_id,
+        workspace_id)`` and returns the storage + identity fields that the
+        original ``document.uploaded`` MQ message carried. Returns ``None`` when
+        the row does not exist (or is not in this workspace), so the caller can
+        404 without leaking cross-workspace existence.
+        """
+        async with self.session() as session:
+            result = await session.execute(
+                text(
+                    """
+                    SELECT document_id, workspace_id, user_id,
+                           filename, original_filename, content_type, size_bytes,
+                           storage_backend, storage_path, storage_bucket, storage_url
+                    FROM processed_documents
+                    WHERE document_id = :document_id AND workspace_id = :workspace_id
+                """
+                ),
+                {"document_id": document_id, "workspace_id": workspace_id},
+            )
+            row = result.fetchone()
+            if not row:
+                return None
+            return dict(row._mapping)
+
     async def get_document_chunks(self, document_id: str, workspace_id: str) -> list[DocumentChunk]:
         """Get all chunks for a document."""
         async with self.session() as session:
@@ -535,7 +581,8 @@ class DatabaseService:
             result = await session.execute(
                 text(
                     """
-                    SELECT id, document_id, content, chunk_index, token_count, metadata
+                    SELECT id, document_id, content, chunk_index, token_count, metadata,
+                           content_hash, source_uri, ingested_at
                     FROM document_chunks
                     WHERE document_id = :document_id
                     ORDER BY chunk_index ASC
@@ -552,7 +599,9 @@ class DatabaseService:
                     content=row.content,
                     chunk_index=row.chunk_index,
                     token_count=row.token_count or 0,
-                    metadata=row.metadata,
+                    # Surface provenance/freshness columns (#41/#42) into metadata
+                    # so consumers like explain_lineage (#40) read real values.
+                    metadata=_merge_chunk_provenance(row),
                 )
                 for row in rows
             ]
@@ -730,7 +779,8 @@ class DatabaseService:
             result = await session.execute(
                 text(
                     """
-                    SELECT id, document_id, content, chunk_index, token_count, metadata
+                    SELECT id, document_id, content, chunk_index, token_count, metadata,
+                           content_hash, source_uri, ingested_at
                     FROM document_chunks
                     WHERE document_id = :document_id
                     ORDER BY chunk_index ASC
@@ -747,7 +797,9 @@ class DatabaseService:
                     content=row.content,
                     chunk_index=row.chunk_index,
                     token_count=row.token_count or 0,
-                    metadata=row.metadata,
+                    # Surface provenance/freshness columns (#41/#42) into metadata
+                    # so consumers like explain_lineage (#40) read real values.
+                    metadata=_merge_chunk_provenance(row),
                 )
                 for row in rows
             ]
@@ -755,6 +807,7 @@ class DatabaseService:
     async def get_context_chunks(
         self,
         workspace_id: str,
+        user_id: str,
         ranges: list[tuple[str, int, int]],
     ) -> list[DocumentChunk]:
         """Fetch chunks whose (document_id, chunk_index) lies in any of the given ranges.
@@ -762,6 +815,14 @@ class DatabaseService:
         One batched query: one round-trip regardless of how many ranges are passed.
         Indexed by uq_document_chunks_doc_idx constraint.
         Empty ranges short-circuits — returns [] without a DB call.
+
+        Cross-tenant safety (#41): neighbour chunks are scoped to BOTH
+        ``workspace_id`` AND the requesting ``user_id``. ``document_chunks`` has
+        no ``user_id`` column, so ownership is enforced via a join to
+        ``processed_documents.user_id`` (which is the per-user owner of each
+        document). Without this join, a workspace shared by multiple Weaviate
+        tenants could leak another user's neighbour chunks during context
+        expansion.
         """
         if not ranges:
             return []
@@ -776,9 +837,15 @@ class DatabaseService:
             column("metadata"),
             column("workspace_id"),
         )
+        processed_documents = table(
+            "processed_documents",
+            column("document_id"),
+            column("workspace_id"),
+            column("user_id"),
+        )
 
         clauses = []
-        params: dict[str, object] = {"workspace_id": workspace_id}
+        params: dict[str, object] = {"workspace_id": workspace_id, "user_id": user_id}
         for i, (doc_id, lo, hi) in enumerate(ranges):
             doc_param = f"doc_{i}"
             lo_param = f"lo_{i}"
@@ -796,6 +863,10 @@ class DatabaseService:
             params[lo_param] = lo
             params[hi_param] = hi
 
+        # Join document_chunks → processed_documents on (document_id,
+        # workspace_id) and require the parent document to be owned by the
+        # requesting user. This guarantees every returned neighbour belongs to
+        # the caller, not just to the (multi-user) workspace.
         query = (
             select(
                 document_chunks.c.id,
@@ -805,7 +876,17 @@ class DatabaseService:
                 document_chunks.c.token_count,
                 document_chunks.c.metadata,
             )
+            .select_from(
+                document_chunks.join(
+                    processed_documents,
+                    and_(
+                        document_chunks.c.document_id == processed_documents.c.document_id,
+                        document_chunks.c.workspace_id == processed_documents.c.workspace_id,
+                    ),
+                )
+            )
             .where(document_chunks.c.workspace_id == bindparam("workspace_id"))
+            .where(processed_documents.c.user_id == bindparam("user_id"))
             .where(or_(*clauses))
             .order_by(document_chunks.c.document_id, document_chunks.c.chunk_index)
         )

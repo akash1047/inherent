@@ -23,6 +23,8 @@ jobs:
 
       - name: Set up uv
         uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
 
       - name: Create .env
         run: cp .env.example .env
@@ -43,8 +45,40 @@ jobs:
       - name: Bootstrap dev workspace and API key
         run: make bootstrap
 
-      - name: Run integration test
+      - name: Run public-api compose tests (integration + retrieval evals + benchmarks)
         working-directory: services/inh-public-api-svc
+        env:
+          # Retrieval eval (#37) writes per-mode metrics here so we can publish
+          # them as an artifact and diff against the committed baseline.
+          EVAL_REPORT: ${{ github.workspace }}/eval-report.json
+        run: |
+          uv sync --frozen --extra dev --group dev
+          uv run pytest -m compose
+
+      - name: Upload retrieval eval report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: retrieval-eval-report
+          path: eval-report.json
+          if-no-files-found: ignore
+
+      - name: Summarize retrieval eval
+        if: always()
+        run: |
+          {
+            echo "### Retrieval eval metrics"
+            if [ -f eval-report.json ]; then
+              echo '```json'
+              cat eval-report.json
+              echo '```'
+            else
+              echo "_No eval report produced (compose retrieval eval may have been skipped)._"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Run ingestion compose benchmarks
+        working-directory: services/inh-ingestion-svc
         run: |
           uv sync --frozen --extra dev --group dev
           uv run pytest -m compose

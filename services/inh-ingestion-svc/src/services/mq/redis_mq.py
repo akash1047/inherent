@@ -33,6 +33,26 @@ class RedisMQService(BaseMQService):
         self._connected = False
         self._poll_tasks: dict[str, asyncio.Task] = {}
         self._running = False
+        # Backpressure (#18): bound how many handler invocations (each of which
+        # starts a Temporal workflow) run concurrently across a polled batch.
+        # Sized from settings; falls back to max_workers. Created lazily so a
+        # plain MagicMock(spec=Settings) in tests still works.
+        self._concurrency_limit = self._resolve_concurrency_limit(settings)
+        self._semaphore = asyncio.Semaphore(self._concurrency_limit)
+
+    @staticmethod
+    def _resolve_concurrency_limit(settings: Settings) -> int:
+        """Resolve the consume-loop concurrency bound from settings.
+
+        Prefers Settings.resolved_mq_max_concurrent; tolerates partial mocks
+        (falling back to max_workers, then to a safe default of 4).
+        """
+        resolver = getattr(settings, "resolved_mq_max_concurrent", None)
+        try:
+            value = int(resolver) if resolver is not None else int(settings.max_workers)
+        except (TypeError, ValueError):
+            value = 4
+        return max(1, value)
 
     @property
     def backend(self) -> str:
@@ -165,9 +185,19 @@ class RedisMQService(BaseMQService):
                 if not results:
                     continue
 
-                for _stream_name, messages in results:
-                    for message_id, fields in messages:
-                        await self._handle_message(stream, group, message_id, fields, handler)
+                # Process the batch concurrently, bounded by the semaphore
+                # (#18 backpressure). Each message is still ACKed only after
+                # its own handler succeeds (see _handle_message).
+                tasks = [
+                    self._handle_message_bounded(stream, group, message_id, fields, handler)
+                    for _stream_name, messages in results
+                    for message_id, fields in messages
+                ]
+                if tasks:
+                    await asyncio.gather(*tasks)
+
+                # Best-effort: publish current pending/lag for this stream+group.
+                await self._update_pending_gauge(stream, group)
 
             except asyncio.CancelledError:
                 break
@@ -247,4 +277,48 @@ class RedisMQService(BaseMQService):
                 stream=stream,
                 message_id=message_id,
                 error=str(e),
+            )
+
+    async def _handle_message_bounded(
+        self,
+        stream: str,
+        group: str,
+        message_id: str,
+        fields: dict,
+        handler: MessageHandler,
+    ) -> None:
+        """Run _handle_message under the concurrency semaphore (#18 backpressure).
+
+        Bounds how many handler invocations (each starting a Temporal workflow)
+        run concurrently across a polled batch; each message is still ACKed only
+        after its own handler succeeds.
+        """
+        async with self._semaphore:
+            await self._handle_message(stream, group, message_id, fields, handler)
+
+    async def _update_pending_gauge(self, stream: str, group: str) -> None:
+        """Best-effort: publish the stream/group pending (lag) count as a gauge.
+
+        Uses the XPENDING summary form. Never raises — observability must not
+        disrupt the consume loop (and this tolerates mocked redis clients).
+        """
+        if self._redis is None:
+            return
+        try:
+            summary = await self._redis.xpending(stream, group)
+            # redis-py returns a dict for the summary form ({"pending": N, ...});
+            # some clients return a sequence whose first element is the count.
+            if isinstance(summary, dict):
+                pending = summary.get("pending", 0)
+            else:
+                pending = summary[0]
+            from src.services.metrics import MQ_STREAM_PENDING
+
+            MQ_STREAM_PENDING.labels(stream=stream, group=group).set(float(pending or 0))
+        except Exception as exc:  # best-effort metric; never disrupt consumption
+            logger.debug(
+                "Redis MQ: could not update pending gauge",
+                stream=stream,
+                group=group,
+                error=str(exc),
             )

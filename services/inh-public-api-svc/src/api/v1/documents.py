@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
 
 from src.config import settings
 from src.config.constants import ALLOWED_MIME_TYPES, MAX_UPLOAD_SIZE_BYTES
@@ -12,6 +12,7 @@ from src.core.exceptions import BadRequestError, ServiceUnavailableError
 from src.models.document import Document, DocumentListResponse, DocumentUploadResponse
 from src.services.auth import ResolvedAuth, resolve_workspace_read, resolve_workspace_write
 from src.services.database import DatabaseService, get_database
+from src.services.lineage import LineageResponse, build_lineage
 from src.services.mq import get_mq_service
 from src.services.storage import get_storage_service
 from src.utils import get_logger
@@ -282,3 +283,171 @@ async def get_document(
         raise HTTPException(status_code=404, detail="Document not found")
 
     return document
+
+
+@router.get("/documents/{document_id}/lineage", response_model=LineageResponse)
+async def get_document_lineage(
+    document_id: str,
+    auth: Annotated[ResolvedAuth, Depends(resolve_workspace_read)],
+    database: Annotated[DatabaseService, Depends(get_database)],
+    chunk_id: str | None = Query(
+        default=None, description="Optional chunk ID for chunk-level provenance"
+    ),
+) -> LineageResponse:
+    """Explain a document's (or chunk's) provenance and freshness (#40).
+
+    Returns ``source_uri``, ``content_hash``, ``ingested_at``, ``is_stale`` and
+    ``document_name`` projected from already-ingested data. ``is_stale`` is
+    computed with the same freshness logic the search path uses, so lineage and
+    search agree. Requires an API key with **read** permission.
+    """
+    if auth.workspace_id:
+        document = await database.get_document(
+            document_id=document_id,
+            workspace_id=auth.workspace_id,
+        )
+    else:
+        user_workspaces = await database.get_user_workspace_ids(auth.key_info.user_id)
+        document = None
+        for ws_id in user_workspaces:
+            document = await database.get_document(document_id=document_id, workspace_id=ws_id)
+            if document:
+                break
+
+    if not document:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    chunks = await database.get_document_chunks(document_id, document.workspace_id)
+    try:
+        return build_lineage(document, chunks, chunk_id=chunk_id)
+    except KeyError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Chunk '{chunk_id}' not found in document '{document_id}'",
+        ) from exc
+
+
+@router.post("/documents/{document_id}/refresh", response_model=DocumentUploadResponse)
+async def refresh_document(
+    document_id: str,
+    auth: Annotated[ResolvedAuth, Depends(resolve_workspace_write)] = ...,  # type: ignore[assignment]
+    database: Annotated[DatabaseService, Depends(get_database)] = ...,  # type: ignore[assignment]
+) -> DocumentUploadResponse:
+    """Re-ingest an already-uploaded document (#42 freshness refresh).
+
+    Rebuilds the original ``document.uploaded`` event from the stored
+    ``processed_documents`` row and re-publishes it to the ingestion MQ topic,
+    reusing the same publish path as upload. Ingestion is idempotent (M2
+    #11/#60): the document_id is unchanged, so existing chunks are replaced and
+    their ``ingested_at`` is reset — clearing any ``is_stale`` flag.
+
+    Requires an API key with **write** permission (which also implies read for
+    these keys); the workspace is resolved from the API key / X-Workspace-Id.
+
+    Limits: the stored S3 object referenced by ``storage_path`` must still
+    exist; this endpoint does NOT re-upload bytes, it only re-triggers
+    processing of the already-stored file. If the original bytes were deleted,
+    ingestion will fail downstream (surfaced via the document's status).
+    """
+    workspace_id = auth.workspace_id
+    if not workspace_id:
+        raise BadRequestError(
+            detail="Workspace ID required. Provide X-Workspace-Id header.",
+        )
+
+    # Defense in depth: write keys are expected to also carry read, and refresh
+    # both reads the stored row and triggers a mutation. Require read explicitly.
+    if not auth.key_info.has_permission("read"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="API key does not have 'read' permission",
+        )
+
+    fields = await database.get_document_upload_fields(document_id, workspace_id)
+    if not fields:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    # Rebuild the upload event from the stored row and reset the row to pending
+    # so status reflects the in-flight re-ingestion (mirrors the upload path).
+    try:
+        await database.create_or_reset_pending_document(
+            document_id=fields["document_id"],
+            workspace_id=fields["workspace_id"],
+            user_id=fields["user_id"],
+            filename=fields["filename"],
+            original_filename=fields["original_filename"],
+            content_type=fields["content_type"],
+            size_bytes=fields["size_bytes"] or 0,
+            storage_backend=fields["storage_backend"],
+            storage_path=fields["storage_path"],
+            storage_bucket=fields.get("storage_bucket"),
+            storage_url=fields.get("storage_url"),
+        )
+    except Exception as exc:
+        logger.error(
+            "Failed to reset document to pending for refresh",
+            error=str(exc),
+            document_id=document_id,
+        )
+        raise ServiceUnavailableError(
+            service_name="database",
+            detail="Failed to record the refresh. Please try again later.",
+        ) from exc
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    mq_message = {
+        "event_type": "document.uploaded",
+        "document_id": fields["document_id"],
+        "workspace_id": fields["workspace_id"],
+        "user_id": fields["user_id"],
+        "filename": fields["filename"],
+        "original_filename": fields["original_filename"],
+        "content_type": fields["content_type"],
+        "size_bytes": fields["size_bytes"],
+        "storage_backend": fields["storage_backend"],
+        "storage_path": fields["storage_path"],
+        "storage_bucket": fields.get("storage_bucket"),
+        "storage_url": fields.get("storage_url"),
+        "timestamp": now_iso,
+        "contract_version": "1.0.0",
+    }
+
+    try:
+        mq = await get_mq_service()
+        await mq.publish(settings.mq_topic_document_uploaded, mq_message)
+    except Exception as exc:
+        logger.error(
+            "MQ publish failed during refresh — re-ingestion not enqueued",
+            error=str(exc),
+            document_id=document_id,
+        )
+        enqueue_error = "refresh enqueue failed"
+        try:
+            await database.mark_document_failed(document_id, workspace_id, enqueue_error)
+        except Exception as mark_exc:
+            logger.error(
+                "Failed to mark document failed after refresh enqueue failure",
+                error=str(mark_exc),
+                document_id=document_id,
+            )
+        raise ServiceUnavailableError(
+            service_name="mq",
+            detail="Failed to queue the document for re-processing. Please try again later.",
+        ) from exc
+
+    logger.info(
+        "Document refresh accepted",
+        document_id=document_id,
+        workspace_id=workspace_id,
+    )
+
+    return DocumentUploadResponse(
+        document_id=fields["document_id"],
+        name=fields["original_filename"],
+        workspace_id=fields["workspace_id"],
+        storage_url=fields.get("storage_url") or "",
+        mime_type=fields["content_type"],
+        size_bytes=fields["size_bytes"] or 0,
+        status="pending",
+        message="Document queued for re-ingestion (refresh).",
+    )

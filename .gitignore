@@ -19,6 +19,7 @@ data/
 uploads/
 playwright-report/
 test-results/
+eval-report.json
 .DS_Store
 
 graphify-out/
