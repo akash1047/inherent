@@ -51,6 +51,11 @@ jobs:
           # Retrieval eval (#37) writes per-mode metrics here so we can publish
           # them as an artifact and diff against the committed baseline.
           EVAL_REPORT: ${{ github.workspace }}/eval-report.json
+          # CPU TEI embedding on a GitHub runner is slow, and by the last test
+          # the Temporal worker queue holds every prior upload, so a document can
+          # take well over the 180s default to reach 'processed'. Give the
+          # status/search polls a generous budget (job timeout-minutes caps it).
+          INTEGRATION_TIMEOUT: "600"
         run: |
           uv sync --frozen --extra dev --group dev
           uv run pytest -m compose
@@ -79,6 +84,10 @@ jobs:
 
       - name: Run ingestion compose benchmarks
         working-directory: services/inh-ingestion-svc
+        env:
+          # Slow CPU-embedding runner + queued backlog (see above): give the
+          # batch time-to-searchable benchmark a generous budget.
+          BENCHMARK_TIMEOUT: "600"
         run: |
           uv sync --frozen --extra dev --group dev
           uv run pytest -m compose

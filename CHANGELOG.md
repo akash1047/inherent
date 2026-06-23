@@ -75,3 +75,10 @@ and [ADR 0001](docs/adr/0001-agent-memory-substrate.md).
 - MVP-by-intent: heuristic poisoning risk (#44), lexical `verify_claim` (#39),
   and advanced indexes (#47, scaffolding only) are deliberate starting points to
   tighten behind the eval gates.
+
+### Post-merge fixes
+- search no longer 500s when a workspace isn't indexed yet — a query that races
+  ahead of Weaviate class/tenant creation (or a brand-new/empty workspace) now
+  returns empty results instead of an error; the retrieval regression guard was
+  calibrated to the real fresh-stack baseline. Fixed the Integration (compose)
+  CI workflow on `main`.
