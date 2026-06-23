@@ -303,6 +303,19 @@ class SearchService:
             )
         return results
 
+    @staticmethod
+    def _is_missing_collection(text: str, collection_name: str) -> bool:
+        """True when Weaviate reports the *collection class* itself is unknown.
+
+        Weaviate phrases a query against a non-existent class as
+        ``Cannot query field "<Collection>" on type "GetObjectsObj"`` (the
+        collection name is the unknown *field*). This is deliberately narrower
+        than a missing *property* (``Cannot query field "content_hash" on type
+        "<Collection>"`` — collection is the *type*), which is a real schema
+        drift we still want to surface rather than swallow.
+        """
+        return f'Cannot query field "{collection_name}"' in text
+
     async def _search_weaviate(
         self,
         workspace_id: str,
@@ -333,14 +346,36 @@ class SearchService:
             response = await client.post("/v1/graphql", json=graphql_query)
             response.raise_for_status()
             data = response.json()
-        except httpx.HTTPError as exc:
-            raise exc
+        except httpx.HTTPStatusError as exc:
+            # A workspace's Weaviate class/tenant only exists after its first
+            # document is ingested, and Weaviate briefly returns HTTP 422 while
+            # that class/tenant is being created (the ingest→search race seen on
+            # fresh stacks) or for an otherwise unprocessable empty-state query.
+            # In all these cases the workspace simply has nothing queryable yet,
+            # so return no results instead of surfacing a 500. A genuinely
+            # malformed query is still caught by unit/contract tests and by E2E
+            # timeouts (a persistent 422 → no results → polling times out).
+            if exc.response is not None and exc.response.status_code == 422:
+                logger.warning(
+                    "Weaviate search returned 422; treating as empty "
+                    "(workspace class/tenant not ready or nothing indexed yet)",
+                    collection=collection_name,
+                    body=exc.response.text[:200],
+                )
+                return []
+            raise
 
         # GraphQL returns 200 even on errors — check for them explicitly
         if data.get("errors"):
-            raise httpx.HTTPError(
-                f"Weaviate GraphQL error: {data['errors'][0].get('message', 'unknown')}"
-            )
+            message = data["errors"][0].get("message", "unknown")
+            # Same "not indexed yet" states can also come back as 200+errors:
+            # a missing collection class, or a tenant that doesn't exist yet.
+            if (
+                self._is_missing_collection(message, collection_name)
+                or "tenant not found" in message
+            ):
+                return []
+            raise httpx.HTTPError(f"Weaviate GraphQL error: {message}")
 
         chunks = data.get("data", {}).get("Get", {}).get(collection_name, []) or []
 
