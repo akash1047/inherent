@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import re
 
-from src.models.citation import SupportVerdict
+from src.models.citation import SupportLevel, SupportVerdict
 
 # Small, conservative English stopword set. Kept intentionally short so the
 # verifier stays dependency-free and predictable.
@@ -161,6 +161,7 @@ def verify_claim(claim: str, evidence: list[str]) -> SupportVerdict:
     matched_count = len(best_matched)
     total = len(claim_tokens)
 
+    level: SupportLevel
     if best_overlap >= _STRONG_THRESHOLD:
         level = "strong"
     elif best_overlap >= _WEAK_THRESHOLD:
