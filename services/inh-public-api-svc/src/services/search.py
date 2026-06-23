@@ -15,7 +15,7 @@ from inh_contracts.naming import (
 
 from src.config import settings
 from src.models.citation import Citation
-from src.models.search import SearchRequest, SearchResponse, SearchResult
+from src.models.search import ScoreSource, SearchRequest, SearchResponse, SearchResult
 from src.services.database import DatabaseService, get_database
 from src.utils import get_logger
 
@@ -338,7 +338,7 @@ class SearchService:
             # Score provenance (#45): map the mode to its score source and the
             # raw signals that produced the score.
             if request.search_mode == "keyword":
-                score_source = "bm25"
+                score_source: ScoreSource = "bm25"
                 bm25_score: float | None = raw_score if raw_score > 0 else None
                 result_alpha: float | None = None
             elif request.search_mode == "hybrid":
