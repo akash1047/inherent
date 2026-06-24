@@ -63,6 +63,7 @@ def write_key():
 @pytest.fixture
 def mock_db():
     db = AsyncMock()
+    db.get_document_id_by_content_hash = AsyncMock(return_value=None)
     db.get_document_id_by_filename = AsyncMock(return_value=None)
     db.create_or_reset_pending_document = AsyncMock(return_value=None)
     db.mark_document_failed = AsyncMock(return_value=None)

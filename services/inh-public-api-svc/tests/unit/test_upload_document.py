@@ -70,7 +70,10 @@ def user_scoped_key():
 @pytest.fixture
 def mock_db():
     db = AsyncMock()
-    # Default: no existing document with this (workspace, filename) -> new doc_id.
+    # Default: no existing document by content hash or filename -> new doc_id.
+    # Both must be explicit AsyncMocks: a bare AsyncMock attribute would resolve
+    # awaits to a truthy MagicMock and spuriously trigger the dedup path.
+    db.get_document_id_by_content_hash = AsyncMock(return_value=None)
     db.get_document_id_by_filename = AsyncMock(return_value=None)
     db.create_or_reset_pending_document = AsyncMock(return_value=None)
     db.mark_document_failed = AsyncMock(return_value=None)
@@ -819,4 +822,194 @@ class TestUploadDedup:
         new_id = response.json()["document_id"]
         # A freshly generated UUID, not the sentinel reuse value.
         assert uuid.UUID(new_id)
+        application.dependency_overrides.clear()
+
+
+class TestUploadContentDedup:
+    """Fix #75: re-upload of the same CONTENT reuses the document_id even when
+    the filename differs, so verbatim copies cannot flood search results."""
+
+    def _app(self, write_key, mock_db, mock_storage, mock_mq):
+        application = create_app()
+        application.dependency_overrides[get_api_key_info] = lambda: write_key
+        application.dependency_overrides[get_write_permission] = lambda: write_key
+        application.dependency_overrides[resolve_workspace_write] = lambda: ResolvedAuth(
+            key_info=write_key, workspace_id=write_key.workspace_id
+        )
+        application.dependency_overrides[get_database] = lambda: mock_db
+        return application
+
+    async def test_content_hash_persisted_on_pending_row(self, client, mock_db):
+        """The sha256 of the uploaded bytes is written onto the pending row."""
+        import hashlib
+
+        response = await client.post(
+            "/v1/documents",
+            files=_file_payload(content=b"hello world"),
+            headers={"X-API-Key": "ink_test_key"},
+        )
+        assert response.status_code == 201
+        kwargs = mock_db.create_or_reset_pending_document.call_args.kwargs
+        assert kwargs["content_hash"] == hashlib.sha256(b"hello world").hexdigest()
+
+    async def test_content_hash_checked_before_filename(self, client, mock_db):
+        """Content-hash dedup is consulted first; filename lookup is the fallback."""
+        await client.post(
+            "/v1/documents",
+            files=_file_payload(),
+            headers={"X-API-Key": "ink_test_key"},
+        )
+        # Content-hash lookup always runs; with no match it falls back to filename.
+        mock_db.get_document_id_by_content_hash.assert_awaited_once()
+        mock_db.get_document_id_by_filename.assert_awaited_once()
+
+    async def test_duplicate_content_new_filename_reuses_document_id(
+        self, write_key, mock_db, mock_storage, mock_mq
+    ):
+        """Identical content under a DIFFERENT filename collapses onto the original.
+
+        This is the #75 flood case: filename dedup would MISS (returns None) but
+        content-hash dedup must still reuse the existing document_id so a verbatim
+        copy does not create a duplicate document/chunks/embeddings.
+        """
+        existing_id = "original-doc-id-abc"
+        mock_db.get_document_id_by_content_hash = AsyncMock(return_value=existing_id)
+        # Filename dedup would NOT match — the copy has a different name.
+        mock_db.get_document_id_by_filename = AsyncMock(return_value=None)
+
+        application = self._app(write_key, mock_db, mock_storage, mock_mq)
+        with (
+            patch("src.api.v1.documents.get_storage_service", return_value=mock_storage),
+            patch(
+                "src.api.v1.documents.get_mq_service",
+                new_callable=AsyncMock,
+                return_value=mock_mq,
+            ),
+        ):
+            transport = ASGITransport(app=application)
+            async with AsyncClient(transport=transport, base_url="http://test") as ac:
+                response = await ac.post(
+                    "/v1/documents",
+                    files=_file_payload(content=b"verbatim", filename="guide-copy.md"),
+                    headers={"X-API-Key": "ink_test_key"},
+                )
+
+        assert response.status_code == 201
+        assert response.json()["document_id"] == existing_id
+        # Filename dedup must never have been the deciding factor: content match
+        # short-circuits, so the filename lookup is not even consulted.
+        mock_db.get_document_id_by_filename.assert_not_awaited()
+        # The reused id propagates to the pending row and the MQ message.
+        assert (
+            mock_db.create_or_reset_pending_document.call_args.kwargs["document_id"] == existing_id
+        )
+        assert mock_mq.publish.call_args[0][1]["document_id"] == existing_id
+        application.dependency_overrides.clear()
+
+    async def test_distinct_content_gets_distinct_document_ids(
+        self, write_key, mock_db, mock_storage, mock_mq
+    ):
+        """Three DIFFERENT documents must each get their own document_id (no flood).
+
+        Mirrors the repro's healthy baseline: distinct content is never deduped,
+        so each topic keeps its own document_id and can surface independently.
+        """
+        # Stateful fake: dedup keyed on (content_hash) then (filename), exactly
+        # like the production lookups, backed by what has been "stored" so far.
+        by_hash: dict[str, str] = {}
+        by_name: dict[str, str] = {}
+
+        async def _by_hash(workspace_id, content_hash):
+            return by_hash.get(content_hash)
+
+        async def _by_name(workspace_id, filename):
+            return by_name.get(filename)
+
+        async def _create(**kwargs):
+            by_hash[kwargs["content_hash"]] = kwargs["document_id"]
+            by_name[kwargs["original_filename"]] = kwargs["document_id"]
+
+        mock_db.get_document_id_by_content_hash = AsyncMock(side_effect=_by_hash)
+        mock_db.get_document_id_by_filename = AsyncMock(side_effect=_by_name)
+        mock_db.create_or_reset_pending_document = AsyncMock(side_effect=_create)
+
+        application = self._app(write_key, mock_db, mock_storage, mock_mq)
+        seen: set[str] = set()
+        docs = [
+            (b"auth content unique", "auth.md"),
+            (b"rate limiting content unique", "rate.md"),
+            (b"error handling content unique", "errors.md"),
+        ]
+        with (
+            patch("src.api.v1.documents.get_storage_service", return_value=mock_storage),
+            patch(
+                "src.api.v1.documents.get_mq_service",
+                new_callable=AsyncMock,
+                return_value=mock_mq,
+            ),
+        ):
+            transport = ASGITransport(app=application)
+            async with AsyncClient(transport=transport, base_url="http://test") as ac:
+                for content, name in docs:
+                    resp = await ac.post(
+                        "/v1/documents",
+                        files=_file_payload(content=content, filename=name),
+                        headers={"X-API-Key": "ink_test_key"},
+                    )
+                    assert resp.status_code == 201
+                    seen.add(resp.json()["document_id"])
+
+        assert len(seen) == 3, "distinct content must yield 3 distinct document_ids"
+        application.dependency_overrides.clear()
+
+    async def test_repeated_copies_collapse_to_one_document_id(
+        self, write_key, mock_db, mock_storage, mock_mq
+    ):
+        """The full #75 scenario: 1 original + 2 verbatim copies => ONE document_id.
+
+        Without content-hash dedup these three uploads (different filenames) would
+        produce three document_ids and flood top-k; with it they all collapse.
+        """
+        by_hash: dict[str, str] = {}
+        by_name: dict[str, str] = {}
+
+        async def _by_hash(workspace_id, content_hash):
+            return by_hash.get(content_hash)
+
+        async def _by_name(workspace_id, filename):
+            return by_name.get(filename)
+
+        async def _create(**kwargs):
+            by_hash.setdefault(kwargs["content_hash"], kwargs["document_id"])
+            by_name.setdefault(kwargs["original_filename"], kwargs["document_id"])
+
+        mock_db.get_document_id_by_content_hash = AsyncMock(side_effect=_by_hash)
+        mock_db.get_document_id_by_filename = AsyncMock(side_effect=_by_name)
+        mock_db.create_or_reset_pending_document = AsyncMock(side_effect=_create)
+
+        application = self._app(write_key, mock_db, mock_storage, mock_mq)
+        body = b"# API Authentication Guide\nidentical bytes across all copies"
+        names = ["guide.md", "guide-copy-1.md", "guide-copy-2.md"]
+        seen: set[str] = set()
+        with (
+            patch("src.api.v1.documents.get_storage_service", return_value=mock_storage),
+            patch(
+                "src.api.v1.documents.get_mq_service",
+                new_callable=AsyncMock,
+                return_value=mock_mq,
+            ),
+        ):
+            transport = ASGITransport(app=application)
+            async with AsyncClient(transport=transport, base_url="http://test") as ac:
+                for name in names:
+                    resp = await ac.post(
+                        "/v1/documents",
+                        files=_file_payload(content=body, filename=name),
+                        headers={"X-API-Key": "ink_test_key"},
+                    )
+                    assert resp.status_code == 201
+                    seen.add(resp.json()["document_id"])
+
+        assert seen == set(list(seen)[:1]), "all verbatim copies must reuse one document_id"
+        assert len(seen) == 1
         application.dependency_overrides.clear()
