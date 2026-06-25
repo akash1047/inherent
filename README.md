@@ -194,6 +194,43 @@ sample document, wait for ingestion, search indexed content, inspect logs, and
 reset your local stack. The [docs index](docs/README.md) is organized for
 agent-first discovery.
 
+## Run from published images (no build)
+
+If you just want to *use* Inherent rather than develop it, you don't need to
+clone the repo or build anything. The two custom services are published to the
+GitHub Container Registry and the rest of the stack pulls upstream OSS images.
+
+```bash
+# 1. Grab the release Compose file (the only file you need)
+curl -O https://raw.githubusercontent.com/inherent-prime/inherent/main/docker-compose.release.yml
+
+# 2. Start the whole stack from published images (pin a version if you like)
+INHERENT_VERSION=latest docker compose -f docker-compose.release.yml up -d
+
+# 3. Seed a local dev workspace + API key (one-time; needs no checkout —
+#    the script only talks to the running containers via `docker exec`)
+curl -O https://raw.githubusercontent.com/inherent-prime/inherent/main/scripts/dev/bootstrap.sh
+PG_CONTAINER=inherent-oss-postgres MONGO_CONTAINER=inherent-oss-mongodb \
+  bash bootstrap.sh
+```
+
+The stack initializes the database automatically: an init container runs the
+ingestion image in `SERVICE_MODE=migrate`, applying the SQL migrations baked
+into the image (idempotent and non-destructive — safe to restart). The same
+[Local Endpoints](#local-endpoints) and [Local Smoke Test](#local-smoke-test)
+below apply.
+
+Notes:
+
+- Images are public (`ghcr.io/inherent-prime/ingestion-svc` and
+  `…/public-api-svc`) — no registry login is needed to pull.
+- Override the source with `INHERENT_REGISTRY` / `INHERENT_VERSION` env vars.
+- The embedding service (`text-embeddings-inference`) is **amd64-only**; on
+  Apple Silicon / arm64 it runs under emulation (slower first start). Run the
+  full stack on an amd64 host for production-like performance.
+- The seeded `ink_dev_local_key_001` is a **dev convenience** — create your own
+  workspace and API keys before exposing the stack to anything real.
+
 ## Local Smoke Test
 
 After `make dev` succeeds, run these commands to verify the full document path

@@ -22,6 +22,11 @@ COPY services/inh-contracts /app/services/inh-contracts
 COPY services/inh-ingestion-svc/pyproject.toml services/inh-ingestion-svc/Readme.md /app/services/inh-ingestion-svc/
 COPY services/inh-ingestion-svc/src /app/services/inh-ingestion-svc/src
 
+# Bake the SQL migrations into the image so SERVICE_MODE=migrate can apply them
+# without a repo checkout. This is what lets docker-compose.release.yml init the
+# database from published images alone (no host bind-mount of ./scripts).
+COPY services/inh-ingestion-svc/scripts/migrations /app/services/inh-ingestion-svc/scripts/migrations
+
 WORKDIR /app/services/inh-ingestion-svc
 
 # Ensure Python resolves the src package from the service dir (the local

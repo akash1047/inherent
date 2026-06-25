@@ -28,6 +28,57 @@ The full set of gating suites, coverage floors, and the README-claim → test
 mapping is in the
 [release acceptance matrix](release_acceptance_matrix.md).
 
+## Publishing Images
+
+The two custom services are published to the GitHub Container Registry so users
+can run the stack without building:
+
+- `ghcr.io/inherent-prime/ingestion-svc`
+- `ghcr.io/inherent-prime/public-api-svc`
+
+The other eight services in the stack are upstream OSS images and are **not**
+republished — `docker-compose.release.yml` pulls them from their own public
+registries. Consumers run the stack with that file (see the README
+"Run from published images" section).
+
+### Image tags vs. service versions
+
+The published **image tag is a repository-level release version** taken from the
+pushed git tag (`vX.Y.Z`). It is intentionally decoupled from the per-service
+`pyproject.toml` versions, because one release publishes **both** images under a
+single coordinated tag and `docker-compose.release.yml` selects them with one
+`INHERENT_VERSION`. The service `pyproject.toml` versions remain independent
+package versions and do not have to match the release tag.
+
+### Approval gate (required, one-time setup)
+
+`.github/workflows/publish.yml` builds both images on a `v*` tag, then the push
+job is bound to the **`release-publish`** GitHub Environment. To make publishing
+require human sign-off, configure that environment once in
+**Settings → Environments → `release-publish` → Required reviewers** (add the
+maintainers who may approve a publish). Until reviewers are configured the push
+job runs without pausing.
+
+### Cutting an image release
+
+1. Complete the [Release Checklist](#release-checklist) above and merge the
+   release commit to `main`.
+2. Push a release-candidate tag, let CI build, then approve to publish:
+   ```bash
+   git tag vX.Y.Z-rc1 && git push origin vX.Y.Z-rc1   # candidate
+   ```
+   A `-rcN` tag publishes `:X.Y.Z-rcN` only — it never moves `:latest`.
+3. When the candidate is accepted, push the final tag:
+   ```bash
+   git tag vX.Y.Z && git push origin vX.Y.Z           # final
+   ```
+   A final (non-`rc`) tag publishes `:X.Y.Z`, `:X.Y`, and moves `:latest`.
+4. In both cases, the workflow pauses on the `release-publish` environment until
+   a reviewer approves the run in the **Actions** tab. Nothing is pushed to GHCR
+   without that approval.
+
+`make release-images` prints these steps.
+
 ## Documentation Rule
 
 Do not publish a release if the root README or service READMEs describe endpoints, ports, or workflows that the repository does not currently support.
