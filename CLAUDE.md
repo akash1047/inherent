@@ -1,6 +1,15 @@
 # CLAUDE.md
 
-Inherent — the ingestion, indexing, storage, and retrieval backend for a private RAG system ("company brain"). Sources are extracted, chunked, embedded, stored, and served over REST + MCP.
+Guidance for AI assistants (Claude Code and others) working in this repository.
+
+## What this is
+
+**Inherent** is the OSS core of a private RAG / "agent memory substrate" — the
+ingestion, indexing, storage, and retrieval layer for turning company knowledge
+into something AI agents can query. Sources are extracted, chunked, embedded,
+stored, and served over REST + MCP. The product boundary, guarantees, and
+non-goals are defined in [`docs/adr/0001-agent-memory-substrate.md`](docs/adr/0001-agent-memory-substrate.md);
+read it before proposing larger changes.
 
 ## Consult the knowledge graph first (saves tokens)
 
@@ -17,31 +26,181 @@ graphify path "SearchRequest" "WeaviateService"     # shortest path between two 
 - Fall back to direct file reads only when the graph lacks the detail (it indexes structure + concepts, not every line).
 - **The graph auto-refreshes after every `git pull`/merge** via a local post-merge hook (`make graphify-hooks` to install). The automatic pass is **AST-only** (deterministic parsing, no LLM) so it's safe to run on freshly-pulled content. Semantic re-extraction of doc/concept changes uses the Claude Code **agent** and is **opt-in only** — run `GRAPHIFY_ALLOW_AGENT_BYPASS=1 make graphify-refresh` on content you trust (it runs an agent with broad permissions; never enable it unattended on outside PRs). Default semantic model is **Haiku** via your Claude Code auth. Logs: `graphify-out/.refresh.log`.
 
-## Commands
+This is a **monorepo of three Python packages** under `services/`:
+
+| Package | Role |
+| --- | --- |
+| `inh-ingestion-svc` | Write/admin plane. Consumes upload events, runs Temporal ingestion workflows (fetch → extract → chunk → embed → store), owns writes to PostgreSQL and Weaviate. Also exposes an HTTP admin API. |
+| `inh-public-api-svc` | Read/query plane. Customer-facing REST API + MCP server over indexed content. Reads from PostgreSQL/Weaviate, enqueues upload events for ingestion. |
+| `inh-contracts` | Shared, versioned source of truth for cross-service event schemas (`events.py`) and Weaviate naming (`naming.py`). Both services depend on it. |
+
+Data flow: documents → ingestion (extract/chunk/embed/index) → PostgreSQL
+(metadata + chunks) and Weaviate (vectors) → public API (search/retrieve) →
+clients. See the architecture diagram in [`README.md`](README.md).
+
+Infra (via `docker-compose.yml`): postgres, mongodb, weaviate, valkey, s3rver,
+text-embeddings-inference (TEI), temporal.
+
+## Architecture notes that matter
+
+- **`inh-contracts` is the anti-drift boundary.** The two services MUST agree
+  byte-for-byte on Weaviate collection/tenant names and event schemas. If you
+  change naming or event shapes, change them in `inh-contracts` only — both
+  services import from there, and contract tests assert the golden behavior
+  (e.g. `ws_local_001 -> Workspace_wslocal001`, `user_001 -> User_user001`).
+  `events.CONTRACT_VERSION` pins the schema semver; keep older messages
+  validating (backward compat) when you bump it.
+- **Multi-tenancy:** workspaces map to Weaviate collections, users to tenants
+  within them. Search and context-window access must enforce `workspace_id`/
+  `user_id`; see the security regression tests in
+  `inh-public-api-svc/tests/security/`. See
+  [`docs/adr/0002-weaviate-multi-tenancy-scale.md`](docs/adr/0002-weaviate-multi-tenancy-scale.md).
+- **Control plane:** MongoDB holds workspace ownership (control-plane truth);
+  PostgreSQL `api_keys` holds API keys. The public API needs both records
+  before any upload/search works — `make bootstrap` creates them locally.
+- **Ingestion service modes** (`SERVICE_MODE`): `worker` (default in Compose —
+  Temporal worker + MQ + metrics + HTTP API when `INGESTION_API_KEY` set) and
+  `standalone` (HTTP API only). Legacy names (`pubsub`, `temporal_worker`, …)
+  map to `worker`.
+- **Public API service modes** (`SERVICE_MODE`): `api`, `mcp` (stdio), `both`
+  (Compose default).
+- **Ingestion is Temporal-orchestrated.** The pipeline lives in
+  `inh-ingestion-svc/src/temporal/` (`workflows/` define orchestration,
+  `activities/` do the work). Don't put long-running or retryable work outside
+  an activity.
+- **Migrations** live in `services/inh-ingestion-svc/scripts/migrations/`
+  (numbered SQL).
+
+## Local development
+
+Prerequisites: Docker + Docker Compose, Python 3.11+, and [`uv`](https://docs.astral.sh/uv/).
+
+The repository-root `Makefile` is the canonical entrypoint — run `make help`
+for the full list. Common targets:
 
 ```bash
-make setup          # env + install (first-time)
-make up             # start full docker-compose stack
-make check          # validate + lint + format-check + type-check + security-check + test
-make test           # unit tests
-make test-integration
-make health         # check running services
-make doctor         # diagnose environment
+make quickstart   # fresh checkout → working stack (env + install + up + bootstrap)
+make setup        # env + install (first-time)
+make dev          # start Compose in background + bootstrap dev workspace/key
+make up           # start full docker-compose stack
+make health       # check both API health endpoints
+make doctor       # diagnose environment
+make logs         # follow stack logs (SVC=name to scope)
+make down         # stop the stack
+make clean        # stop + remove volumes
+make graphify-hooks    # install post-merge hook for knowledge graph refresh
+make graphify-refresh  # refresh graphify-out/ now (AST-only; opt-in agent pass)
 ```
 
-## Architecture
+`make bootstrap` (run by `quickstart`/`dev`) is **local/dev only**, safe to
+re-run, and creates the dev workspace + API key `ink_dev_local_key_001` in both
+PostgreSQL and MongoDB.
 
-Three Python packages under `services/`:
+Local endpoints (host ports are offset, e.g. Postgres on `15432`): Public API
+`:18000` (docs at `/docs`), Ingestion API `:18002`, Temporal UI `:18233`,
+Weaviate `:18080`, S3/`s3rver` `:19000`, MongoDB `:27018`, Valkey `:16379`.
 
-- **`inh-ingestion-svc`** — ingestion pipeline: connectors → extract → chunk → embed → store. Uses **Temporal** workflows/activities (`src/temporal/`), Postgres, Weaviate (vector store, multi-tenant), S3-compatible object storage, and a message queue (Redis/Valkey).
-- **`inh-public-api-svc`** — public REST + MCP API: search, verify/citations, documents, chunks. API-key auth with permission + workspace-isolation gates, RFC 7807 problem details, rate limiting, audit logging.
-- **`inh-contracts`** — shared event schemas and the **Weaviate naming contract** (single source of truth for collection/tenant names across both services).
+`.env.example` is the canonical reference for every env var. Values tagged
+`# LOCAL-ONLY` are dev placeholders and must never be reused in production.
+Validate a local `.env` with `make validate`.
 
-Infra (via `docker-compose.yml`): postgres, mongodb, weaviate, valkey, s3rver, text-embeddings-inference (TEI), temporal.
+## Checks — always run before committing
 
-## Gotchas
+`make check` runs the full suite for **both** services. Individual stages:
 
-- **Weaviate naming is contract-governed** — collection/tenant names must come from `inh-contracts` naming helpers, used by both services. Don't hand-format them.
-- **`SERVICE_MODE`** env var (worker/standalone) is shared across both services; legacy aliases are mapped.
-- **Multi-tenancy is workspace-scoped** — search and context-window access must enforce `workspace_id`/`user_id`; see the security regression tests in `inh-public-api-svc/tests/security/`.
-- Migrations live in `services/inh-ingestion-svc/scripts/migrations/` (numbered SQL).
+```bash
+make lint            # ruff check src tests
+make format-check    # black --check src tests
+make type-check      # mypy (public API only — ingestion not yet enabled)
+make security-check  # bandit (public API only)
+make test            # pytest for both services
+```
+
+CI (`.github/workflows/ci.yml`) runs lint + format + typecheck + security +
+test per service with an overall coverage floor (currently 40% ingestion, 45%
+public API) plus per-core-module floors that ratchet up over time. The
+Compose-backed e2e gate runs separately in `integration.yml`.
+
+Tooling config (per service `pyproject.toml`): Ruff and Black both use
+**line-length 100**, target `py311`. Ruff selects `E,F,I,N,W` and ignores
+`E501`. mypy and Bandit adoption is gradual (some modules excluded) — don't
+expand strictness opportunistically without intent.
+
+### Test profiles and markers
+
+```bash
+make test-fast        # fast offline unit profile (not compose/slow/benchmark)
+make test             # default offline pytest (excludes compose)
+make test-integration # Compose e2e — requires a running stack
+make release-check    # offline release-acceptance suites (contract/security/eval/failure_injection)
+```
+
+`-m 'not compose'` is the default in both services' `addopts`; Compose tests
+are opt-in. Markers include `unit`, `integration`, `compose`, `slow`,
+`security`, `contract`, `benchmark`, and service-specific ones (`eval`,
+`failure_injection`, `retrieval_eval`). Full reference in
+[`docs/testing.md`](docs/testing.md).
+
+### Working in a single service
+
+Each service is a standalone `uv` project. From its directory:
+
+```bash
+cd services/inh-public-api-svc      # (or inh-ingestion-svc)
+uv sync --extra dev --group dev
+uv run ruff check src tests
+uv run black --check src tests
+uv run mypy src                     # public API only
+uv run pytest
+```
+
+Dev tool versions are **pinned and normalized across all services** — see
+[`docs/developer/dependencies.md`](docs/developer/dependencies.md). Don't bump a
+pin in one service without the others.
+
+## Service layout (mirrored in both services)
+
+```text
+src/
+  api/          FastAPI routes (public API: api/v1/*)
+  config/       Settings (pydantic-settings) and constants
+  core/         Shared exceptions / response helpers (public API)
+  middleware/   Auth, rate limiting, audit logging, security headers, errors
+  models/       Pydantic request/response models
+  services/     DB, search, embedder, storage, MQ, metrics, auth logic
+  temporal/     Workflows + activities (ingestion only)
+  mcp_server/   MCP server (public API only — note: NOT `mcp/`, to avoid
+                shadowing the `mcp` SDK package)
+  utils/        Logging, validators
+  main.py       Entrypoint; dispatches on SERVICE_MODE
+tests/          Mirrors src/; markers per pyproject
+```
+
+## Conventions
+
+- **Commits:** Conventional Commits with scopes, e.g. `fix(search): …`,
+  `feat: …`, `docs(examples): …`, `ci: …`, `chore(dx): …`, `test(contract): …`.
+  Reference issue numbers where relevant (`(#45)`).
+- **Branches:** descriptive prefixes like `fix/…`, `bug/…`, `milestone/…`.
+- **Pre-commit:** root `.pre-commit-config.yaml` runs file hygiene + per-service
+  Ruff/Black (and mypy/Bandit for public API) via `uv run`. Install once:
+  `uv --project services/inh-public-api-svc run pre-commit install`.
+- **Async throughout:** both services are async FastAPI; tests use
+  `asyncio_mode = "auto"`. New I/O code should be async.
+- **Logging:** `structlog` (structured). Don't `print`.
+- **Scope discipline (OSS boundary):** don't add internal tooling, secrets,
+  private operational workflows, or non-OSS product dependencies. See
+  [`docs/maintainers/repository-boundaries.md`](docs/maintainers/repository-boundaries.md)
+  and [`CONTRIBUTING.md`](CONTRIBUTING.md).
+- **Docs stay consistent:** when behavior, setup, or boundaries change, update
+  `README.md`, the relevant service `Readme.md`, and `docs/`. Update
+  `CHANGELOG.md` for user-visible changes.
+- `graphify-out/` is local/generated and gitignored — never commit it.
+
+## Where to look
+
+- API examples / curl / Postman: [`docs/examples/README.md`](docs/examples/README.md)
+- Getting started walkthrough: [`docs/getting-started/local.md`](docs/getting-started/local.md)
+- Architecture decisions: [`docs/adr/`](docs/adr/)
+- Testing reference: [`docs/testing.md`](docs/testing.md)
+- Docs index (agent-first): [`docs/README.md`](docs/README.md)
