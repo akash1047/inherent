@@ -3,6 +3,7 @@
 Service modes:
     worker     — Temporal worker + MQ subscriber (production default)
     standalone — HTTP API + Temporal worker (manual triggers, health checks)
+    migrate    — Apply pending SQL migrations, then exit (DB init container)
 
 Configure via SERVICE_MODE environment variable.
 """
@@ -12,6 +13,8 @@ from __future__ import annotations
 import asyncio
 import signal
 import sys
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _pkg_version
 
 import structlog
 
@@ -20,6 +23,13 @@ from src.services.mq import BaseMQService, create_mq_service
 from src.utils.logger import setup_logging
 
 logger = structlog.get_logger(__name__)
+
+try:
+    # Single source of truth: the installed package version (pyproject.toml),
+    # so the logged version can't drift from the published image tag.
+    __version__ = _pkg_version("inh-ingestion-svc")
+except PackageNotFoundError:  # not installed (e.g. running from a raw checkout)
+    __version__ = "0.0.0+local"
 
 # Global instances
 mq_service: BaseMQService | None = None
@@ -230,7 +240,7 @@ async def main() -> None:
 
     logger.info(
         "Starting ingestion service",
-        version="0.4.0",
+        version=__version__,
         mode=mode,
         mq_backend=settings.mq_backend,
     )
@@ -238,6 +248,14 @@ async def main() -> None:
     _shutdown_event = asyncio.Event()
 
     try:
+        if mode == "migrate":
+            # One-shot DB init container: apply migrations, then exit. Used by
+            # docker-compose.release.yml in place of the host-bind-mounted
+            # postgres-init step, so the stack is self-contained from images.
+            from src.services.migrations import run_migrations
+
+            run_migrations(settings)
+            return
         if mode == "standalone":
             await run_standalone(settings)
         else:

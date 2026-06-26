@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := help
 
-.PHONY: help setup quickstart env install validate up dev down restart ps logs health doctor bootstrap seed dev-seed check test test-fast test-integration release-check lint format-check type-check security-check clean
+.PHONY: help setup quickstart env install validate up dev down restart ps logs health doctor bootstrap seed dev-seed check test test-fast test-integration release-check release-images release-up release-down lint format-check type-check security-check clean
 
 COMPOSE              ?= docker compose
 PUBLIC_API_URL       ?= http://localhost:18000
@@ -153,6 +153,32 @@ release-check: check
 	@echo "==> ingestion failure-injection suite"
 	@cd $(INGESTION_DIR) && uv run pytest -m failure_injection
 	@echo "==> Offline release-acceptance suites passed. Confirm the Compose e2e gate (integration.yml) before tagging."
+
+RELEASE_COMPOSE      ?= docker-compose.release.yml
+INHERENT_VERSION     ?= latest
+
+## release-images: Print the steps to publish the service images to GHCR.
+##                 Publishing runs in CI (.github/workflows/publish.yml) and
+##                 requires human approval — this target documents the flow.
+release-images:
+	@echo "Images are published by .github/workflows/publish.yml. To cut a release:"
+	@echo "  1. Bump versions in services/*/pyproject.toml and update CHANGELOG.md."
+	@echo "  2. Push a release-candidate tag, then the final tag:"
+	@echo "       git tag v<X.Y.Z>-rc1 && git push origin v<X.Y.Z>-rc1   # candidate"
+	@echo "       git tag v<X.Y.Z>     && git push origin v<X.Y.Z>       # final"
+	@echo "  3. CI builds linux/amd64+arm64, then PAUSES for approval on the"
+	@echo "     'release-publish' Environment (Settings -> Environments ->"
+	@echo "     Required reviewers). Approve the run in the Actions tab to push:"
+	@echo "       ghcr.io/<owner>/ingestion-svc:<X.Y.Z>   (+ :latest on finals)"
+	@echo "       ghcr.io/<owner>/public-api-svc:<X.Y.Z>  (+ :latest on finals)"
+
+## release-up: Start the self-contained stack from PUBLISHED images (no build).
+release-up:
+	@INHERENT_VERSION=$(INHERENT_VERSION) $(COMPOSE) -f $(RELEASE_COMPOSE) up -d --wait
+
+## release-down: Stop the published-image stack and remove its volumes.
+release-down:
+	@$(COMPOSE) -f $(RELEASE_COMPOSE) down -v
 
 ## lint: Run Ruff checks for both services.
 lint:
