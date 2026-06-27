@@ -1,5 +1,6 @@
 """Documents endpoint."""
 
+import hashlib
 import uuid
 from datetime import datetime, timezone
 from typing import Annotated
@@ -70,11 +71,26 @@ async def upload_document(
         )
 
     filename = file.filename or "unnamed"
+    content_hash = hashlib.sha256(file_content).hexdigest()
 
-    # --- 3b. Dedup: reuse document_id for same (workspace, filename) ---------
-    # Re-uploading the same file name into the same workspace should reindex
-    # the existing document rather than flood the workspace with duplicates.
-    existing_document_id = await database.get_document_id_by_filename(workspace_id, filename)
+    # --- 3b. Dedup: reuse document_id rather than flood the workspace --------
+    # Two re-upload shapes must collapse onto an existing document_id so
+    # ingestion reindexes it instead of creating a duplicate document (with
+    # duplicate chunks + embeddings) that floods top-k search results (#75):
+    #   1. Same CONTENT under any filename — keyed on (workspace, content_hash).
+    #      Checked first so a verbatim copy uploaded as ``guide-copy.md``
+    #      collapses onto the original ``guide.md`` instead of multiplying it.
+    #   2. Same FILENAME with changed content — keyed on (workspace, filename).
+    #      Preserves the existing reindex-on-edit behaviour (#60) for a file
+    #      whose bytes changed but whose logical identity (name) is unchanged.
+    existing_document_id = await database.get_document_id_by_content_hash(
+        workspace_id, content_hash
+    )
+    dedup_reason = "content_hash" if existing_document_id else None
+    if not existing_document_id:
+        existing_document_id = await database.get_document_id_by_filename(workspace_id, filename)
+        dedup_reason = "filename" if existing_document_id else None
+
     if existing_document_id:
         document_id = existing_document_id
         logger.info(
@@ -82,6 +98,7 @@ async def upload_document(
             document_id=document_id,
             workspace_id=workspace_id,
             filename=filename,
+            dedup_reason=dedup_reason,
         )
     else:
         document_id = str(uuid.uuid4())
@@ -123,6 +140,7 @@ async def upload_document(
             storage_path=s3_key,
             storage_bucket=storage._bucket,
             storage_url=storage_url,
+            content_hash=content_hash,
         )
     except Exception as exc:
         logger.error(

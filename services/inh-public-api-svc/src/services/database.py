@@ -330,6 +330,38 @@ class DatabaseService:
             row = result.fetchone()
             return str(row.document_id) if row else None
 
+    async def get_document_id_by_content_hash(
+        self,
+        workspace_id: str,
+        content_hash: str,
+    ) -> str | None:
+        """Return an existing document_id for (workspace_id, content_hash).
+
+        Content-based dedup (#75): re-uploading the SAME content into a workspace
+        — even under a different filename — should reuse the existing document_id
+        so ingestion reindexes it rather than creating a duplicate document that
+        floods search results. This is checked BEFORE filename dedup so a verbatim
+        copy uploaded as ``guide-copy.md`` collapses onto the original ``guide.md``.
+
+        Returns the most recently created matching document_id, or None.
+        """
+        async with self.session() as session:
+            result = await session.execute(
+                text(
+                    """
+                    SELECT document_id
+                    FROM processed_documents
+                    WHERE workspace_id = :workspace_id
+                      AND content_hash = :content_hash
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """
+                ),
+                {"workspace_id": workspace_id, "content_hash": content_hash},
+            )
+            row = result.fetchone()
+            return str(row.document_id) if row else None
+
     async def create_or_reset_pending_document(
         self,
         *,
@@ -344,6 +376,7 @@ class DatabaseService:
         storage_path: str,
         storage_bucket: str | None = None,
         storage_url: str | None = None,
+        content_hash: str | None = None,
         metadata: dict | None = None,
     ) -> None:
         """Persist (or reset) a 'pending' row in processed_documents.
@@ -356,6 +389,10 @@ class DatabaseService:
         reset to a clean pending state: status='pending', error_message=NULL,
         chunk_count=0, and the latest file metadata is applied. tenant_id is
         left NULL here; the ingestion service backfills it.
+
+        ``content_hash`` is the document-level dedup key (#75). When None (e.g. a
+        refresh that re-publishes a stored row without re-reading bytes) the
+        existing stored hash is preserved via COALESCE rather than being wiped.
         """
         import json
 
@@ -367,12 +404,12 @@ class DatabaseService:
                         document_id, workspace_id, user_id,
                         filename, original_filename, content_type, size_bytes,
                         storage_backend, storage_path, storage_bucket, storage_url,
-                        status, error_message, chunk_count, metadata
+                        content_hash, status, error_message, chunk_count, metadata
                     ) VALUES (
                         :document_id, :workspace_id, :user_id,
                         :filename, :original_filename, :content_type, :size_bytes,
                         :storage_backend, :storage_path, :storage_bucket, :storage_url,
-                        'pending', NULL, 0, CAST(:metadata AS JSONB)
+                        :content_hash, 'pending', NULL, 0, CAST(:metadata AS JSONB)
                     )
                     ON CONFLICT (document_id) DO UPDATE SET
                         workspace_id = EXCLUDED.workspace_id,
@@ -385,6 +422,9 @@ class DatabaseService:
                         storage_path = EXCLUDED.storage_path,
                         storage_bucket = EXCLUDED.storage_bucket,
                         storage_url = EXCLUDED.storage_url,
+                        content_hash = COALESCE(
+                            EXCLUDED.content_hash, processed_documents.content_hash
+                        ),
                         status = 'pending',
                         error_message = NULL,
                         chunk_count = 0,
@@ -404,6 +444,7 @@ class DatabaseService:
                     "storage_path": storage_path,
                     "storage_bucket": storage_bucket,
                     "storage_url": storage_url,
+                    "content_hash": content_hash,
                     "metadata": json.dumps(metadata) if metadata is not None else None,
                 },
             )

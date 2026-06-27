@@ -82,3 +82,12 @@ and [ADR 0001](docs/adr/0001-agent-memory-substrate.md).
   returns empty results instead of an error; the retrieval regression guard was
   calibrated to the real fresh-stack baseline. Fixed the Integration (compose)
   CI workflow on `main`.
+- document upload dedup no longer floods search with re-uploaded duplicates
+  (#75). Dedup previously keyed only on `(workspace, filename)`, so re-uploading
+  identical content under a different name created a new `document_id` with
+  duplicate chunks/embeddings that monopolized top-k and pushed out distinct
+  documents. Upload now computes `sha256(file_bytes)` and reuses the existing
+  `document_id` on a content match (any filename) before falling back to
+  filename dedup — verbatim copies collapse onto one document. Adds migration
+  `010_document_content_hash.sql` (nullable `content_hash` column + lookup
+  index) plus unit coverage and a compose E2E content-flood regression test.
