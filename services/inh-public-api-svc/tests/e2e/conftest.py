@@ -44,6 +44,7 @@ def mock_db():
     mock.get_document_by_id = AsyncMock(return_value=None)
     mock.get_document_chunks_by_doc_id = AsyncMock(return_value=[])
     # Upload lifecycle writes (dedup + durable pending row + failure marking).
+    mock.get_document_id_by_content_hash = AsyncMock(return_value=None)
     mock.get_document_id_by_filename = AsyncMock(return_value=None)
     mock.create_or_reset_pending_document = AsyncMock(return_value=None)
     mock.mark_document_failed = AsyncMock(return_value=None)

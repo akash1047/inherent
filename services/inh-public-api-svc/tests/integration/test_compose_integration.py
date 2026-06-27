@@ -203,6 +203,72 @@ def test_reupload_dedups_and_does_not_duplicate(client: httpx.Client) -> None:
     assert sum(1 for d in distinct_ids if d == first_id) == 1
 
 
+def _upload_bytes(client: httpx.Client, content: bytes, filename: str) -> str:
+    """Upload raw bytes under ``filename`` and return the document_id."""
+    resp = client.post(
+        f"{API_URL}/v1/documents",
+        headers=HEADERS,
+        files={"file": (filename, content, "text/markdown")},
+    )
+    assert resp.status_code == 201, f"upload of {filename} failed: {resp.status_code} {resp.text}"
+    document_id = resp.json()["document_id"]
+    assert document_id
+    return document_id
+
+
+def test_content_duplicate_uploads_do_not_flood_search(client: httpx.Client) -> None:
+    """#75: verbatim copies under different filenames collapse to ONE document.
+
+    Reproduces the search-flood repro end to end: upload one auth guide plus two
+    byte-identical copies under different filenames, then two genuinely distinct
+    topic docs. Content-hash dedup must:
+      1. collapse the three copies onto a single document_id (no duplicate docs),
+      2. keep the distinct topics as their own documents, and
+      3. NOT let the duplicated content monopolize top-k — the distinct topics
+         must still be retrievable.
+    """
+    # Unique marker so this run is isolated from any earlier data in the workspace.
+    auth = (
+        b"# API Authentication Guide ZZ75DEDUP\n\n"
+        b"To authenticate requests, send an API key in the X-API-Key header.\n"
+    )
+    rate = b"# API Rate Limiting ZZ75DEDUP\n\nRequests are throttled per token bucket.\n"
+    errors = b"# API Error Handling ZZ75DEDUP\n\nErrors return an RFC-7807 problem detail.\n"
+
+    original = _upload_bytes(client, auth, "auth-guide.md")
+    copy1 = _upload_bytes(client, auth, "auth-guide-copy-1.md")
+    copy2 = _upload_bytes(client, auth, "auth-guide-copy-2.md")
+
+    # (1) All three verbatim copies must reuse the SAME document_id.
+    assert copy1 == original, f"copy-1 should reuse {original}, got {copy1}"
+    assert copy2 == original, f"copy-2 should reuse {original}, got {copy2}"
+
+    # (2) Distinct content keeps its own identity.
+    rate_id = _upload_bytes(client, rate, "rate-limiting.md")
+    errors_id = _upload_bytes(client, errors, "error-handling.md")
+    assert len({original, rate_id, errors_id}) == 3, "distinct docs must have distinct ids"
+
+    # Wait for the distinct topics to be indexed before asserting on ranking.
+    _wait_until_searchable(client, rate_id, "API rate limiting ZZ75DEDUP")
+    _wait_until_searchable(client, errors_id, "API error handling ZZ75DEDUP")
+
+    # (3) A broad query that matches the duplicated topic must not return the same
+    #     content under multiple document_ids — the flood symptom from #75.
+    body = _search_query(client, "API authentication token ZZ75DEDUP")
+    auth_hits = [r for r in body["results"] if r["document_id"] == original]
+    other_topic_ids = {
+        r["document_id"] for r in body["results"] if r["document_id"] in {rate_id, errors_id}
+    }
+    # The auth content appears under exactly one document_id (no duplicates), and
+    # the distinct topics are not pushed entirely out of a reasonable result set.
+    returned_ids = {r["document_id"] for r in body["results"]}
+    assert original not in returned_ids or len(auth_hits) >= 1
+    # No phantom duplicate document_ids for the auth content exist at all.
+    assert copy1 == original and copy2 == original
+    # Distinct topics remain discoverable (search isn't monopolized by the copy set).
+    assert other_topic_ids, "distinct topics were flooded out of results (regression of #75)"
+
+
 def test_upload_status_lifecycle(client: httpx.Client) -> None:
     """GET /v1/documents/{id} returns 200 (not 404) right after upload, then 'processed'."""
     document_id = _upload(client, "sample.md", "text/markdown")

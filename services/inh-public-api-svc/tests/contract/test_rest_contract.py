@@ -222,6 +222,7 @@ class TestDocumentUploadResponseShape:
         storage.build_storage_url = MagicMock(return_value="s3://b/ws-1/file.txt")
         storage._bucket = "b"
         db = AsyncMock()
+        db.get_document_id_by_content_hash = AsyncMock(return_value=None)
         db.get_document_id_by_filename = AsyncMock(return_value=None)
         db.create_or_reset_pending_document = AsyncMock(return_value=None)
         app.dependency_overrides[get_database] = lambda: db
