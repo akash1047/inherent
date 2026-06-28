@@ -6,9 +6,25 @@ Guidance for AI assistants (Claude Code and others) working in this repository.
 
 **Inherent** is the OSS core of a private RAG / "agent memory substrate" — the
 ingestion, indexing, storage, and retrieval layer for turning company knowledge
-into something AI agents can query. The product boundary, guarantees, and
+into something AI agents can query. Sources are extracted, chunked, embedded,
+stored, and served over REST + MCP. The product boundary, guarantees, and
 non-goals are defined in [`docs/adr/0001-agent-memory-substrate.md`](docs/adr/0001-agent-memory-substrate.md);
 read it before proposing larger changes.
+
+## Consult the knowledge graph first (saves tokens)
+
+A graphify knowledge graph of this repo lives in `graphify-out/` (gitignored). **Before grepping or reading files to answer a question about how the codebase works, query the graph** — it answers most "how/where/why" questions at ~45× fewer tokens than reading source.
+
+```bash
+graphify query "how does authentication work"      # BFS — broad context
+graphify query "how does search reach Weaviate" --dfs   # DFS — trace one path
+graphify explain "DatabaseService"                  # one node + its neighbors
+graphify path "SearchRequest" "WeaviateService"     # shortest path between two concepts
+```
+
+- Read `graphify-out/GRAPH_REPORT.md` for god nodes (core abstractions), community map, and surprising cross-file connections.
+- Fall back to direct file reads only when the graph lacks the detail (it indexes structure + concepts, not every line).
+- **The graph auto-refreshes after every `git pull`/merge** via a local post-merge hook (`make graphify-hooks` to install). The automatic pass is **AST-only** (deterministic parsing, no LLM) so it's safe to run on freshly-pulled content. Semantic re-extraction of doc/concept changes uses the Claude Code **agent** and is **opt-in only** — run `GRAPHIFY_ALLOW_AGENT_BYPASS=1 make graphify-refresh` on content you trust (it runs an agent with broad permissions; never enable it unattended on outside PRs). Default semantic model is **Haiku** via your Claude Code auth. Logs: `graphify-out/.refresh.log`.
 
 This is a **monorepo of three Python packages** under `services/`:
 
@@ -22,6 +38,9 @@ Data flow: documents → ingestion (extract/chunk/embed/index) → PostgreSQL
 (metadata + chunks) and Weaviate (vectors) → public API (search/retrieve) →
 clients. See the architecture diagram in [`README.md`](README.md).
 
+Infra (via `docker-compose.yml`): postgres, mongodb, weaviate, valkey, s3rver,
+text-embeddings-inference (TEI), temporal.
+
 ## Architecture notes that matter
 
 - **`inh-contracts` is the anti-drift boundary.** The two services MUST agree
@@ -32,7 +51,10 @@ clients. See the architecture diagram in [`README.md`](README.md).
   `events.CONTRACT_VERSION` pins the schema semver; keep older messages
   validating (backward compat) when you bump it.
 - **Multi-tenancy:** workspaces map to Weaviate collections, users to tenants
-  within them. See [`docs/adr/0002-weaviate-multi-tenancy-scale.md`](docs/adr/0002-weaviate-multi-tenancy-scale.md).
+  within them. Search and context-window access must enforce `workspace_id`/
+  `user_id`; see the security regression tests in
+  `inh-public-api-svc/tests/security/`. See
+  [`docs/adr/0002-weaviate-multi-tenancy-scale.md`](docs/adr/0002-weaviate-multi-tenancy-scale.md).
 - **Control plane:** MongoDB holds workspace ownership (control-plane truth);
   PostgreSQL `api_keys` holds API keys. The public API needs both records
   before any upload/search works — `make bootstrap` creates them locally.
@@ -46,6 +68,8 @@ clients. See the architecture diagram in [`README.md`](README.md).
   `inh-ingestion-svc/src/temporal/` (`workflows/` define orchestration,
   `activities/` do the work). Don't put long-running or retryable work outside
   an activity.
+- **Migrations** live in `services/inh-ingestion-svc/scripts/migrations/`
+  (numbered SQL).
 
 ## Local development
 
@@ -56,11 +80,16 @@ for the full list. Common targets:
 
 ```bash
 make quickstart   # fresh checkout → working stack (env + install + up + bootstrap)
+make setup        # env + install (first-time)
 make dev          # start Compose in background + bootstrap dev workspace/key
+make up           # start full docker-compose stack
 make health       # check both API health endpoints
+make doctor       # diagnose environment
 make logs         # follow stack logs (SVC=name to scope)
 make down         # stop the stack
 make clean        # stop + remove volumes
+make graphify-hooks    # install post-merge hook for knowledge graph refresh
+make graphify-refresh  # refresh graphify-out/ now (AST-only; opt-in agent pass)
 ```
 
 `make bootstrap` (run by `quickstart`/`dev`) is **local/dev only**, safe to

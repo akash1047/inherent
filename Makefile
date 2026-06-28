@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := help
 
-.PHONY: help setup quickstart env install validate up dev down restart ps logs health doctor bootstrap seed dev-seed check test test-fast test-integration release-check release-images release-up release-down lint format-check type-check security-check clean
+.PHONY: help setup quickstart env install validate up dev down restart ps logs health doctor bootstrap seed dev-seed check test test-fast test-integration release-check release-images release-up release-down lint format-check type-check security-check clean graphify-hooks graphify-refresh
 
 COMPOSE              ?= docker compose
 PUBLIC_API_URL       ?= http://localhost:18000
@@ -105,6 +105,17 @@ health:
 ## doctor: Check health of every local service and print triage hints on failure.
 doctor:
 	@bash scripts/dev/doctor.sh
+
+## graphify-hooks: Install the git post-merge hook that refreshes graphify-out/
+##                 after every pull/merge (auto AST-only; opt-in Haiku pass for docs).
+graphify-hooks:
+	@bash scripts/dev/install-graphify-hooks.sh
+
+## graphify-refresh: Refresh the knowledge graph now (foreground, free AST pass).
+##                   For semantic doc re-extraction (Claude Code agent on TRUSTED
+##                   content) prefix: GRAPHIFY_ALLOW_AGENT_BYPASS=1 make graphify-refresh
+graphify-refresh:
+	@GRAPHIFY_REFRESH_SYNC=1 bash scripts/dev/graphify-refresh.sh
 
 ## bootstrap: Create the local dev workspace + API key in BOTH stores
 ##            (PostgreSQL api_keys and MongoDB workspaces). Local/dev only.

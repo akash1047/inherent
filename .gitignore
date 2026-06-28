@@ -3,6 +3,8 @@
 !.env.example
 
 node_modules/
+.claude/
+.remember/
 .venv/
 venv/
 __pycache__/

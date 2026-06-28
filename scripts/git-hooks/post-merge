@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+#
+# post-merge — refresh the local graphify knowledge graph after a pull/merge
+# (e.g. after merging main). Non-blocking; cheap (AST for code, Haiku for docs).
+# Installed into .git/hooks by: make graphify-hooks
+set -euo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+REFRESH="$REPO_ROOT/scripts/dev/graphify-refresh.sh"
+
+[ -x "$REFRESH" ] || [ -f "$REFRESH" ] || exit 0
+bash "$REFRESH" "ORIG_HEAD..HEAD" || true
