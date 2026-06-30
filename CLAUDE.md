@@ -8,6 +8,7 @@ Guidance for working in this repository.
 
 
 ## Coding Standards
+
 - Always write tests first and then do the development later
 - A feature is only complete when all tests are passed and you can provide proof of complete.
 - All the code must have comments, which humans can understand easily with the context of this repo.
