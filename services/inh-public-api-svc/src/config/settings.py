@@ -89,6 +89,13 @@ class Settings(BaseSettings):
     rate_limit_enabled: bool = True
     rate_limit_window_seconds: int = 60
     rate_limit_default: int = Field(default=100, description="Default rate limit per minute")
+    rate_limit_unauthenticated: int = Field(
+        default=30,
+        description=(
+            "Per-client-IP limit for requests with no valid API key. Bounds "
+            "brute-force / DB-hammering when auth fails or is absent (#5)."
+        ),
+    )
 
     # S3 Storage
     aws_s3_endpoint: str = Field(
@@ -107,6 +114,10 @@ class Settings(BaseSettings):
     )
     mq_topic_document_uploaded: str = Field(
         default="core.document.uploaded.v1",
+        # Must match the ingestion consumer's MQ_UPLOAD_TOPIC (#15) — a separate
+        # env var name would let an operator override one side only and silently
+        # publish uploads to a stream nobody consumes.
+        alias="MQ_UPLOAD_TOPIC",
         description="MQ topic for document upload events",
     )
 
@@ -115,6 +126,12 @@ class Settings(BaseSettings):
         default=None,
         description="Redis URL for distributed rate limiting. Falls back to in-memory if not set.",
     )
+
+    # Trusted reverse proxies whose X-Forwarded-For / X-Real-IP headers may be
+    # believed when deriving the client IP for audit/rate-limiting (#16). Empty
+    # (default) = trust nobody; the direct peer IP is always used, so a client
+    # can't forge its audited IP. Set to your LB/ingress IPs in production.
+    trusted_proxies: list[str] = Field(default=[])
 
     # CORS Configuration
     cors_origins: list[str] = Field(
@@ -234,6 +251,18 @@ class Settings(BaseSettings):
         ]:
             return ["*"]
         return self.cors_origins
+
+    @property
+    def cors_allow_credentials_effective(self) -> bool:
+        """Never advertise credentials alongside a wildcard origin (#36).
+
+        allow_origins=["*"] with allow_credentials=True lets any site make
+        credentialed cross-origin calls (and is spec-invalid). When the origin
+        list is a wildcard, force credentials off regardless of config.
+        """
+        if "*" in self.cors_origins_list:
+            return False
+        return self.cors_allow_credentials
 
 
 @lru_cache

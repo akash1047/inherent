@@ -6,6 +6,7 @@ Multi-tenancy Design:
 - This enables efficient per-user data isolation within workspace-level organization
 """
 
+import asyncio
 import hashlib
 import uuid
 from datetime import UTC, datetime
@@ -467,11 +468,14 @@ class WeaviateService:
             # Use tenant-scoped operations
             tenant_collection = collection.with_tenant(tenant_name)
 
-            # Compute embeddings in one batch (much faster than per-chunk)
+            # Compute embeddings in one batch (much faster than per-chunk).
+            # embed_texts does blocking HTTP to the TEI sidecar, so offload it to
+            # a thread — otherwise it stalls the event loop (and every other
+            # coroutine) for the whole document's embedding round-trip (#19).
             from src.services.embedder import embed_texts
 
             chunk_texts = [c.content for c in chunks]
-            vectors = embed_texts(chunk_texts)
+            vectors = await asyncio.to_thread(embed_texts, chunk_texts)
 
             # Single ingest timestamp for this store call (#42): all chunks of a
             # document share one ingested_at so freshness is consistent per store.
@@ -520,7 +524,19 @@ class WeaviateService:
                         uuid=chunk_uuid,
                         vector=vector,
                     )
-                    stored_count += 1
+
+            # The v4 batch collects per-object errors in failed_objects instead
+            # of raising, so a partial failure would otherwise be reported as a
+            # full success -> Postgres/Weaviate divergence with no error (#8).
+            # Raise so the store activity retries / dead-letters (see #2).
+            failed = tenant_collection.batch.failed_objects
+            if failed:
+                first = getattr(failed[0], "message", failed[0])
+                raise RuntimeError(
+                    f"Weaviate batch store failed for {len(failed)}/{len(chunks)} "
+                    f"chunks in document {document_id}: {first}"
+                )
+            stored_count = len(chunks)
 
             logger.info(
                 "Stored chunks in Weaviate with multi-tenancy",

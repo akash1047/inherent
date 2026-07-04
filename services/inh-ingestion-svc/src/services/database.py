@@ -149,6 +149,21 @@ class DatabaseService:
             Index("idx_workspace_metadata_user_id", "user_id"),
         )
 
+        # Idempotency ledger for workspace stat increments (#7): each workflow
+        # run applies its deltas at most once. See migration 011.
+        self.workspace_stats_ledger = Table(
+            "workspace_stats_ledger",
+            self.metadata,
+            Column("workflow_run_id", String, primary_key=True),
+            Column("workspace_id", String, nullable=False),
+            Column(
+                "applied_at",
+                DateTime(timezone=True),
+                nullable=False,
+                default=lambda: datetime.now(UTC),
+            ),
+        )
+
         # Parent table: processed_documents
         self.processed_documents = Table(
             "processed_documents",
@@ -334,6 +349,14 @@ class DatabaseService:
             Index("idx_dead_letter_jobs_document_id", "document_id"),
             Index("idx_dead_letter_jobs_workspace_id", "workspace_id"),
             Index("idx_dead_letter_jobs_status", "status"),
+            # Dedup record-retries per run (#24). NULL workflow_run_id rows stay
+            # distinct in Postgres, so pre-workflow failures aren't deduped.
+            Index(
+                "ux_dead_letter_jobs_document_run",
+                "document_id",
+                "workflow_run_id",
+                unique=True,
+            ),
         )
 
     def connect(self) -> None:
@@ -663,6 +686,7 @@ class DatabaseService:
         document_delta: int = 0,
         chunk_delta: int = 0,
         size_delta: int = 0,
+        workflow_run_id: str | None = None,
     ) -> bool:
         """Update workspace statistics atomically.
 
@@ -671,14 +695,36 @@ class DatabaseService:
             document_delta: Change in document count
             chunk_delta: Change in chunk count
             size_delta: Change in total size bytes
+            workflow_run_id: When provided, the increment is applied at most once
+                per run (idempotency ledger, #7) so a Temporal retry or a
+                dead-letter reprocess of the same document cannot double-count.
 
         Returns:
-            True if updated
+            True if the increment was applied; False if it was skipped as a
+            duplicate for this ``workflow_run_id``.
         """
         if not self.engine:
             raise RuntimeError("Database not connected")
 
         with self.get_session() as session:
+            # Idempotency (#7): record the run in a ledger and only apply the
+            # increment the first time. The ledger insert and the UPDATE share
+            # one transaction, so they commit (or roll back) together.
+            if workflow_run_id is not None:
+                ledger = session.execute(
+                    text(
+                        """
+                        INSERT INTO workspace_stats_ledger (workflow_run_id, workspace_id)
+                        VALUES (:run_id, :workspace_id)
+                        ON CONFLICT (workflow_run_id) DO NOTHING
+                        """
+                    ),
+                    {"run_id": workflow_run_id, "workspace_id": workspace_id},
+                )
+                if ledger.rowcount == 0:
+                    # Already applied for this run — skip to avoid double counting.
+                    return False
+
             # Use raw SQL for atomic update with GREATEST to prevent negative values
             result = session.execute(
                 text(
@@ -882,6 +928,59 @@ class DatabaseService:
                     exc_info=True,
                 )
                 raise
+
+    async def create_pending_document(
+        self,
+        *,
+        document_id: str,
+        workspace_id: str,
+        user_id: str,
+        filename: str,
+        original_filename: str,
+        content_type: str,
+        size_bytes: int,
+        storage_backend: str,
+        storage_path: str,
+        storage_bucket: str | None = None,
+        storage_url: str | None = None,
+    ) -> bool:
+        """Create a minimal 'processing' processed_documents row up front (#10).
+
+        Without this, no row exists until the store step, so an early
+        'processing'/'failed' status write hits 0 rows and a document that fails
+        during fetch/extract/chunk is invisible ('not found') to the status API.
+        No-op if the row already exists (the store step upserts the full record).
+
+        Returns True if a row was created, False if one already existed.
+        """
+        if not self.engine:
+            raise RuntimeError("Database not connected")
+
+        with self.get_session() as session:
+            now = datetime.now(UTC)
+            stmt = (
+                pg_insert(self.processed_documents)
+                .values(
+                    document_id=document_id,
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    filename=filename,
+                    original_filename=original_filename,
+                    content_type=content_type,
+                    size_bytes=size_bytes,
+                    storage_backend=storage_backend,
+                    storage_path=storage_path,
+                    storage_bucket=storage_bucket,
+                    storage_url=storage_url,
+                    status=DocumentStatus.PROCESSING.value,
+                    chunk_count=0,
+                    created_at=now,
+                    updated_at=now,
+                )
+                .on_conflict_do_nothing(index_elements=["document_id"])
+            )
+            result = session.execute(stmt)
+            return bool(result.rowcount and result.rowcount > 0)
 
     async def update_document_status(
         self,
@@ -1240,8 +1339,13 @@ class DatabaseService:
 
         with self.get_session() as session:
             now = datetime.now(UTC)
+            # Upsert-do-nothing on (document_id, workflow_run_id): a record-retry
+            # (insert commits then loses its ack) must not create a duplicate
+            # dead-letter row, which the retry API could otherwise re-ingest twice
+            # (#24). NULL workflow_run_id rows are distinct in Postgres, so
+            # pre-workflow failures aren't deduped (correct — no run to key on).
             result = session.execute(
-                self.dead_letter_jobs.insert()
+                pg_insert(self.dead_letter_jobs)
                 .values(
                     document_id=document_id,
                     workspace_id=workspace_id,
@@ -1255,9 +1359,21 @@ class DatabaseService:
                     created_at=now,
                     updated_at=now,
                 )
+                .on_conflict_do_nothing(index_elements=["document_id", "workflow_run_id"])
                 .returning(self.dead_letter_jobs.c.id)
             )
-            job_id: int = result.scalar_one()  # type: ignore[assignment]
+            job_id = result.scalar_one_or_none()
+            if job_id is None:
+                # Row already existed for this run — return its id (idempotent).
+                job_id = session.execute(
+                    self.dead_letter_jobs.select()
+                    .with_only_columns(self.dead_letter_jobs.c.id)
+                    .where(
+                        self.dead_letter_jobs.c.document_id == document_id,
+                        self.dead_letter_jobs.c.workflow_run_id == workflow_run_id,
+                    )
+                    .limit(1)
+                ).scalar_one_or_none()
 
             logger.info(
                 "Added dead-letter job",

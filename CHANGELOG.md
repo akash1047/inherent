@@ -13,6 +13,41 @@ of the already-merged M0–M2 #62/#63/#64). See
 [docs/maintainers/org-readiness-requirements.md](docs/maintainers/org-readiness-requirements.md)
 and [ADR 0001](docs/adr/0001-agent-memory-substrate.md).
 
+### Defect-register remediation (in progress)
+
+A codescan-driven pass fixing correctness, isolation, and durability defects.
+
+- **⚠️ BREAKING (data) — collision-free Weaviate naming.** Workspace/user ids
+  are now base32-encoded into collection/tenant names instead of stripping
+  punctuation, which previously let ids differing only in punctuation
+  (`ws-123` / `ws_123` / `ws123`) collapse onto one tenant — a cross-tenant
+  leak (#1). Derivation is now injective. **Existing Weaviate collections use
+  the old names and must be re-indexed** (drop + re-ingest) to migrate; Postgres
+  is unaffected.
+- **Auth** — a workspace-scoped API key can no longer be used against a
+  different workspace via the `X-Workspace-Id` header, even one its owner also
+  owns; the key's binding is authoritative.
+- **Durable ingestion** — the `store_in_postgresql`, `store_in_weaviate`, and
+  `ensure_tenant_ready` Temporal activities now re-raise on failure so the
+  configured `RetryPolicy` actually fires (they previously swallowed errors
+  into a success return → no retry, instant dead-letter, and NULL-tenant docs).
+- **Poison messages** — a malformed upload event is now dead-lettered and
+  ACKed instead of re-raising into an infinite MQ redelivery loop; the worker
+  and api trigger are wired with `db_service` so dead-lettering is not a no-op.
+- **Rate limiting** — unauthenticated / invalid-key requests (and all traffic
+  during a transient auth-DB outage) are now bounded per client IP instead of
+  bypassing the limiter; a Redis backend (selected when `REDIS_URL` is set)
+  keeps limits correct across autoscaled instances, and the in-memory fallback
+  now warns that limits are per-process. New `RATE_LIMIT_UNAUTHENTICATED`.
+- **⚠️ BREAKING (deploy) — release Compose hardening.** `docker-compose.release.yml`
+  now **refuses to start** unless `POSTGRES_PASSWORD` and `INGESTION_API_KEY`
+  are set (no more shipped `postgres` / `dev-ingestion-key` defaults), and all
+  backing datastores (Postgres, Mongo, Weaviate, Valkey, S3) publish their
+  ports on `127.0.0.1` only. Set both variables (see `.env.example`) before
+  `docker compose up`. **Weaviate now runs with API-key auth** (anonymous access
+  off): set `WEAVIATE_API_KEY` too — both services authenticate to Weaviate with
+  it (Bearer token), and the ports stay loopback-bound as defense-in-depth.
+
 ### M0–M2 (merged: #62, #63, #64)
 - **Boundary** — agent-memory-substrate ADR + org-readiness plan (#46).
 - **Foundation** — one-command `make quickstart`; OSS bootstrap creating the

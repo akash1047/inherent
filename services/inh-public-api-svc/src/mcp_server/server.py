@@ -35,6 +35,7 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
 
+from src.config.constants import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE
 from src.models.api_key import APIKeyInfo
 from src.services.database import get_database
 from src.services.lineage import build_lineage
@@ -96,16 +97,9 @@ _SEARCH_INPUT_SCHEMA = {
             "description": "Hybrid fusion weight in [0,1] (1.0=vector-heavy, 0.0=keyword-heavy); only used when search_mode=hybrid",
             "default": 0.7,
         },
-        "include_context": {
-            "type": "boolean",
-            "description": "If true, include surrounding chunks for each result",
-            "default": False,
-        },
-        "context_window": {
-            "type": "integer",
-            "description": "Chunks before AND after each match when include_context=true (0-5, default 2)",
-            "default": 2,
-        },
+        # include_context / context_window were advertised but never honored by
+        # _run_search (a silent no-op). Use the dedicated get_document_context
+        # tool for surrounding chunks instead (#29).
     },
     "required": ["api_key", "query"],
 }
@@ -361,8 +355,20 @@ async def _run_search(
         for result in response.results:
             tagged.append((workspace_id, result))
 
-    tagged.sort(key=lambda pair: pair[1].score, reverse=True)
+    tagged.sort(key=_search_rank_key)
     return tagged[: request.limit], requested_workspace_id, None
+
+
+def _search_rank_key(pair: tuple[str, object]) -> tuple[float, str, str]:
+    """Stable sort key for merged multi-workspace results (#28).
+
+    Sort by score descending, then by (chunk_id, document_id) so equal-scored
+    results at the top-k cutoff order deterministically across identical
+    requests — matching the REST path. Workspaces are iterated in a set's
+    (nondeterministic) order, so score alone is not stable.
+    """
+    result = pair[1]
+    return (-result.score, result.chunk_id, result.document_id)  # type: ignore[attr-defined]
 
 
 async def _handle_search(key_info: APIKeyInfo, arguments: dict) -> list[TextContent]:
@@ -475,8 +481,17 @@ async def _handle_get_context(key_info: APIKeyInfo, arguments: dict) -> list[Tex
 
 async def _handle_list_documents(key_info: APIKeyInfo, arguments: dict) -> list[TextContent]:
     """Handle list_documents tool."""
-    page = arguments.get("page", 1)
-    page_size = arguments.get("page_size", 20)
+    # Clamp to the same bounds the REST route enforces (page>=1,
+    # 1<=page_size<=MAX_PAGE_SIZE) so an agent can't request a negative SQL
+    # OFFSET or dump the whole tenant in one call (#13).
+    try:
+        page = max(1, int(arguments.get("page", 1)))
+    except (TypeError, ValueError):
+        page = 1
+    try:
+        page_size = min(MAX_PAGE_SIZE, max(1, int(arguments.get("page_size", DEFAULT_PAGE_SIZE))))
+    except (TypeError, ValueError):
+        page_size = DEFAULT_PAGE_SIZE
     requested_workspace_id = arguments.get("workspace_id")
 
     # Get workspace IDs to list from

@@ -1,5 +1,6 @@
 """Search service for semantic search operations."""
 
+import asyncio
 import json
 import re
 import time
@@ -20,6 +21,17 @@ from src.services.database import DatabaseService, get_database
 from src.utils import get_logger
 
 logger = get_logger(__name__)
+
+
+def _require_safe_name(name: str, kind: str) -> None:
+    """Reject a collection/tenant name that isn't safe to interpolate into GraphQL.
+
+    An explicit raise (not ``assert``) so the guard survives ``python -O`` (#33).
+    Names are ``<Prefix>_<base32>`` — alphanumerics plus the prefix underscore.
+    """
+    if not name.replace("_", "").isalnum():
+        raise ValueError(f"Unsafe {kind} name: {name}")
+
 
 # Re-exported for backward compatibility (the WORKSPACE_COLLECTION_PREFIX
 # constant and the naming helpers now live in the shared contracts package).
@@ -131,17 +143,27 @@ class SearchService:
     invariants are enforced upstream; no redundant per-result filter is added.
     """
 
-    def __init__(self, database: DatabaseService, weaviate_url: str):
+    def __init__(
+        self,
+        database: DatabaseService,
+        weaviate_url: str,
+        weaviate_api_key: str | None = None,
+    ):
         self.database = database
         self.weaviate_url = weaviate_url.rstrip("/")
+        self._api_key = weaviate_api_key
         self._client: httpx.AsyncClient | None = None
 
     async def _get_client(self) -> httpx.AsyncClient:
         """Get HTTP client for Weaviate."""
         if self._client is None:
+            # Authenticate when Weaviate API-key auth is enabled (#3 follow-up);
+            # Weaviate accepts the key as a Bearer token.
+            headers = {"Authorization": f"Bearer {self._api_key}"} if self._api_key else None
             self._client = httpx.AsyncClient(
                 base_url=self.weaviate_url,
                 timeout=30.0,
+                headers=headers,
             )
         return self._client
 
@@ -332,13 +354,17 @@ class SearchService:
         """
         client = await self._get_client()
 
+        # Compute the query vector here (offloaded to a thread) if the caller
+        # didn't precompute it, so _build_graphql never does a blocking embed on
+        # the event loop (#19). embed_query_vector returns None for keyword mode.
+        if query_vector is None and request.search_mode != "keyword":
+            query_vector = await asyncio.to_thread(self.embed_query_vector, request)
+
         collection_name = _get_workspace_collection_name(workspace_id)
         tenant_name = _get_user_tenant_name(user_id)
 
-        assert collection_name.replace(
-            "_", ""
-        ).isalnum(), f"Unsafe collection name: {collection_name}"
-        assert tenant_name.replace("_", "").isalnum(), f"Unsafe tenant name: {tenant_name}"
+        _require_safe_name(collection_name, "collection")
+        _require_safe_name(tenant_name, "tenant")
 
         graphql_query = self._build_graphql(collection_name, tenant_name, request, query_vector)
 
@@ -540,7 +566,9 @@ class SearchService:
                     citation=citation,
                 )
             )
-        return results
+        # Truncate back to the requested page size after min_score filtering
+        # (the query may have over-fetched to avoid under-filling) (#31).
+        return results[: request.limit]
 
     def _build_graphql(
         self,
@@ -556,6 +584,11 @@ class SearchService:
         computed here for semantic/hybrid modes (#13).
         """
         escaped_query = request.query.replace("\\", "\\\\").replace('"', '\\"')
+        # Over-fetch when a min_score filter is active: Weaviate returns exactly
+        # `limit` rows, then min_score is applied client-side, so without this a
+        # page could come back short even when more above-threshold matches
+        # exist. Results are truncated back to request.limit after filtering (#31).
+        fetch_limit = min(100, request.limit * 3) if request.min_score > 0 else request.limit
         where_clause = ""
         if request.document_ids:
             where_filter: dict[str, Any] = {
@@ -572,12 +605,11 @@ class SearchService:
             # because Weaviate is configured without a text vectorizer module.
             # Reuse the caller's precomputed vector when provided (#13) so a
             # multi-workspace request embeds the query only once.
-            if query_vector is not None:
-                vector_list = query_vector
-            else:
-                from src.services.embedder import embed_query
-
-                vector_list = list(embed_query(request.query))
+            # _search_weaviate always precomputes the vector for semantic/hybrid
+            # (offloaded to a thread, #19), so it is present here. Guard defensively.
+            if query_vector is None:
+                raise ValueError("query_vector is required for semantic/hybrid search")
+            vector_list = query_vector
             vector_literal = "[" + ", ".join(f"{v:.6f}" for v in vector_list) + "]"
             if request.search_mode == "hybrid":
                 search_args = (
@@ -594,7 +626,7 @@ class SearchService:
                     {search_args}
                     tenant: "{tenant_name}"
                     {where_clause}
-                    limit: {request.limit}
+                    limit: {fetch_limit}
                 ) {{
                     document_id
                     original_filename
@@ -614,53 +646,6 @@ class SearchService:
         """
         return {"query": gql}
 
-    async def _fallback_search(
-        self,
-        workspace_id: str,
-        request: SearchRequest,
-    ) -> list[SearchResult]:
-        """Fallback to PostgreSQL full-text search when Weaviate is unavailable."""
-        logger.warning("Using PostgreSQL fallback for search", workspace_id=workspace_id)
-
-        async with self.database.session() as session:
-            from sqlalchemy import text
-
-            # Simple LIKE search as fallback
-            query = text(
-                """
-                SELECT c.id as chunk_id, c.document_id,
-                       d.original_filename as document_name,
-                       c.content, 1.0 as score
-                FROM document_chunks c
-                JOIN processed_documents d ON c.document_id = d.document_id
-                WHERE d.workspace_id = :workspace_id
-                  AND c.content ILIKE :search_pattern
-                ORDER BY c.chunk_index
-                LIMIT :limit
-            """
-            )
-
-            result = await session.execute(
-                query,
-                {
-                    "workspace_id": workspace_id,
-                    "search_pattern": f"%{request.query}%",
-                    "limit": request.limit,
-                },
-            )
-            rows = result.fetchall()
-
-            return [
-                SearchResult(
-                    chunk_id=str(row.chunk_id),
-                    document_id=str(row.document_id),
-                    document_name=row.document_name,
-                    content=row.content,
-                    score=row.score,
-                )
-                for row in rows
-            ]
-
     def _format_where(self, filter_dict: dict) -> str:
         """Format a where filter dict as Weaviate GraphQL syntax."""
         # Convert dict to JSON-like string but without quotes on keys
@@ -678,7 +663,11 @@ async def get_search_service() -> SearchService:
     global _search_service
     if _search_service is None:
         database = await get_database()
-        _search_service = SearchService(database, settings.effective_weaviate_url)
+        _search_service = SearchService(
+            database,
+            settings.effective_weaviate_url,
+            weaviate_api_key=settings.weaviate_api_key,
+        )
     return _search_service
 
 

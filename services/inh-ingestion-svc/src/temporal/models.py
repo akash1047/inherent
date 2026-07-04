@@ -177,9 +177,11 @@ class ChunkTextInput:
 
     workflow_run_id: str
     document_id: str
-    strategy: Literal["tokens", "sentences", "paragraphs"]
-    max_chunk_size: int
-    chunk_overlap: int
+    # Nullable overrides — the chunk_text activity resolves None from settings
+    # (config is resolved in the activity, not the workflow, #38).
+    strategy: Literal["tokens", "sentences", "paragraphs"] | None = None
+    max_chunk_size: int | None = None
+    chunk_overlap: int | None = None
     workspace_id: str | None = None
 
 
@@ -253,6 +255,28 @@ class UpdateStatsInput:
     size_delta: int
     workflow_run_id: str | None = None
     document_id: str | None = None
+
+
+@dataclass
+class CreatePendingDocumentInput:
+    """Input for the create_pending_document activity (#10).
+
+    Creates a minimal 'processing' processed_documents row at workflow start so
+    a failure during fetch/extract/chunk is observable via the status API
+    instead of returning 'not found'. The store step later upserts the full row.
+    """
+
+    document_id: str
+    workspace_id: str
+    user_id: str
+    filename: str
+    original_filename: str
+    content_type: str
+    size_bytes: int
+    storage_backend: str
+    storage_path: str
+    storage_bucket: str | None = None
+    storage_url: str | None = None
 
 
 # =============================================================================

@@ -1,7 +1,10 @@
 """Multi-backend storage service for fetching documents."""
 
+import ipaddress
+import socket
 from abc import ABC, abstractmethod
 from pathlib import Path
+from urllib.parse import urlparse
 
 import httpx
 import structlog
@@ -9,6 +12,50 @@ import structlog
 from src.config.settings import Settings
 
 logger = structlog.get_logger(__name__)
+
+_BLOCKED_HOSTNAMES = {"localhost", "metadata", "metadata.google.internal"}
+
+
+def _is_internal_ip(candidate: str) -> bool:
+    """True if ``candidate`` is a literal IP in a private/loopback/link-local/reserved range."""
+    try:
+        ip = ipaddress.ip_address(candidate)
+    except ValueError:
+        return False
+    return (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_reserved
+        or ip.is_multicast
+        or ip.is_unspecified
+    )
+
+
+def _validate_fetch_url(url: str) -> None:
+    """Reject URLs that could be an SSRF vector (#34).
+
+    Only http/https to a non-internal address is allowed; cloud-metadata,
+    loopback, and RFC1918 targets are blocked. Hostnames are resolved
+    best-effort and rejected if they map to an internal address.
+    """
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise PermissionError(f"URL scheme not allowed for fetch: {parsed.scheme!r}")
+
+    host = (parsed.hostname or "").strip("[]")
+    if not host or host.lower() in _BLOCKED_HOSTNAMES:
+        raise PermissionError(f"Blocked host for fetch: {host!r}")
+    if _is_internal_ip(host):
+        raise PermissionError(f"Blocked internal address for fetch: {host!r}")
+
+    # Best-effort DNS: reject a hostname that resolves to an internal address.
+    try:
+        for info in socket.getaddrinfo(host, None):
+            if _is_internal_ip(info[4][0]):
+                raise PermissionError(f"Host resolves to internal address: {host!r}")
+    except socket.gaierror:
+        pass  # let the HTTP client surface an unresolved-host error
 
 
 class BaseStorageBackend(ABC):
@@ -33,6 +80,14 @@ class BaseStorageBackend(ABC):
     def file_exists(self, path: str, bucket: str | None = None) -> bool:
         """Check if a file exists."""
         pass
+
+    def get_size(self, path: str, bucket: str | None = None) -> int:
+        """Return the file size in bytes.
+
+        Default reads the file; backends should override with a stat/HEAD that
+        avoids downloading the content (#22).
+        """
+        return len(self.read_file(path, bucket))
 
 
 class S3StorageBackend(BaseStorageBackend):
@@ -94,6 +149,16 @@ class S3StorageBackend(BaseStorageBackend):
         except Exception:
             return False
 
+    def get_size(self, path: str, bucket: str | None = None) -> int:
+        """Return object size via a HEAD request — no content download (#22)."""
+        if not self.client:
+            raise RuntimeError("S3 client not connected")
+        target_bucket = bucket or self.default_bucket
+        if not target_bucket:
+            raise RuntimeError("No S3 bucket configured")
+        resp = self.client.head_object(Bucket=target_bucket, Key=path)
+        return int(resp["ContentLength"])
+
 
 class LocalStorageBackend(BaseStorageBackend):
     """Local filesystem storage backend.
@@ -133,7 +198,12 @@ class LocalStorageBackend(BaseStorageBackend):
         else:
             resolved = (self._base_path / path).resolve()
 
-        if not str(resolved).startswith(str(self._base_path)):
+        # Use a real path-boundary check, not a string prefix: a prefix match
+        # lets a sibling directory that shares the base's name escape the base
+        # (base=/data/store, path=../store-secrets/x -> /data/store-secrets/x
+        # passes ``startswith('/data/store')``). ``is_relative_to`` compares path
+        # components, so only true descendants (and the base itself) are allowed (#11).
+        if resolved != self._base_path and not resolved.is_relative_to(self._base_path):
             raise PermissionError(f"Path traversal blocked: {path}")
 
         return resolved
@@ -160,6 +230,10 @@ class LocalStorageBackend(BaseStorageBackend):
             return self._resolve(path, bucket).is_file()
         except (PermissionError, ValueError):
             return False
+
+    def get_size(self, path: str, bucket: str | None = None) -> int:
+        """Return file size via stat — no content read (#22)."""
+        return self._resolve(path, bucket).stat().st_size
 
 
 class StorageService:
@@ -221,9 +295,12 @@ class StorageService:
         return storage_backend.read_file(path, bucket)
 
     def read_file_from_url(self, url: str) -> bytes:
-        """Read a file directly from a URL."""
+        """Read a file directly from a URL (validated against SSRF, #34)."""
+        _validate_fetch_url(url)
         logger.info("Fetching file from URL", url=url)
-        with httpx.Client(timeout=60.0, follow_redirects=True) as client:
+        # follow_redirects=False: a redirect could point at an internal host that
+        # bypasses the pre-fetch validation.
+        with httpx.Client(timeout=60.0, follow_redirects=False) as client:
             response = client.get(url)
             response.raise_for_status()
             return response.content

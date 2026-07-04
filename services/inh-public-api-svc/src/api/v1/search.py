@@ -77,10 +77,7 @@ def _record_search_metrics(request: SearchRequest, workspace_id: str | None) -> 
     try:
         from src.services.metrics import record_search_context_request, record_search_request
 
-        record_search_request(
-            mode=request.search_mode,
-            workspace_id=workspace_id if workspace_id else "multi",
-        )
+        record_search_request(mode=request.search_mode)
         if request.include_context:
             record_search_context_request(k=request.context_window)
     except Exception as exc:
@@ -181,8 +178,9 @@ async def _search_workspaces_concurrently(
     time in milliseconds (measured around the gather, NOT a sum of per-workspace
     times).
     """
-    # Embed once, reuse across all workspaces (#13).
-    query_vector = search_service.embed_query_vector(request)
+    # Embed once, reuse across all workspaces (#13). Offload the blocking TEI
+    # call to a thread so it doesn't stall the event loop (#19).
+    query_vector = await asyncio.to_thread(search_service.embed_query_vector, request)
 
     semaphore = asyncio.Semaphore(settings.search_max_workspace_concurrency)
 
@@ -415,7 +413,11 @@ async def search_documents(
     # same authorised fan-out so a fallback can never widen the workspace scope.
     await _apply_quality_gate_and_fallback(response, request, _retrieve_multi)
 
-    # PM-S019: for multi-workspace, use primary workspace when unambiguous
+    # PM-S019: context expansion needs a single workspace scope. For a
+    # multi-workspace search (len != 1) we deliberately skip it — expanding a
+    # match with a workspace that isn't its own risks a cross-tenant neighbour
+    # read (#30). So include_context is honored only for single-workspace users;
+    # for multi-workspace users it is a documented no-op (empty ctx_ws below).
     ctx_ws = user_workspaces[0] if len(user_workspaces) == 1 else ""
     await _expand_context_and_total_tokens(response, request, ctx_ws, auth.key_info.user_id)
     _record_search_metrics(request, None)

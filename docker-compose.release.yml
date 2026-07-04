@@ -19,10 +19,14 @@ services:
     container_name: inherent-oss-postgres
     restart: unless-stopped
     ports:
-      - "15432:5432"
+      # Loopback-only: the datastore is reached over the compose network by the
+      # services; publishing on all interfaces would expose it to the host's
+      # network. Override the bind address explicitly if you need remote access.
+      - "127.0.0.1:15432:5432"
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      # Fail-fast: refuse to boot with a default password (#3). Set POSTGRES_PASSWORD.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set — refusing to start with a default password}
       POSTGRES_DB: ${POSTGRES_DB:-knowledge_base}
     volumes:
       - postgres_data:/var/lib/postgresql/data
@@ -45,9 +49,10 @@ services:
         condition: service_healthy
     environment:
       SERVICE_MODE: migrate
-      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-knowledge_base}
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-knowledge_base}
       # Required by the shared Settings model; migrate mode never connects to it.
       WEAVIATE_URL: http://weaviate:8080
+      WEAVIATE_API_KEY: ${WEAVIATE_API_KEY:?WEAVIATE_API_KEY must be set}
       LOG_LEVEL: INFO
     networks:
       - inherent-oss
@@ -58,7 +63,8 @@ services:
     container_name: inherent-oss-mongodb
     restart: unless-stopped
     ports:
-      - "27018:27017"
+      # Loopback-only (#3): reached over the compose network by the services.
+      - "127.0.0.1:27018:27017"
     volumes:
       - mongodb_data:/data/db
     healthcheck:
@@ -74,11 +80,20 @@ services:
     container_name: inherent-oss-weaviate
     restart: unless-stopped
     ports:
-      - "18080:8080"
-      - "15051:50051"
+      # Loopback-only (#3) as defense-in-depth alongside API-key auth below.
+      - "127.0.0.1:18080:8080"
+      - "127.0.0.1:15051:50051"
     environment:
       QUERY_DEFAULTS_LIMIT: 25
-      AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: "true"
+      # API-key auth (#3): the vector store holding every tenant's chunks is no
+      # longer anonymous. Both services authenticate with WEAVIATE_API_KEY
+      # (Bearer token). Fail-fast if it's unset.
+      AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: "false"
+      AUTHENTICATION_APIKEY_ENABLED: "true"
+      AUTHENTICATION_APIKEY_ALLOWED_KEYS: ${WEAVIATE_API_KEY:?WEAVIATE_API_KEY must be set}
+      AUTHENTICATION_APIKEY_USERS: inherent@local
+      AUTHORIZATION_ADMINLIST_ENABLED: "true"
+      AUTHORIZATION_ADMINLIST_USERS: inherent@local
       PERSISTENCE_DATA_PATH: /var/lib/weaviate
       DEFAULT_VECTORIZER_MODULE: none
       ENABLE_MODULES: ""
@@ -98,7 +113,8 @@ services:
     container_name: inherent-oss-valkey
     restart: unless-stopped
     ports:
-      - "16379:6379"
+      # Loopback-only (#3): reached over the compose network by the services.
+      - "127.0.0.1:16379:6379"
     command: valkey-server --appendonly yes --maxmemory 128mb --maxmemory-policy allkeys-lru
     volumes:
       - valkey_data:/data
@@ -115,7 +131,8 @@ services:
     container_name: inherent-oss-s3rver
     restart: unless-stopped
     ports:
-      - "19000:9000"
+      # Loopback-only (#3): reached over the compose network by the services.
+      - "127.0.0.1:19000:9000"
     command: npx s3rver -d /data -a 0.0.0.0 -p 9000 --no-vhost-buckets --configure-bucket inherent-documents
     volumes:
       - s3_data:/data
@@ -163,7 +180,7 @@ services:
       DB: postgres12
       DB_PORT: 5432
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
-      POSTGRES_PWD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_PWD: ${POSTGRES_PASSWORD}
       POSTGRES_SEEDS: postgres
       DEFAULT_NAMESPACE: default
     depends_on:
@@ -199,8 +216,9 @@ services:
       - "18002:8000"
       - "19090:9090"
     environment:
-      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-knowledge_base}
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-knowledge_base}
       WEAVIATE_URL: http://weaviate:8080
+      WEAVIATE_API_KEY: ${WEAVIATE_API_KEY:?WEAVIATE_API_KEY must be set}
       MQ_BACKEND: redis
       REDIS_URL: redis://valkey:6379
       STORAGE_BACKEND: s3
@@ -214,7 +232,8 @@ services:
       TEMPORAL_HOST: temporal:7233
       TEMPORAL_NAMESPACE: default
       TEMPORAL_TASK_QUEUE: document-ingestion
-      INGESTION_API_KEY: ${INGESTION_API_KEY:-dev-ingestion-key}
+      # Fail-fast: refuse to boot with the previously-shipped known dev key (#3).
+      INGESTION_API_KEY: ${INGESTION_API_KEY:?INGESTION_API_KEY must be set — refusing to start with a default key}
       API_HOST: 0.0.0.0
       API_PORT: 8000
       EMBEDDING_ENABLED: "true"
@@ -258,10 +277,11 @@ services:
       PORT: 8080
       MCP_PORT: 8001
       ENVIRONMENT: development
-      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-knowledge_base}
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-knowledge_base}
       MONGODB_URI: mongodb://mongodb:27017/main
       MONGODB_DB_NAME: main
       WEAVIATE_URL: http://weaviate:8080
+      WEAVIATE_API_KEY: ${WEAVIATE_API_KEY:?WEAVIATE_API_KEY must be set}
       MQ_REDIS_URL: redis://valkey:6379
       REDIS_URL: redis://valkey:6379
       AWS_S3_ENDPOINT: http://s3rver:9000
