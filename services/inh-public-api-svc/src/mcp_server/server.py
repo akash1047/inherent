@@ -14,6 +14,7 @@ REST 403 path. Permission map:
     verify_claim                        -> "read"
     explain_lineage                     -> "read"
     refresh_stale_source                -> "write"
+    report_feedback / get_retrieval_health -> "search"
     delete_document                     -> "write"
 
 Search-feature parity (#14)
@@ -38,7 +39,10 @@ from mcp.types import TextContent, Tool
 
 from src.config.constants import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE
 from src.models.api_key import APIKeyInfo
+from src.models.evals import FeedbackRequest
 from src.services.database import get_database
+from src.services.eval_feedback import EventNotFoundError, submit_feedback
+from src.services.eval_scorecard import build_scorecard
 from src.services.lineage import build_lineage
 from src.services.search import (
     SearchService,
@@ -60,6 +64,8 @@ _TOOL_PERMISSIONS: dict[str, str] = {
     "verify_claim": "read",
     "explain_lineage": "read",
     "refresh_stale_source": "write",
+    "report_feedback": "search",
+    "get_retrieval_health": "search",
     "delete_document": "write",
 }
 
@@ -104,6 +110,41 @@ _SEARCH_INPUT_SCHEMA = {
         # tool for surrounding chunks instead (#29).
     },
     "required": ["api_key", "query"],
+}
+
+# Schema for report_feedback (evals v1): an agent's verdict on one captured
+# search event (see src/models/evals.py FeedbackRequest).
+_FEEDBACK_INPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "api_key": {"type": "string", "description": "Your Inherent API key"},
+        "event_id": {
+            "type": "string",
+            "description": "The event_id returned on the search response you are judging",
+        },
+        "verdict": {
+            "type": "string",
+            "enum": ["answered", "partial", "not_relevant"],
+            "description": "Did the returned evidence answer the query?",
+        },
+        "useful_chunk_ids": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "chunk_ids from the results that actually answered it",
+        },
+        "note": {"type": "string", "description": "Optional short explanation"},
+    },
+    "required": ["api_key", "event_id", "verdict"],
+}
+
+# Schema for get_retrieval_health (evals v1): the workspace scorecard.
+_HEALTH_INPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "api_key": {"type": "string", "description": "Your Inherent API key"},
+        "workspace_id": {"type": "string", "description": "Workspace to report on"},
+    },
+    "required": ["api_key", "workspace_id"],
 }
 
 
@@ -239,6 +280,22 @@ def create_mcp_server() -> Server:
                 },
             ),
             Tool(
+                name="report_feedback",
+                description="ALWAYS call this after using search results: report whether the "
+                "returned evidence answered your query. Your feedback builds this workspace's "
+                "retrieval eval set and improves future quality measurement. Pass the "
+                "event_id from the search response. Requires 'search' permission.",
+                inputSchema=_FEEDBACK_INPUT_SCHEMA,
+            ),
+            Tool(
+                name="get_retrieval_health",
+                description="Get the retrieval-quality scorecard for a workspace: answer rate, "
+                "verdict distribution, corpus gaps, labeled-case count, and last eval run. Use "
+                "it to calibrate how much to trust search results from this corpus. Requires "
+                "'search' permission.",
+                inputSchema=_HEALTH_INPUT_SCHEMA,
+            ),
+            Tool(
                 name="delete_document",
                 description="Memory primitive: permanently delete a document and all of its "
                 "derived data — vectors, chunks, and stored bytes (same logic as DELETE "
@@ -300,6 +357,10 @@ def create_mcp_server() -> Server:
                 return await _handle_explain_lineage(key_info, arguments)
             elif name == "refresh_stale_source":
                 return await _handle_refresh_stale_source(key_info, arguments)
+            elif name == "report_feedback":
+                return await _handle_report_feedback(key_info, arguments)
+            elif name == "get_retrieval_health":
+                return await _handle_get_retrieval_health(key_info, arguments)
             elif name == "delete_document":
                 return await _handle_delete_document(key_info, arguments)
             else:  # pragma: no cover - guarded by _TOOL_PERMISSIONS above
@@ -698,6 +759,47 @@ async def _handle_refresh_stale_source(key_info: APIKeyInfo, arguments: dict) ->
         f"Document '{document.name}' ({document_id}) queued for re-ingestion (refresh).",
         payload,
     )
+
+
+async def _handle_report_feedback(key_info: APIKeyInfo, arguments: dict) -> list[TextContent]:
+    """Record agent feedback on a captured search event (evals v1).
+
+    Delegates to the shared ``submit_feedback`` service (same promotion rules
+    REST uses at POST /v1/evals/feedback) so the two surfaces never drift.
+    """
+    database = await get_database()
+    workspace_ids = await database.get_user_workspace_ids(key_info.user_id)
+    req = FeedbackRequest(
+        event_id=arguments["event_id"],
+        verdict=arguments["verdict"],
+        useful_chunk_ids=arguments.get("useful_chunk_ids"),
+        note=arguments.get("note"),
+    )
+    try:
+        result = await submit_feedback(database, workspace_ids=workspace_ids, req=req)
+    except EventNotFoundError:
+        return [
+            TextContent(
+                type="text",
+                text=f"Error: unknown or expired event_id '{req.event_id}'",
+            )
+        ]
+    return [TextContent(type="text", text=result.model_dump_json())]
+
+
+async def _handle_get_retrieval_health(key_info: APIKeyInfo, arguments: dict) -> list[TextContent]:
+    """Return the workspace scorecard so agents can calibrate trust (evals v1).
+
+    Enforces the same workspace-ownership check every other tool uses before
+    handing the workspace_id to ``build_scorecard``.
+    """
+    database = await get_database()
+    workspace_ids = await database.get_user_workspace_ids(key_info.user_id)
+    workspace_id = arguments["workspace_id"]
+    if workspace_id not in workspace_ids:
+        return [TextContent(type="text", text="Error: workspace not accessible with this key")]
+    scorecard = await build_scorecard(database, workspace_id=workspace_id)
+    return [TextContent(type="text", text=scorecard.model_dump_json())]
 
 
 async def _handle_delete_document(key_info: APIKeyInfo, arguments: dict) -> list[TextContent]:
