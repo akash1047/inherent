@@ -1,10 +1,18 @@
 # Changelog
 
 All notable changes to Inherent are documented here. The format follows
-[Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project has not
-yet cut a tagged release, so everything sits under **Unreleased**.
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased] — Org-readiness program
+## [Unreleased]
+
+Nothing yet.
+
+## [0.1.0] — 2026-07-09 — Org-readiness program
+
+The first tagged release. Repository-level release tag; per-service package
+versions (independent, see [releasing.md](docs/maintainers/releasing.md))
+moved to `inh-contracts` 2.0.0, `inh-ingestion-svc` 0.5.0, and
+`inh-public-api-svc` 0.2.0 alongside this tag.
 
 A milestone-by-milestone push to make Inherent a self-hostable, permission-aware
 agent **memory substrate** an organization can run on day one. Delivered as a
