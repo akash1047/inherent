@@ -15,6 +15,25 @@ and [ADR 0001](docs/adr/0001-agent-memory-substrate.md).
 
 ### Added
 
+- **Evals v1 — traffic-mined retrieval evals (#91).** Operators can now get a
+  defensible retrieval-quality number for their own corpus without authoring a
+  golden set. Search responses carry an `event_id`; consuming agents (or the
+  new `docs/examples/eval_trial.py` trial-labeling script) report a verdict via
+  `POST /v1/evals/feedback` (MCP: `report_feedback`), and positive feedback
+  auto-promotes the query into a labeled eval case. `POST /v1/evals/runs`
+  replays the active cases as a keyword-vs-semantic-vs-hybrid mode comparison
+  scored with dependency-free recall@k / MRR / nDCG; `GET /v1/evals/scorecard`
+  (MCP: `get_retrieval_health`) gives the day-one summary (answer rate, corpus
+  gaps, labeled-case count). Rounds out with `GET /v1/evals/cases`,
+  `PATCH /v1/evals/cases/{id}`, `GET /v1/evals/runs/{id}`, and
+  `DELETE /v1/evals/events`. Capture is on by default (write-behind, never
+  blocks or fails a search), per-tenant opt-out via
+  `EVAL_CAPTURE_DISABLED_WORKSPACES`, raw events purge after
+  `EVAL_RETENTION_DAYS` (default 30) or on demand. Adds migration `015_evals.sql`.
+  Design boundary — retrieval-layer evals only, no answer/task grading, no LLM
+  judge, no second service — is recorded in
+  [ADR 0003](docs/adr/0003-traffic-mined-retrieval-evals.md); quickstart in
+  [docs/getting-started/local.md](docs/getting-started/local.md#6-judge-retrieval-quality-evals).
 - **Document delete — REST + MCP (#87 P1).** An agent can finally retract
   knowledge: `DELETE /v1/documents/{id}` and the MCP `delete_document` tool
   remove a document's Weaviate objects (tenant-scoped), its PostgreSQL row +
