@@ -77,6 +77,8 @@ CI e2e does **not** use local state; see [CI e2e](#ci-e2e) below.
 
 1. Terraform registers your SSH key with Hetzner.
 2. Terraform creates a firewall allowing SSH (22), Public API (18000), and ICMP.
+   This firewall is the only network barrier for Docker-published ports;
+   set `ssh_allowed_ips` / `api_allowed_ips` to restrict access in production.
 3. Terraform provisions a server with cloud-init user data.
 4. Cloud-init installs Docker, creates `/opt/inherent`, downloads the release
    compose file, writes `.env`, and starts all containers.
@@ -117,8 +119,11 @@ INGESTION_API_KEY=strong-api-key
 EOF
 ```
 
-The `env_file_content` variable is marked `sensitive` and will not appear in
-logs or state output. If omitted, safe development defaults are used.
+`env_file_content` is `sensitive = true`: Terraform CLI redacts it from plan/apply
+terminal output only. Secrets still land in Terraform state (restrict Object
+Storage) and in cloud-init `user_data` / instance metadata (`169.254.169.254`).
+Containers on the VM can read metadata — known limitation. If omitted, safe
+development defaults are used.
 
 ## Clean up
 
@@ -152,9 +157,12 @@ Workflow: [`.github/workflows/hetzner-e2e.yml`](../.github/workflows/hetzner-e2e
 
 ### GitHub Actions configuration
 
+Use a **dedicated Hetzner Cloud project** for the CI `HCLOUD_TOKEN` so e2e
+blast radius cannot touch production servers or SSH keys.
+
 | Kind | Name | Notes |
 |------|------|-------|
-| Secret | `HCLOUD_TOKEN` | Hetzner Cloud API token |
+| Secret | `HCLOUD_TOKEN` | Hetzner Cloud API token (CI project only) |
 | Secret | `AWS_ACCESS_KEY_ID` | Hetzner Object Storage S3 access key |
 | Secret | `AWS_SECRET_ACCESS_KEY` | Hetzner Object Storage S3 secret key |
 | Variable | `HETZNER_S3_BUCKET` | Object Storage bucket name |
@@ -174,7 +182,8 @@ Workflow: [`.github/workflows/hetzner-e2e.yml`](../.github/workflows/hetzner-e2e
   image, compose, and test checkout. See
   [docs/maintainers/releasing.md](../docs/maintainers/releasing.md#cutting-an-image-release).
 - **State:** Hetzner Object Storage key `inherent/ci/<github.run_id>/terraform.tfstate` via workflow-generated `backend-ci.hcl`. Never the prod key.
-- **Flow:** generate `backend-ci.hcl` → `terraform init -reconfigure -backend-config=backend-ci.hcl` → apply → wait `/health` → bootstrap on VM → public-api `pytest -m compose` → always destroy (same remote state).
+- **Server type:** CI defaults to **cpx32** (compose e2e headroom for TEI + stack). Local/prod examples may use `cpx22`.
+- **Flow:** generate `backend-ci.hcl` → `terraform init -reconfigure -backend-config=backend-ci.hcl` → apply (`environment=ci`) → cloud-init wait → `/health` → bootstrap on VM → public-api `pytest -m compose` → always destroy with retries (same remote state).
 - **Naming:** unique `server_name` / `ssh_key_name` per run (`inherent-ci-${{ github.run_id }}`).
 - **Image parity:** default env sets `WEAVIATE_API_KEY`, and release compose enables Weaviate API-key auth. The **published** `public-api-svc` image must include Weaviate Bearer client support (see [docs/audit/act-hetzner-e2e-weaviate-401.md](../docs/audit/act-hetzner-e2e-weaviate-401.md)). `/health` alone does not prove Weaviate auth works. Smoke-grep image before long e2e runs ([docs/maintainers/releasing.md](../docs/maintainers/releasing.md)).
 - **Long-lived deploys:** use Hetzner Object Storage via `backend.hcl` (see Setup above and [docs/getting-started/production.md](../docs/getting-started/production.md)).
@@ -183,11 +192,14 @@ Workflow: [`.github/workflows/hetzner-e2e.yml`](../.github/workflows/hetzner-e2e
 
 Workflow: [`.github/workflows/hetzner-e2e-recover.yml`](../.github/workflows/hetzner-e2e-recover.yml).
 
+This is the **orphan path** when primary destroy fails or the job dies after
+state was written — there is no separate age-sweep job.
+
 - **When:** e2e job died after Terraform wrote remote state (e.g. runner killed mid-run) and destroy did not run.
 - **Input:** `run_id` — the failed workflow run id (state key `inherent/ci/<run_id>/terraform.tfstate`).
-- Re-inits with that CI key and runs `terraform destroy`.
+- Re-inits with that CI key and runs `terraform destroy` (with retries).
 - Prefer `inherent_version` / `compose_git_ref` matching the stuck run when known; pure destroy usually OK with defaults (`compose_git_ref` defaults to `main`).
-- **If the job dies before the first state write**, remote state cannot help: delete servers named `inherent-ci-*` in the Hetzner console/API manually.
+- **If the job dies before the first state write**, remote state cannot help: delete servers named `inherent-ci-*` in the Hetzner console/API manually (CI project).
 
 ## Out of scope (future iterations)
 

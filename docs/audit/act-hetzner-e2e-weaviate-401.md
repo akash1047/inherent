@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-11  
 **Workflow:** `.github/workflows/hetzner-e2e.yml`  
-**Evidence log:** `/tmp/act-hetzner-e2e.log` (local act run)
+**Evidence:** Local `act` run (not committed; log was ephemeral on the operator machine). Symptoms excerpted below.
 
 ## Summary
 
@@ -41,10 +41,12 @@ Local `act` simulation of Hetzner e2e left infra green (TF local backend, apply,
 
 ## Evidence
 
-- Workflow path: health → bootstrap → compose tests (`.github/workflows/hetzner-e2e.yml:94-120`); local TF backend override (`.github/workflows/hetzner-e2e.yml:66-75`).
+Symptoms captured from a local `act` run (operator machine; not stored in this repo).
+
+- Workflow path: health → bootstrap → compose tests (`.github/workflows/hetzner-e2e.yml`); local TF backend override used for that act run.
 - VM boot: pulls release compose + `.env`, starts stack (`infra/cloud-init.yaml.tftpl:27-34`).
-- Act log symptoms:
-  - Search failures: `500` with detail  
+- Observed failures:
+  - Search: HTTP `500` with detail  
     `HTTPStatusError: Client error '401 Unauthorized' for url 'http://weaviate:8080/v1/graphql'`
   - Container log: `inherent-oss-public-api` same 401 on GraphQL
   - Ingestion path live: document upload accepted, S3 put, MQ publish on `core.document.uploaded.v1` (ingestion not blocked by Weaviate auth the way public-api search is)

@@ -74,9 +74,12 @@ WEAVIATE_API_KEY=<weaviate-api-key>
 EOF
 ```
 
-This variable is marked `sensitive` and never appears in logs or terminal
-output. If omitted, the server starts with safe defaults that you can update
-later via SSH.
+`sensitive = true` only redacts the value from Terraform CLI plan/apply
+terminal output. Secrets still land in Terraform state (restrict Object
+Storage / state access) and in cloud-init `user_data` / instance metadata
+(`169.254.169.254`) — processes and containers on the VM can read metadata.
+Treat that as a known limitation. If omitted, the server starts with safe
+defaults that you can update later via SSH.
 
 The full list of environment variables is documented in
 [.env.example](../../.env.example) at the repository root.
@@ -258,12 +261,14 @@ Terraform
 
 The firewall allows inbound traffic on:
 
-- Port **22** (SSH) from any source
-- Port **18000** (Inherent Public API) from any source
+- Port **22** (SSH) — `ssh_allowed_ips` (default any source)
+- Port **18000** (Inherent Public API) — `api_allowed_ips` (default any source)
 - **ICMP** (ping) from any source
 
-All other inbound traffic is blocked. Service-to-service communication happens
-inside the Docker Compose network and does not traverse the firewall.
+All other inbound traffic is blocked. This Hetzner firewall is the only
+network barrier for Docker-published ports; restrict the CIDR vars in
+production. Service-to-service traffic stays on the Compose network and does
+not traverse the firewall.
 
 ## Not in Scope (Future Iterations)
 
@@ -283,7 +288,14 @@ inside the Docker Compose network and does not traverse the firewall.
 
 - Browse [docs/README.md](../README.md) for the full documentation index.
 - Open the Public API docs at `http://<server-ip>:18000/docs`.
-- Open the Temporal UI at `http://<server-ip>:18233`.
+- Temporal UI is **not** opened on the Hetzner firewall (only 22, 18000, ICMP).
+  Reach it via SSH tunnel:
+
+  ```bash
+  ssh -L 18233:127.0.0.1:18233 root@<server-ip>
+  # then browse http://127.0.0.1:18233
+  ```
+
 - Run the end-to-end local smoke test from the
   [root README](../../README.md#local-smoke-test) against your production server
   to verify the full upload-ingest-search path.
