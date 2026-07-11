@@ -79,6 +79,35 @@ job runs without pausing.
 
 `make release-images` prints these steps.
 
+### Hetzner / act e2e image parity
+
+Hetzner e2e and local `act` pull **published**
+`ghcr.io/inherent-prime/public-api-svc:${INHERENT_VERSION:-latest}` — not
+workspace source.
+
+If Weaviate has API-key auth enabled (release compose) but the image’s
+`SearchService` does not send `Authorization: Bearer`, compose e2e fails with
+public-api 500 / Weaviate 401. See
+[`docs/audit/act-hetzner-e2e-weaviate-401.md`](../audit/act-hetzner-e2e-weaviate-401.md).
+
+**Republish:** run workflow **Publish images** via `workflow_dispatch` (or push
+a `v*` tag). Publish requires `release-publish` environment approval. Prefer
+also republishing `ingestion-svc` in the same workflow run (matrix already
+builds both).
+
+**Smoke (required before re-running act):**
+
+```bash
+docker pull ghcr.io/inherent-prime/public-api-svc:latest
+docker run --rm --entrypoint grep \
+  ghcr.io/inherent-prime/public-api-svc:latest \
+  -n 'Bearer {self._api_key}' \
+  /app/services/inh-public-api-svc/src/services/search.py
+```
+
+Expect a matching line. No match → do not run Hetzner e2e; republish from
+current `main` first.
+
 ## Documentation Rule
 
 Do not publish a release if the root README or service READMEs describe endpoints, ports, or workflows that the repository does not currently support.
