@@ -153,6 +153,7 @@ Workflow: [`.github/workflows/hetzner-e2e.yml`](../.github/workflows/hetzner-e2e
 - **Flow:** local backend override → `terraform init -reconfigure` → apply → wait `/health` → bootstrap on VM → public-api `pytest -m compose` → always destroy.
 - **Naming:** unique `server_name` / `ssh_key_name` per run (`inherent-ci-${{ github.run_id }}`).
 - **State:** ephemeral local state only — never the prod Object Storage key.
+- **Image parity:** default env sets `WEAVIATE_API_KEY`, and release compose enables Weaviate API-key auth. The **published** `public-api-svc` image must include Weaviate Bearer client support (see [docs/audit/act-hetzner-e2e-weaviate-401.md](../docs/audit/act-hetzner-e2e-weaviate-401.md)). `/health` alone does not prove Weaviate auth works. Smoke-grep image before long e2e runs ([docs/maintainers/releasing.md](../docs/maintainers/releasing.md)).
 - **Long-lived deploys:** use Hetzner Object Storage via `backend.hcl` (see Setup above and [docs/getting-started/production.md](../docs/getting-started/production.md)).
 
 ## Out of scope (future iterations)

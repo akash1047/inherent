@@ -14,6 +14,7 @@ POSTGRES_DB=knowledge_base
 MONGODB_URI=mongodb://mongodb:27017
 MONGODB_DB_NAME=main
 WEAVIATE_URL=http://weaviate:8080
+# public-api image must send this key as Bearer to Weaviate — env alone is not enough
 WEAVIATE_API_KEY=changeme
 REDIS_URL=redis://valkey:6379
 MQ_REDIS_URL=redis://valkey:6379
