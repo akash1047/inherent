@@ -75,6 +75,14 @@ Repo-wide shortcut:
 make test-integration   # public-api compose suite (stack must be up)
 ```
 
+**Local compose CI:** `.github/workflows/integration.yml` (or `make test-integration`
+against a laptop stack).
+
+**Hetzner production-path e2e:** `.github/workflows/hetzner-e2e.yml` — Terraform
+apply on Hetzner, bootstrap, then public-api `pytest -m compose` against the
+VM. Requires repo secret `HCLOUD_TOKEN`. Dispatch + schedule only; not a PR gate.
+See [infra/README.md](../infra/README.md#ci-e2e).
+
 ## Markers
 
 Markers are declared in each service's `[tool.pytest.ini_options].markers`.

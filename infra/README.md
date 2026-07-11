@@ -135,6 +135,17 @@ infra/
 └── README.md                 # This file
 ```
 
+## CI e2e
+
+Workflow: [`.github/workflows/hetzner-e2e.yml`](../.github/workflows/hetzner-e2e.yml).
+
+- **Secret:** `HCLOUD_TOKEN` (repo secret).
+- **Triggers:** `workflow_dispatch` + weekly schedule. Not a PR merge gate.
+- **Flow:** `terraform init -backend=false` → apply → wait `/health` → bootstrap on VM → public-api `pytest -m compose` → always destroy.
+- **Naming:** unique `server_name` / `ssh_key_name` per run (`inherent-ci-${{ github.run_id }}`).
+- **State:** ephemeral local state only — never the prod Object Storage key.
+- **Long-lived deploys:** use Hetzner Object Storage via `backend.hcl` (see Setup above and [docs/getting-started/production.md](../docs/getting-started/production.md)).
+
 ## Out of scope (future iterations)
 
 - DNS / TLS / HTTPS
