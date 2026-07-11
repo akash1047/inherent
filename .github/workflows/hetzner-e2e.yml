@@ -1,0 +1,142 @@
+# Validates Hetzner production path (#83). Uses published images.
+# Costs real Hetzner resources. Not a PR merge gate.
+name: Hetzner e2e
+
+on:
+  workflow_dispatch:
+    inputs:
+      inherent_version:
+        description: Docker image tag for Inherent
+        type: string
+        default: latest
+      server_type:
+        description: Hetzner server type
+        type: string
+        default: cpx32
+  schedule:
+    # Weekly Monday 05:00 UTC
+    - cron: "0 5 * * 1"
+
+concurrency:
+  group: hetzner-e2e
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  hetzner-e2e:
+    name: Hetzner Terraform compose e2e
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Require HCLOUD_TOKEN
+        run: |
+          if [ -z "${{ secrets.HCLOUD_TOKEN }}" ]; then
+            echo "::error::secrets.HCLOUD_TOKEN is empty; cannot provision Hetzner VM"
+            exit 1
+          fi
+
+      - name: Generate SSH key pair
+        run: |
+          KEY="$RUNNER_TEMP/hetzner_ci"
+          ssh-keygen -t ed25519 -N "" -f "$KEY" -C "inherent-ci-${{ github.run_id }}"
+          chmod 600 "$KEY"
+          echo "HETZNER_SSH_KEY=$KEY" >> "$GITHUB_ENV"
+          echo "HETZNER_SSH_PUB=${KEY}.pub" >> "$GITHUB_ENV"
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.8"
+          terraform_wrapper: false
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      # Ephemeral runner-local state only — never Object Storage / prod backend.
+      - name: Terraform init (local state)
+        run: terraform -chdir=infra init -input=false -backend=false
+
+      - name: Terraform apply
+        env:
+          HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
+        run: |
+          INHERENT_VERSION="${{ github.event.inputs.inherent_version || 'latest' }}"
+          SERVER_TYPE="${{ github.event.inputs.server_type || 'cpx32' }}"
+          terraform -chdir=infra apply -auto-approve \
+            -var="server_name=inherent-ci-${{ github.run_id }}" \
+            -var="ssh_key_name=inherent-ci-key-${{ github.run_id }}" \
+            -var="ssh_public_key_path=${HETZNER_SSH_PUB}" \
+            -var="inherent_version=${INHERENT_VERSION}" \
+            -var="server_type=${SERVER_TYPE}"
+
+      - name: Export server IP
+        run: |
+          echo "SERVER_IPV4=$(terraform -chdir=infra output -raw server_ipv4)" >> "$GITHUB_ENV"
+
+      - name: Wait for the public API to be healthy
+        run: |
+          for i in $(seq 1 60); do
+            if curl -fsS "http://${SERVER_IPV4}:18000/health" >/dev/null 2>&1; then
+              echo "public API healthy on ${SERVER_IPV4}"; exit 0
+            fi
+            echo "waiting for public API ($i)..."; sleep 15
+          done
+          echo "::error::public API on ${SERVER_IPV4}:18000 did not become healthy in time"; exit 1
+
+      - name: Bootstrap dev workspace and API key on VM
+        run: |
+          ssh -i "$HETZNER_SSH_KEY" \
+            -o StrictHostKeyChecking=accept-new \
+            -o UserKnownHostsFile=/dev/null \
+            "root@${SERVER_IPV4}" 'bash -s' < scripts/dev/bootstrap.sh
+
+      - name: Run public-api compose tests
+        working-directory: services/inh-public-api-svc
+        env:
+          PUBLIC_API_URL: http://${{ env.SERVER_IPV4 }}:18000
+          INTEGRATION_API_KEY: ink_dev_local_key_001
+          INTEGRATION_WORKSPACE_ID: ws_local_001
+          INTEGRATION_TIMEOUT: "600"
+        run: |
+          uv sync --frozen --extra dev --group dev
+          uv run pytest -m compose
+
+      - name: Dump Compose logs on failure
+        if: failure()
+        continue-on-error: true
+        run: |
+          ssh -i "$HETZNER_SSH_KEY" \
+            -o StrictHostKeyChecking=accept-new \
+            -o UserKnownHostsFile=/dev/null \
+            "root@${SERVER_IPV4}" \
+            'docker compose -f /opt/inherent/docker-compose.release.yml logs --no-color --tail=200'
+
+      # Always destroy when local state exists so CI never leaves a paid VM.
+      - name: Terraform destroy
+        if: always()
+        env:
+          HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
+        run: |
+          if [ ! -f infra/terraform.tfstate ]; then
+            echo "No infra/terraform.tfstate; skipping destroy"
+            exit 0
+          fi
+          if [ -z "${HCLOUD_TOKEN}" ]; then
+            echo "::error::HCLOUD_TOKEN empty but state exists; cannot destroy"
+            exit 1
+          fi
+          INHERENT_VERSION="${{ github.event.inputs.inherent_version || 'latest' }}"
+          SERVER_TYPE="${{ github.event.inputs.server_type || 'cpx32' }}"
+          terraform -chdir=infra destroy -auto-approve \
+            -var="server_name=inherent-ci-${{ github.run_id }}" \
+            -var="ssh_key_name=inherent-ci-key-${{ github.run_id }}" \
+            -var="ssh_public_key_path=${HETZNER_SSH_PUB}" \
+            -var="inherent_version=${INHERENT_VERSION}" \
+            -var="server_type=${SERVER_TYPE}"
