@@ -18,7 +18,8 @@ on:
         type: string
         default: ""
       server_type:
-        description: Hetzner server type
+        # cpx32: compose e2e needs headroom for TEI + full stack (cpx22 is fine for lighter manual deploys)
+        description: Hetzner server type (default cpx32 for compose e2e headroom)
         type: string
         default: cpx32
 
@@ -41,16 +42,22 @@ jobs:
     steps:
       - name: Resolve ref and image tag
         id: meta
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_REF: ${{ inputs.ref }}
+          INPUT_INHERENT_VERSION: ${{ inputs.inherent_version }}
+          WR_HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          WR_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
           set -euo pipefail
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            GIT_REF="${{ inputs.ref }}"
-            IMAGE_TAG="${{ inputs.inherent_version }}"
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            GIT_REF="$INPUT_REF"
+            IMAGE_TAG="$INPUT_INHERENT_VERSION"
           else
             # Tag push workflows put the tag name in head_branch.
-            GIT_REF="${{ github.event.workflow_run.head_branch }}"
+            GIT_REF="$WR_HEAD_BRANCH"
             if [ -z "$GIT_REF" ]; then
-              GIT_REF="${{ github.event.workflow_run.head_sha }}"
+              GIT_REF="$WR_HEAD_SHA"
             fi
             IMAGE_TAG=""
           fi
@@ -61,7 +68,7 @@ jobs:
           fi
 
           # Automation: final tags only (v* without hyphen; skip RCs like v0.4.0-rc1).
-          if [ "${{ github.event_name }}" = "workflow_run" ]; then
+          if [ "$EVENT_NAME" = "workflow_run" ]; then
             case "$GIT_REF" in
               v*)
                 if echo "$GIT_REF" | grep -q '-'; then
@@ -100,25 +107,31 @@ jobs:
 
       - name: Require HCLOUD_TOKEN and S3 backend secrets/vars
         if: steps.meta.outputs.skip != 'true'
+        env:
+          HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          HETZNER_S3_BUCKET: ${{ vars.HETZNER_S3_BUCKET }}
+          HETZNER_S3_ENDPOINT: ${{ vars.HETZNER_S3_ENDPOINT }}
         run: |
           missing=0
-          if [ -z "${{ secrets.HCLOUD_TOKEN }}" ]; then
+          if [ -z "$HCLOUD_TOKEN" ]; then
             echo "::error::secrets.HCLOUD_TOKEN is empty; cannot provision Hetzner VM"
             missing=1
           fi
-          if [ -z "${{ secrets.AWS_ACCESS_KEY_ID }}" ]; then
+          if [ -z "$AWS_ACCESS_KEY_ID" ]; then
             echo "::error::secrets.AWS_ACCESS_KEY_ID is empty; cannot use Hetzner Object Storage state"
             missing=1
           fi
-          if [ -z "${{ secrets.AWS_SECRET_ACCESS_KEY }}" ]; then
+          if [ -z "$AWS_SECRET_ACCESS_KEY" ]; then
             echo "::error::secrets.AWS_SECRET_ACCESS_KEY is empty; cannot use Hetzner Object Storage state"
             missing=1
           fi
-          if [ -z "${{ vars.HETZNER_S3_BUCKET }}" ]; then
+          if [ -z "$HETZNER_S3_BUCKET" ]; then
             echo "::error::vars.HETZNER_S3_BUCKET is empty; cannot use Hetzner Object Storage state"
             missing=1
           fi
-          if [ -z "${{ vars.HETZNER_S3_ENDPOINT }}" ]; then
+          if [ -z "$HETZNER_S3_ENDPOINT" ]; then
             echo "::error::vars.HETZNER_S3_ENDPOINT is empty; cannot use Hetzner Object Storage state"
             missing=1
           fi
@@ -128,12 +141,22 @@ jobs:
 
       - name: Generate SSH key pair
         if: steps.meta.outputs.skip != 'true'
+        env:
+          RUN_ID: ${{ github.run_id }}
         run: |
           KEY="$RUNNER_TEMP/hetzner_ci"
-          ssh-keygen -t ed25519 -N "" -f "$KEY" -C "inherent-ci-${{ github.run_id }}"
+          ssh-keygen -t ed25519 -N "" -f "$KEY" -C "inherent-ci-${RUN_ID}"
           chmod 600 "$KEY"
           echo "HETZNER_SSH_KEY=$KEY" >> "$GITHUB_ENV"
           echo "HETZNER_SSH_PUB=${KEY}.pub" >> "$GITHUB_ENV"
+
+      # Per-run key so logs/state never reuse the well-known local dev bootstrap key.
+      - name: Generate per-run integration API key
+        if: steps.meta.outputs.skip != 'true'
+        run: |
+          API_KEY="ink_ci_$(openssl rand -hex 16)"
+          echo "::add-mask::${API_KEY}"
+          echo "INTEGRATION_API_KEY=${API_KEY}" >> "$GITHUB_ENV"
 
       - name: Set up Terraform
         if: steps.meta.outputs.skip != 'true'
@@ -155,16 +178,19 @@ jobs:
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ${{ vars.AWS_DEFAULT_REGION }}
+          HETZNER_S3_BUCKET: ${{ vars.HETZNER_S3_BUCKET }}
+          HETZNER_S3_ENDPOINT: ${{ vars.HETZNER_S3_ENDPOINT }}
+          RUN_ID: ${{ github.run_id }}
         run: |
-          REGION="${{ vars.AWS_DEFAULT_REGION }}"
-          REGION="${REGION:-eu-central}"
+          REGION="${AWS_DEFAULT_REGION:-eu-central}"
           export AWS_DEFAULT_REGION="$REGION"
           cat > infra/backend-ci.hcl <<EOF
-          bucket = "${{ vars.HETZNER_S3_BUCKET }}"
-          key    = "inherent/ci/${{ github.run_id }}/terraform.tfstate"
+          bucket = "${HETZNER_S3_BUCKET}"
+          key    = "inherent/ci/${RUN_ID}/terraform.tfstate"
 
           endpoints = {
-            s3 = "${{ vars.HETZNER_S3_ENDPOINT }}"
+            s3 = "${HETZNER_S3_ENDPOINT}"
           }
 
           skip_credentials_validation = true
@@ -181,27 +207,49 @@ jobs:
           HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ${{ vars.AWS_DEFAULT_REGION }}
+          SERVER_TYPE: ${{ inputs.server_type || 'cpx32' }}
+          IMAGE_TAG: ${{ steps.meta.outputs.image_tag }}
+          GIT_REF: ${{ steps.meta.outputs.git_ref }}
+          RUN_ID: ${{ github.run_id }}
         run: |
-          REGION="${{ vars.AWS_DEFAULT_REGION }}"
-          REGION="${REGION:-eu-central}"
+          REGION="${AWS_DEFAULT_REGION:-eu-central}"
           export AWS_DEFAULT_REGION="$REGION"
-          SERVER_TYPE="${{ inputs.server_type || 'cpx32' }}"
           terraform -chdir=infra apply -auto-approve \
-            -var="server_name=inherent-ci-${{ github.run_id }}" \
-            -var="ssh_key_name=inherent-ci-key-${{ github.run_id }}" \
+            -var="server_name=inherent-ci-${RUN_ID}" \
+            -var="ssh_key_name=inherent-ci-key-${RUN_ID}" \
             -var="ssh_public_key_path=${HETZNER_SSH_PUB}" \
-            -var="inherent_version=${{ steps.meta.outputs.image_tag }}" \
-            -var="compose_git_ref=${{ steps.meta.outputs.git_ref }}" \
-            -var="server_type=${SERVER_TYPE}"
+            -var="inherent_version=${IMAGE_TAG}" \
+            -var="compose_git_ref=${GIT_REF}" \
+            -var="server_type=${SERVER_TYPE}" \
+            -var="environment=ci"
 
       - name: Export server IP
         if: steps.meta.outputs.skip != 'true'
         run: |
           echo "SERVER_IPV4=$(terraform -chdir=infra output -raw server_ipv4)" >> "$GITHUB_ENV"
 
-      - name: Wait for the public API to be healthy
+      - name: Wait for cloud-init then public API healthy
         if: steps.meta.outputs.skip != 'true'
         run: |
+          set -euo pipefail
+          # Split cloud-init failures from app /health failures.
+          echo "Waiting for cloud-init to finish on ${SERVER_IPV4}..."
+          if ! timeout 600 ssh -i "$HETZNER_SSH_KEY" \
+            -o StrictHostKeyChecking=accept-new \
+            -o UserKnownHostsFile=/dev/null \
+            -o ConnectTimeout=30 \
+            "root@${SERVER_IPV4}" \
+            "cloud-init status --wait"; then
+            echo "::error::cloud-init did not complete within 600s on ${SERVER_IPV4}"
+            ssh -i "$HETZNER_SSH_KEY" \
+              -o StrictHostKeyChecking=accept-new \
+              -o UserKnownHostsFile=/dev/null \
+              "root@${SERVER_IPV4}" \
+              "cloud-init status || true; journalctl -u cloud-final --no-pager -n 80 || true" || true
+            exit 1
+          fi
+          echo "cloud-init finished; polling /health"
           for i in $(seq 1 60); do
             if curl -fsS "http://${SERVER_IPV4}:18000/health" >/dev/null 2>&1; then
               echo "public API healthy on ${SERVER_IPV4}"; exit 0
@@ -213,10 +261,12 @@ jobs:
       - name: Bootstrap dev workspace and API key on VM
         if: steps.meta.outputs.skip != 'true'
         run: |
+          # Pass per-run key into bootstrap (scripts/dev/bootstrap.sh reads API_KEY).
           ssh -i "$HETZNER_SSH_KEY" \
             -o StrictHostKeyChecking=accept-new \
             -o UserKnownHostsFile=/dev/null \
-            "root@${SERVER_IPV4}" 'bash -s' < scripts/dev/bootstrap.sh
+            "root@${SERVER_IPV4}" \
+            "API_KEY=${INTEGRATION_API_KEY} bash -s" < scripts/dev/bootstrap.sh
 
       # Fail fast when public-api cannot auth to Weaviate (stale image / missing Bearer).
       - name: Preflight Weaviate auth via public-api search
@@ -224,7 +274,7 @@ jobs:
         run: |
           BASE="http://${SERVER_IPV4}:18000"
           RESP=$(curl -sS -w "\n%{http_code}" -X POST "${BASE}/v1/search" \
-            -H "X-API-Key: ink_dev_local_key_001" \
+            -H "X-API-Key: ${INTEGRATION_API_KEY}" \
             -H "X-Workspace-Id: ws_local_001" \
             -H "Content-Type: application/json" \
             -d '{"query":"ping","limit":1}' || true)
@@ -249,7 +299,7 @@ jobs:
         working-directory: services/inh-public-api-svc
         env:
           PUBLIC_API_URL: http://${{ env.SERVER_IPV4 }}:18000
-          INTEGRATION_API_KEY: ink_dev_local_key_001
+          INTEGRATION_API_KEY: ${{ env.INTEGRATION_API_KEY }}
           INTEGRATION_WORKSPACE_ID: ws_local_001
           INTEGRATION_TIMEOUT: "600"
         run: |
@@ -273,6 +323,13 @@ jobs:
           HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ${{ vars.AWS_DEFAULT_REGION }}
+          HETZNER_S3_BUCKET: ${{ vars.HETZNER_S3_BUCKET }}
+          HETZNER_S3_ENDPOINT: ${{ vars.HETZNER_S3_ENDPOINT }}
+          SERVER_TYPE: ${{ inputs.server_type || 'cpx32' }}
+          IMAGE_TAG: ${{ steps.meta.outputs.image_tag }}
+          GIT_REF: ${{ steps.meta.outputs.git_ref }}
+          RUN_ID: ${{ github.run_id }}
         run: |
           if [ -z "${HCLOUD_TOKEN}" ]; then
             echo "::error::secrets.HCLOUD_TOKEN is empty; cannot destroy"
@@ -286,24 +343,23 @@ jobs:
             echo "::error::secrets.AWS_SECRET_ACCESS_KEY is empty; cannot destroy"
             exit 1
           fi
-          if [ -z "${{ vars.HETZNER_S3_BUCKET }}" ]; then
+          if [ -z "${HETZNER_S3_BUCKET}" ]; then
             echo "::error::vars.HETZNER_S3_BUCKET is empty; cannot destroy"
             exit 1
           fi
-          if [ -z "${{ vars.HETZNER_S3_ENDPOINT }}" ]; then
+          if [ -z "${HETZNER_S3_ENDPOINT}" ]; then
             echo "::error::vars.HETZNER_S3_ENDPOINT is empty; cannot destroy"
             exit 1
           fi
-          REGION="${{ vars.AWS_DEFAULT_REGION }}"
-          REGION="${REGION:-eu-central}"
+          REGION="${AWS_DEFAULT_REGION:-eu-central}"
           export AWS_DEFAULT_REGION="$REGION"
           # Rewrite backend-ci.hcl + re-init so destroy works alone after cancel.
           cat > infra/backend-ci.hcl <<EOF
-          bucket = "${{ vars.HETZNER_S3_BUCKET }}"
-          key    = "inherent/ci/${{ github.run_id }}/terraform.tfstate"
+          bucket = "${HETZNER_S3_BUCKET}"
+          key    = "inherent/ci/${RUN_ID}/terraform.tfstate"
 
           endpoints = {
-            s3 = "${{ vars.HETZNER_S3_ENDPOINT }}"
+            s3 = "${HETZNER_S3_ENDPOINT}"
           }
 
           skip_credentials_validation = true
@@ -313,11 +369,25 @@ jobs:
           use_path_style              = true
           EOF
           terraform -chdir=infra init -input=false -reconfigure -backend-config=backend-ci.hcl
-          SERVER_TYPE="${{ inputs.server_type || 'cpx32' }}"
-          terraform -chdir=infra destroy -auto-approve \
-            -var="server_name=inherent-ci-${{ github.run_id }}" \
-            -var="ssh_key_name=inherent-ci-key-${{ github.run_id }}" \
-            -var="ssh_public_key_path=${HETZNER_SSH_PUB}" \
-            -var="inherent_version=${{ steps.meta.outputs.image_tag }}" \
-            -var="compose_git_ref=${{ steps.meta.outputs.git_ref }}" \
-            -var="server_type=${SERVER_TYPE}"
+          ok=0
+          for attempt in 1 2 3; do
+            if terraform -chdir=infra destroy -auto-approve \
+              -var="server_name=inherent-ci-${RUN_ID}" \
+              -var="ssh_key_name=inherent-ci-key-${RUN_ID}" \
+              -var="ssh_public_key_path=${HETZNER_SSH_PUB}" \
+              -var="inherent_version=${IMAGE_TAG}" \
+              -var="compose_git_ref=${GIT_REF}" \
+              -var="server_type=${SERVER_TYPE}" \
+              -var="environment=ci"; then
+              ok=1
+              break
+            fi
+            echo "terraform destroy attempt ${attempt}/3 failed"
+            if [ "$attempt" -lt 3 ]; then
+              sleep $(( attempt * 20 ))
+            fi
+          done
+          if [ "$ok" -ne 1 ]; then
+            echo "::error::terraform destroy failed after 3 attempts; use Hetzner e2e recover destroy with run_id=${RUN_ID}"
+            exit 1
+          fi
