@@ -5,8 +5,9 @@
 *.tfstate
 *.tfstate.*
 
-# Backend config with real bucket/endpoint (keep backend.hcl.example)
+# Backend config with real bucket/endpoint (keep *.hcl.example)
 backend.hcl
+backend-ci.hcl
 
 # Crash log files
 crash.log
