@@ -76,6 +76,13 @@ job runs without pausing.
 4. In both cases, the workflow pauses on the `release-publish` environment until
    a reviewer approves the run in the **Actions** tab. Nothing is pushed to GHCR
    without that approval.
+5. After a **successful** Publish images run on a **final** `vX.Y.Z` tag (not
+   `-rcN`), [Hetzner e2e](../../.github/workflows/hetzner-e2e.yml) starts via
+   `workflow_run`. It pins the same release for checkout, GHCR image tag
+   `X.Y.Z`, and compose `compose_git_ref` (the tag). RC tags skip e2e.
+6. Re-run manually: Actions → **Hetzner e2e** → `workflow_dispatch` with
+   `ref` (tag/branch/SHA). Optional `inherent_version` overrides the image tag
+   (default: strip leading `v` from `ref`).
 
 `make release-images` prints these steps.
 

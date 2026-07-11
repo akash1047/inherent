@@ -163,7 +163,16 @@ Workflow: [`.github/workflows/hetzner-e2e.yml`](../.github/workflows/hetzner-e2e
 
 ### Behaviour
 
-- **Triggers:** `workflow_dispatch` + weekly schedule. Not a PR merge gate.
+- **Triggers:**
+  - **Release:** successful **Publish images** on a final `vX.Y.Z` tag
+    (`workflow_run`). RC tags (`v*-rcN`) skip e2e. Not a PR merge gate.
+  - **Manual:** `workflow_dispatch` with required `ref` (tag/branch/SHA);
+    optional `inherent_version` (default: strip leading `v` from `ref`).
+  - No weekly schedule; does not pull `:latest` by default.
+- **Pin:** `inherent_version` (GHCR image tag, e.g. `X.Y.Z`) +
+  `compose_git_ref` (same git ref for compose checkout). One release unit for
+  image, compose, and test checkout. See
+  [docs/maintainers/releasing.md](../docs/maintainers/releasing.md#cutting-an-image-release).
 - **State:** Hetzner Object Storage key `inherent/ci/<github.run_id>/terraform.tfstate` via workflow-generated `backend-ci.hcl`. Never the prod key.
 - **Flow:** generate `backend-ci.hcl` → `terraform init -reconfigure -backend-config=backend-ci.hcl` → apply → wait `/health` → bootstrap on VM → public-api `pytest -m compose` → always destroy (same remote state).
 - **Naming:** unique `server_name` / `ssh_key_name` per run (`inherent-ci-${{ github.run_id }}`).
