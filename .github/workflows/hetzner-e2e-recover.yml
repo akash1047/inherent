@@ -1,0 +1,141 @@
+# Use when primary e2e was killed after apply; if apply never wrote state,
+# delete inherent-ci-* in Hetzner console/API instead.
+#
+# Prefer inherent_version (and compose_git_ref) matching the original stuck run
+# if re-creating resources; for pure destroy, defaults usually OK — TF only
+# needs vars so config evaluates; destroy uses remote state.
+name: Hetzner e2e recover destroy
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: GitHub Actions run id of the stuck e2e job
+        type: string
+        required: true
+      inherent_version:
+        description: Docker image tag for Inherent (must match apply vars)
+        type: string
+        default: latest
+      server_type:
+        description: Hetzner server type (must match apply vars)
+        type: string
+        default: cpx32
+      compose_git_ref:
+        description: Git ref for compose file (match stuck run when known; default main)
+        type: string
+        default: main
+
+permissions:
+  contents: read
+
+jobs:
+  recover-destroy:
+    name: Destroy stuck Hetzner e2e by run_id
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Require HCLOUD_TOKEN and S3 backend secrets/vars
+        env:
+          HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          HETZNER_S3_BUCKET: ${{ vars.HETZNER_S3_BUCKET }}
+          HETZNER_S3_ENDPOINT: ${{ vars.HETZNER_S3_ENDPOINT }}
+        run: |
+          missing=0
+          if [ -z "$HCLOUD_TOKEN" ]; then
+            echo "::error::secrets.HCLOUD_TOKEN is empty; cannot destroy Hetzner VM"
+            missing=1
+          fi
+          if [ -z "$AWS_ACCESS_KEY_ID" ]; then
+            echo "::error::secrets.AWS_ACCESS_KEY_ID is empty; cannot use Hetzner Object Storage state"
+            missing=1
+          fi
+          if [ -z "$AWS_SECRET_ACCESS_KEY" ]; then
+            echo "::error::secrets.AWS_SECRET_ACCESS_KEY is empty; cannot use Hetzner Object Storage state"
+            missing=1
+          fi
+          if [ -z "$HETZNER_S3_BUCKET" ]; then
+            echo "::error::vars.HETZNER_S3_BUCKET is empty; cannot use Hetzner Object Storage state"
+            missing=1
+          fi
+          if [ -z "$HETZNER_S3_ENDPOINT" ]; then
+            echo "::error::vars.HETZNER_S3_ENDPOINT is empty; cannot use Hetzner Object Storage state"
+            missing=1
+          fi
+          if [ "$missing" -ne 0 ]; then
+            exit 1
+          fi
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.8"
+          terraform_wrapper: false
+
+      # Destroy needs ssh_public_key_path even if the Hetzner key resource is already gone.
+      - name: Generate temp SSH key
+        env:
+          INPUT_RUN_ID: ${{ inputs.run_id }}
+        run: |
+          KEY="$RUNNER_TEMP/hetzner_ci_recover"
+          ssh-keygen -t ed25519 -N "" -f "$KEY" -C "inherent-ci-recover-${INPUT_RUN_ID}"
+          chmod 600 "$KEY"
+          echo "HETZNER_SSH_PUB=${KEY}.pub" >> "$GITHUB_ENV"
+
+      - name: Terraform init and destroy (remote CI state)
+        env:
+          HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ${{ vars.AWS_DEFAULT_REGION }}
+          HETZNER_S3_BUCKET: ${{ vars.HETZNER_S3_BUCKET }}
+          HETZNER_S3_ENDPOINT: ${{ vars.HETZNER_S3_ENDPOINT }}
+          INPUT_RUN_ID: ${{ inputs.run_id }}
+          INPUT_INHERENT_VERSION: ${{ inputs.inherent_version }}
+          INPUT_SERVER_TYPE: ${{ inputs.server_type }}
+          INPUT_COMPOSE_GIT_REF: ${{ inputs.compose_git_ref }}
+        run: |
+          REGION="${AWS_DEFAULT_REGION:-eu-central}"
+          export AWS_DEFAULT_REGION="$REGION"
+          cat > infra/backend-ci.hcl <<EOF
+          bucket = "${HETZNER_S3_BUCKET}"
+          key    = "inherent/ci/${INPUT_RUN_ID}/terraform.tfstate"
+
+          endpoints = {
+            s3 = "${HETZNER_S3_ENDPOINT}"
+          }
+
+          skip_credentials_validation = true
+          skip_metadata_api_check     = true
+          skip_region_validation      = true
+          skip_requesting_account_id  = true
+          use_path_style              = true
+          EOF
+          terraform -chdir=infra init -input=false -reconfigure -backend-config=backend-ci.hcl
+          ok=0
+          for attempt in 1 2 3; do
+            if terraform -chdir=infra destroy -auto-approve \
+              -var="server_name=inherent-ci-${INPUT_RUN_ID}" \
+              -var="ssh_key_name=inherent-ci-key-${INPUT_RUN_ID}" \
+              -var="ssh_public_key_path=${HETZNER_SSH_PUB}" \
+              -var="inherent_version=${INPUT_INHERENT_VERSION}" \
+              -var="compose_git_ref=${INPUT_COMPOSE_GIT_REF}" \
+              -var="server_type=${INPUT_SERVER_TYPE}" \
+              -var="environment=ci"; then
+              ok=1
+              break
+            fi
+            echo "terraform destroy attempt ${attempt}/3 failed"
+            if [ "$attempt" -lt 3 ]; then
+              sleep $(( attempt * 20 ))
+            fi
+          done
+          if [ "$ok" -ne 1 ]; then
+            echo "::error::terraform destroy failed after 3 attempts for run_id=${INPUT_RUN_ID}"
+            exit 1
+          fi

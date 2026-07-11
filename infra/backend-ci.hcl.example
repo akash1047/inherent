@@ -1,0 +1,19 @@
+# Used by GHA Hetzner e2e. Copy/generate as backend-ci.hcl (gitignored) on the runner.
+# Credentials via env AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY (Hetzner S3 keys)
+# and AWS_DEFAULT_REGION (any valid-looking region string Hetzner/TF accept, e.g. eu-central).
+# Never commit filled backend-ci.hcl files.
+
+bucket = "YOUR_BUCKET_NAME"
+# CI substitutes real github.run_id for RUN_ID. Never use prod key inherent/prod/... for CI.
+key    = "inherent/ci/RUN_ID/terraform.tfstate"
+
+endpoints = {
+  s3 = "https://fsn1.your-objectstorage.com" # match your bucket region
+}
+
+# Required for non-AWS S3-compatible endpoints (Hetzner Object Storage)
+skip_credentials_validation = true
+skip_metadata_api_check     = true
+skip_region_validation      = true
+skip_requesting_account_id  = true
+use_path_style              = true

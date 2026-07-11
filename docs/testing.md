@@ -75,6 +75,26 @@ Repo-wide shortcut:
 make test-integration   # public-api compose suite (stack must be up)
 ```
 
+**Local compose CI:** `.github/workflows/integration.yml` (or `make test-integration`
+against a laptop stack).
+
+**Hetzner production-path e2e:** `.github/workflows/hetzner-e2e.yml` — Terraform
+apply on Hetzner (remote state key `inherent/ci/<run_id>/terraform.tfstate`),
+bootstrap, then public-api `pytest -m compose` against the VM. Not a PR gate.
+
+- **Triggers:** successful **Publish images** on a final `vX.Y.Z` tag
+  (`workflow_run`; RCs skipped), or manual `workflow_dispatch` with `ref`.
+- **Pin:** same tag for checkout, GHCR `inherent_version` (`X.Y.Z`), and
+  `compose_git_ref`. No weekly / `:latest` schedule.
+- **Secrets:** `HCLOUD_TOKEN`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`.
+- **Variables:** `HETZNER_S3_BUCKET`, `HETZNER_S3_ENDPOINT`, optional
+  `AWS_DEFAULT_REGION` (default `eu-central`).
+- **Recover orphans:** `.github/workflows/hetzner-e2e-recover.yml` (`run_id`
+  input).
+
+See [infra/README.md](../infra/README.md#ci-e2e) and
+[releasing](maintainers/releasing.md#cutting-an-image-release).
+
 ## Markers
 
 Markers are declared in each service's `[tool.pytest.ini_options].markers`.
