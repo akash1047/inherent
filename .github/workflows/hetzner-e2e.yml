@@ -108,6 +108,31 @@ jobs:
             -o UserKnownHostsFile=/dev/null \
             "root@${SERVER_IPV4}" 'bash -s' < scripts/dev/bootstrap.sh
 
+      # Fail fast when public-api cannot auth to Weaviate (stale image / missing Bearer).
+      - name: Preflight Weaviate auth via public-api search
+        run: |
+          BASE="http://${SERVER_IPV4}:18000"
+          RESP=$(curl -sS -w "\n%{http_code}" -X POST "${BASE}/v1/search" \
+            -H "X-API-Key: ink_dev_local_key_001" \
+            -H "X-Workspace-Id: ws_local_001" \
+            -H "Content-Type: application/json" \
+            -d '{"query":"ping","limit":1}' || true)
+          BODY=$(echo "$RESP" | sed '$d')
+          CODE=$(echo "$RESP" | tail -n1)
+          echo "preflight HTTP ${CODE}"
+          echo "$BODY" | head -c 2000
+          if echo "$BODY" | grep -qiE 'weaviate.*(401|Unauthorized)|(401|Unauthorized).*weaviate' \
+            || { [ "$CODE" = "500" ] && echo "$BODY" | grep -qiE 'weaviate' && echo "$BODY" | grep -qiE '401|Unauthorized'; }; then
+            echo "::error::public-api cannot authenticate to Weaviate (401 Unauthorized on graphql). Stale public-api-svc image is likely missing Bearer auth to Weaviate. Republish via the Publish images workflow and see docs/audit/act-hetzner-e2e-weaviate-401.md"
+            exit 1
+          fi
+          if [ "$CODE" = "200" ]; then
+            echo "Weaviate auth preflight OK"
+            exit 0
+          fi
+          echo "warning: preflight got HTTP ${CODE} without Weaviate 401 pattern; leaving diagnosis to pytest"
+          exit 0
+
       - name: Run public-api compose tests
         working-directory: services/inh-public-api-svc
         env:
