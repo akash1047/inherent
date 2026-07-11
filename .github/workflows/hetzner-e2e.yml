@@ -1,21 +1,26 @@
 # Validates Hetzner production path (#83). Uses published images.
 # Costs real Hetzner resources. Not a PR merge gate.
+# Runs after successful Publish images (final v* tags) or via workflow_dispatch.
 name: Hetzner e2e
 
 on:
+  workflow_run:
+    workflows: ["Publish images"]
+    types: [completed]
   workflow_dispatch:
     inputs:
-      inherent_version:
-        description: Docker image tag for Inherent
+      ref:
+        description: Git tag/branch/SHA to checkout and for compose_git_ref
         type: string
-        default: latest
+        required: true
+      inherent_version:
+        description: Docker image tag (empty = strip leading v from ref)
+        type: string
+        default: ""
       server_type:
         description: Hetzner server type
         type: string
         default: cpx32
-  schedule:
-    # Weekly Monday 05:00 UTC
-    - cron: "0 5 * * 1"
 
 concurrency:
   group: hetzner-e2e
@@ -29,11 +34,72 @@ jobs:
     name: Hetzner Terraform compose e2e
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    # Dispatch always; workflow_run only after successful Publish images.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
     steps:
+      - name: Resolve ref and image tag
+        id: meta
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            GIT_REF="${{ inputs.ref }}"
+            IMAGE_TAG="${{ inputs.inherent_version }}"
+          else
+            # Tag push workflows put the tag name in head_branch.
+            GIT_REF="${{ github.event.workflow_run.head_branch }}"
+            if [ -z "$GIT_REF" ]; then
+              GIT_REF="${{ github.event.workflow_run.head_sha }}"
+            fi
+            IMAGE_TAG=""
+          fi
+
+          if [ -z "$GIT_REF" ]; then
+            echo "::error::could not resolve git_ref from event"
+            exit 1
+          fi
+
+          # Automation: final tags only (v* without hyphen; skip RCs like v0.4.0-rc1).
+          if [ "${{ github.event_name }}" = "workflow_run" ]; then
+            case "$GIT_REF" in
+              v*)
+                if echo "$GIT_REF" | grep -q '-'; then
+                  echo "Skipping e2e for pre-release/RC ref: $GIT_REF"
+                  echo "skip=true" >> "$GITHUB_OUTPUT"
+                  exit 0
+                fi
+                ;;
+              *)
+                echo "Skipping e2e: workflow_run ref is not a final v* tag: $GIT_REF"
+                echo "skip=true" >> "$GITHUB_OUTPUT"
+                exit 0
+                ;;
+            esac
+          fi
+
+          if [ -z "$IMAGE_TAG" ]; then
+            # Strip one leading v (v0.4.0 → 0.4.0).
+            IMAGE_TAG="${GIT_REF#v}"
+          fi
+          if [ -z "$IMAGE_TAG" ]; then
+            echo "::error::image_tag is empty; pass inherent_version or a resolvable ref"
+            exit 1
+          fi
+
+          echo "git_ref=$GIT_REF" >> "$GITHUB_OUTPUT"
+          echo "image_tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          echo "Resolved git_ref=$GIT_REF image_tag=$IMAGE_TAG"
+
       - name: Check out repository
+        if: steps.meta.outputs.skip != 'true'
         uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.meta.outputs.git_ref }}
 
       - name: Require HCLOUD_TOKEN and S3 backend secrets/vars
+        if: steps.meta.outputs.skip != 'true'
         run: |
           missing=0
           if [ -z "${{ secrets.HCLOUD_TOKEN }}" ]; then
@@ -61,6 +127,7 @@ jobs:
           fi
 
       - name: Generate SSH key pair
+        if: steps.meta.outputs.skip != 'true'
         run: |
           KEY="$RUNNER_TEMP/hetzner_ci"
           ssh-keygen -t ed25519 -N "" -f "$KEY" -C "inherent-ci-${{ github.run_id }}"
@@ -69,12 +136,14 @@ jobs:
           echo "HETZNER_SSH_PUB=${KEY}.pub" >> "$GITHUB_ENV"
 
       - name: Set up Terraform
+        if: steps.meta.outputs.skip != 'true'
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: "1.9.8"
           terraform_wrapper: false
 
       - name: Set up uv
+        if: steps.meta.outputs.skip != 'true'
         uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
@@ -82,6 +151,7 @@ jobs:
       # Remote CI state on Hetzner Object Storage; never prod key.
       # Survives runner death for recover workflow.
       - name: Terraform init (remote S3 state)
+        if: steps.meta.outputs.skip != 'true'
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -106,6 +176,7 @@ jobs:
           terraform -chdir=infra init -input=false -reconfigure -backend-config=backend-ci.hcl
 
       - name: Terraform apply
+        if: steps.meta.outputs.skip != 'true'
         env:
           HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -114,20 +185,22 @@ jobs:
           REGION="${{ vars.AWS_DEFAULT_REGION }}"
           REGION="${REGION:-eu-central}"
           export AWS_DEFAULT_REGION="$REGION"
-          INHERENT_VERSION="${{ github.event.inputs.inherent_version || 'latest' }}"
-          SERVER_TYPE="${{ github.event.inputs.server_type || 'cpx32' }}"
+          SERVER_TYPE="${{ inputs.server_type || 'cpx32' }}"
           terraform -chdir=infra apply -auto-approve \
             -var="server_name=inherent-ci-${{ github.run_id }}" \
             -var="ssh_key_name=inherent-ci-key-${{ github.run_id }}" \
             -var="ssh_public_key_path=${HETZNER_SSH_PUB}" \
-            -var="inherent_version=${INHERENT_VERSION}" \
+            -var="inherent_version=${{ steps.meta.outputs.image_tag }}" \
+            -var="compose_git_ref=${{ steps.meta.outputs.git_ref }}" \
             -var="server_type=${SERVER_TYPE}"
 
       - name: Export server IP
+        if: steps.meta.outputs.skip != 'true'
         run: |
           echo "SERVER_IPV4=$(terraform -chdir=infra output -raw server_ipv4)" >> "$GITHUB_ENV"
 
       - name: Wait for the public API to be healthy
+        if: steps.meta.outputs.skip != 'true'
         run: |
           for i in $(seq 1 60); do
             if curl -fsS "http://${SERVER_IPV4}:18000/health" >/dev/null 2>&1; then
@@ -138,6 +211,7 @@ jobs:
           echo "::error::public API on ${SERVER_IPV4}:18000 did not become healthy in time"; exit 1
 
       - name: Bootstrap dev workspace and API key on VM
+        if: steps.meta.outputs.skip != 'true'
         run: |
           ssh -i "$HETZNER_SSH_KEY" \
             -o StrictHostKeyChecking=accept-new \
@@ -146,6 +220,7 @@ jobs:
 
       # Fail fast when public-api cannot auth to Weaviate (stale image / missing Bearer).
       - name: Preflight Weaviate auth via public-api search
+        if: steps.meta.outputs.skip != 'true'
         run: |
           BASE="http://${SERVER_IPV4}:18000"
           RESP=$(curl -sS -w "\n%{http_code}" -X POST "${BASE}/v1/search" \
@@ -170,6 +245,7 @@ jobs:
           exit 0
 
       - name: Run public-api compose tests
+        if: steps.meta.outputs.skip != 'true'
         working-directory: services/inh-public-api-svc
         env:
           PUBLIC_API_URL: http://${{ env.SERVER_IPV4 }}:18000
@@ -181,7 +257,7 @@ jobs:
           uv run pytest -m compose
 
       - name: Dump Compose logs on failure
-        if: failure()
+        if: failure() && steps.meta.outputs.skip != 'true'
         continue-on-error: true
         run: |
           ssh -i "$HETZNER_SSH_KEY" \
@@ -192,7 +268,7 @@ jobs:
 
       # Always destroy using remote CI state so CI never leaves a paid VM.
       - name: Terraform destroy
-        if: always()
+        if: always() && steps.meta.outputs.skip != 'true'
         env:
           HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -237,11 +313,11 @@ jobs:
           use_path_style              = true
           EOF
           terraform -chdir=infra init -input=false -reconfigure -backend-config=backend-ci.hcl
-          INHERENT_VERSION="${{ github.event.inputs.inherent_version || 'latest' }}"
-          SERVER_TYPE="${{ github.event.inputs.server_type || 'cpx32' }}"
+          SERVER_TYPE="${{ inputs.server_type || 'cpx32' }}"
           terraform -chdir=infra destroy -auto-approve \
             -var="server_name=inherent-ci-${{ github.run_id }}" \
             -var="ssh_key_name=inherent-ci-key-${{ github.run_id }}" \
             -var="ssh_public_key_path=${HETZNER_SSH_PUB}" \
-            -var="inherent_version=${INHERENT_VERSION}" \
+            -var="inherent_version=${{ steps.meta.outputs.image_tag }}" \
+            -var="compose_git_ref=${{ steps.meta.outputs.git_ref }}" \
             -var="server_type=${SERVER_TYPE}"
