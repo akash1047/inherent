@@ -5,6 +5,23 @@ All notable changes to Inherent are documented here. The format follows
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.2.0] — 2026-07-09 — Org-readiness program
+
+Repository-level release tag (`v0.1.0`/`v0.1.0-rc1` were already used by an
+earlier, narrower release — see [releasing.md](docs/maintainers/releasing.md)
+for the image-publishing flow). Per-service package versions (independent of
+this tag) moved to `inh-contracts` 2.0.0, `inh-ingestion-svc` 0.5.0, and
+`inh-public-api-svc` 0.2.0 alongside this tag.
+
+A milestone-by-milestone push to make Inherent a self-hostable, permission-aware
+agent **memory substrate** an organization can run on day one. Delivered as a
+stack of reviewable PRs (merge order: #65 → #66 → #67 → #68 → #69 → #70, on top
+of the already-merged M0–M2 #62/#63/#64). See
+[docs/maintainers/org-readiness-requirements.md](docs/maintainers/org-readiness-requirements.md)
+and [ADR 0001](docs/adr/0001-agent-memory-substrate.md).
+
 ### Changed
 
 - **MCP tool registry (#100).** Every MCP tool is now declared exactly once in
@@ -19,31 +36,14 @@ All notable changes to Inherent are documented here. The format follows
 - **REST ↔ MCP failure-parity contract suite** (`tests/contract/
   test_failure_parity.py`): dependency-failure tests (MQ down, vector store
   down) asserting both surfaces leave the same document state and surface an
-  error. Includes `xfail` pins for #98 (MCP refresh strands documents as
-  'pending' on MQ failure — fix in PR #96) and #99 (upload's compensating
-  mark-failed is not retried), so those contracts flip to enforced the moment
-  the fixes land.
+  error. The #98 contract (MCP refresh must mark a document failed, not strand
+  it 'pending', on an MQ outage) is now **enforced** — its fix landed in #96
+  (see below). One `xfail` pin remains for #99 (upload's compensating
+  mark-failed is not retried), to flip to enforced the moment that fix lands.
 - **CLAUDE.md defect-prevention rules** from the #98/#99/#100 retrospective:
   pattern sweep after bug fixes, dual-surface failure parity, compensated
   state mutations, registry-only MCP tool registration, and friction/unfiled-
   defect reporting.
-
-## [0.1.0] — 2026-07-09 — Org-readiness program
-
-The first tagged release. Repository-level release tag; per-service package
-versions (independent, see [releasing.md](docs/maintainers/releasing.md))
-moved to `inh-contracts` 2.0.0, `inh-ingestion-svc` 0.5.0, and
-`inh-public-api-svc` 0.2.0 alongside this tag.
-
-A milestone-by-milestone push to make Inherent a self-hostable, permission-aware
-agent **memory substrate** an organization can run on day one. Delivered as a
-stack of reviewable PRs (merge order: #65 → #66 → #67 → #68 → #69 → #70, on top
-of the already-merged M0–M2 #62/#63/#64). See
-[docs/maintainers/org-readiness-requirements.md](docs/maintainers/org-readiness-requirements.md)
-and [ADR 0001](docs/adr/0001-agent-memory-substrate.md).
-
-### Added
-
 - **Evals v1 — traffic-mined retrieval evals (#91).** Operators can now get a
   defensible retrieval-quality number for their own corpus without authoring a
   golden set. Search responses carry an `event_id`; consuming agents (or the
@@ -72,6 +72,18 @@ and [ADR 0001](docs/adr/0001-agent-memory-substrate.md).
   instead of leaving orphaned vectors in search. Requires **write** permission
   and is workspace-scoped — cross-workspace documents read as not-found. The
   `Readme.md` REST/MCP tables were refreshed to match the implemented surface.
+- **Complete REST ↔ MCP API parity (#87 P2/P3, #96).** Closes the remaining
+  parity gaps so an agent has full CRUD + retrieval on both surfaces. Adds
+  `GET /v1/chunks/{doc_id}/{chunk_id}` single-chunk fetch (read, workspace-
+  scoped), the MCP `get_document` and `list_chunks` metadata/chunk tools
+  (read), and the MCP `upload_document` tool — text ingestion (markdown/plain/
+  csv/html) sharing the REST upload's validate/dedup/store/enqueue pipeline via
+  the new `document_intake` service; binary formats stay REST-only by design.
+  `POST /v1/search` already returns a `citation` on every result, so "memory
+  search" and "citations" parity needed no new endpoint. Also **fixes #98**:
+  MCP `refresh_stale_source` now compensates its pending-reset with a
+  mark-failed on MQ publish failure, matching the REST refresh twin (the
+  failure-parity contract above is now enforced).
 
 ### Defect-register remediation (in progress)
 
