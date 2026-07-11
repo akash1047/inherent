@@ -186,6 +186,7 @@ Workflow: [`.github/workflows/hetzner-e2e-recover.yml`](../.github/workflows/het
 - **When:** e2e job died after Terraform wrote remote state (e.g. runner killed mid-run) and destroy did not run.
 - **Input:** `run_id` — the failed workflow run id (state key `inherent/ci/<run_id>/terraform.tfstate`).
 - Re-inits with that CI key and runs `terraform destroy`.
+- Prefer `inherent_version` / `compose_git_ref` matching the stuck run when known; pure destroy usually OK with defaults (`compose_git_ref` defaults to `main`).
 - **If the job dies before the first state write**, remote state cannot help: delete servers named `inherent-ci-*` in the Hetzner console/API manually.
 
 ## Out of scope (future iterations)

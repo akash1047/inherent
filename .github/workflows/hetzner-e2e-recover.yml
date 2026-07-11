@@ -1,5 +1,9 @@
 # Use when primary e2e was killed after apply; if apply never wrote state,
 # delete inherent-ci-* in Hetzner console/API instead.
+#
+# Prefer inherent_version (and compose_git_ref) matching the original stuck run
+# if re-creating resources; for pure destroy, defaults usually OK — TF only
+# needs vars so config evaluates; destroy uses remote state.
 name: Hetzner e2e recover destroy
 
 on:
@@ -17,6 +21,10 @@ on:
         description: Hetzner server type (must match apply vars)
         type: string
         default: cpx32
+      compose_git_ref:
+        description: Git ref for compose file (match stuck run when known; default main)
+        type: string
+        default: main
 
 permissions:
   contents: read
@@ -100,4 +108,5 @@ jobs:
             -var="ssh_key_name=inherent-ci-key-${{ inputs.run_id }}" \
             -var="ssh_public_key_path=${HETZNER_SSH_PUB}" \
             -var="inherent_version=${{ inputs.inherent_version }}" \
+            -var="compose_git_ref=${{ inputs.compose_git_ref }}" \
             -var="server_type=${{ inputs.server_type }}"
