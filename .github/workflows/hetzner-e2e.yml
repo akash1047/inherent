@@ -60,8 +60,19 @@ jobs:
           enable-cache: true
 
       # Ephemeral runner-local state only — never Object Storage / prod backend.
+      # Empty partial backend "s3" {} cannot use `init -backend=false` alone on
+      # modern Terraform (plan/apply still demand backend init). Override to
+      # local for this job's workspace only.
       - name: Terraform init (local state)
-        run: terraform -chdir=infra init -input=false -backend=false
+        run: |
+          cat > infra/zzz_ci_backend_override.tf <<'EOF'
+          terraform {
+            backend "local" {
+              path = "terraform.tfstate"
+            }
+          }
+          EOF
+          terraform -chdir=infra init -input=false -reconfigure
 
       - name: Terraform apply
         env:

@@ -7,8 +7,10 @@ terraform {
   #
   # Remote (prod):   copy backend.hcl.example → backend.hcl, set AWS_* env,
   #                  then: terraform init -backend-config=backend.hcl
-  # Ephemeral/local: terraform init -backend=false
-  #                  (laptop throwaway + CI e2e; do not use the prod state key)
+  # Ephemeral/local: write a temporary *_override.tf with backend "local" {},
+  #                  then: terraform init -reconfigure
+  #                  (do not use the prod state key; plain -backend=false is
+  #                  not enough with an empty partial s3 backend)
   backend "s3" {}
 
   required_providers {

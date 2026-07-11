@@ -28,7 +28,7 @@ cp terraform.tfvars.example terraform.tfvars
 | Path | When | Init |
 |------|------|------|
 | Hetzner Object Storage | Long-lived prod VM | copy `backend.hcl.example` → `backend.hcl`, set `AWS_*` env, `terraform init -backend-config=backend.hcl` |
-| Local ephemeral | CI e2e / throwaway laptop | `terraform init -backend=false` |
+| Local ephemeral | CI e2e / throwaway laptop | temporary `backend "local"` override + `terraform init -reconfigure` |
 
 - `.terraform.lock.hcl` is the **provider lock** — committed to git.
 - `*.tfstate` is **state** — never commit; remote state uses Hetzner Object Storage (S3-compatible).
@@ -50,17 +50,26 @@ terraform init -backend-config=backend.hcl
 
 #### Local / CI (ephemeral)
 
-```bash
-terraform init -backend=false
-```
+Empty partial `backend "s3" {}` still requires a configured backend for
+`plan`/`apply`. For throwaway runs, override to local (do not commit the override):
 
 ```bash
-# Review the plan
+cat > zzz_local_backend_override.tf <<'EOF'
+terraform {
+  backend "local" {
+    path = "terraform.tfstate"
+  }
+}
+EOF
+terraform init -input=false -reconfigure
+# Review / provision
 terraform plan
-
-# Provision
 terraform apply
+# Remove override when done so prod init stays S3-oriented
+rm zzz_local_backend_override.tf
 ```
+
+CI does the same override inside `.github/workflows/hetzner-e2e.yml`.
 
 ## What happens
 
@@ -141,7 +150,7 @@ Workflow: [`.github/workflows/hetzner-e2e.yml`](../.github/workflows/hetzner-e2e
 
 - **Secret:** `HCLOUD_TOKEN` (repo secret).
 - **Triggers:** `workflow_dispatch` + weekly schedule. Not a PR merge gate.
-- **Flow:** `terraform init -backend=false` → apply → wait `/health` → bootstrap on VM → public-api `pytest -m compose` → always destroy.
+- **Flow:** local backend override → `terraform init -reconfigure` → apply → wait `/health` → bootstrap on VM → public-api `pytest -m compose` → always destroy.
 - **Naming:** unique `server_name` / `ssh_key_name` per run (`inherent-ci-${{ github.run_id }}`).
 - **State:** ephemeral local state only — never the prod Object Storage key.
 - **Long-lived deploys:** use Hetzner Object Storage via `backend.hcl` (see Setup above and [docs/getting-started/production.md](../docs/getting-started/production.md)).

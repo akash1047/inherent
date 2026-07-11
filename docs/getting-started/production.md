@@ -88,7 +88,7 @@ Pick one init path:
 | Path | When | Init |
 |------|------|------|
 | Hetzner Object Storage | Long-lived prod VM | copy `backend.hcl.example` → `backend.hcl`, set `AWS_*` env, `terraform init -backend-config=backend.hcl` |
-| Local ephemeral | CI e2e / throwaway laptop | `terraform init -backend=false` |
+| Local ephemeral | CI e2e / throwaway laptop | temporary `backend "local"` override + `terraform init -reconfigure` |
 
 - `.terraform.lock.hcl` is the **provider lock** — committed to git.
 - `*.tfstate` is **state** — never commit; remote state uses Hetzner Object Storage (S3-compatible).
@@ -110,11 +110,23 @@ terraform init -backend-config=backend.hcl
 
 ### Local / CI (ephemeral)
 
+Empty partial `backend "s3" {}` still requires a configured backend for
+`plan`/`apply`. For throwaway runs, override to local (do not commit the override):
+
 ```bash
-terraform init -backend=false
+cat > zzz_local_backend_override.tf <<'EOF'
+terraform {
+  backend "local" {
+    path = "terraform.tfstate"
+  }
+}
+EOF
+terraform init -input=false -reconfigure
 ```
 
 Init downloads the Hetzner provider; the lock file is already committed.
+Remove the override file when you switch back to Object Storage init. CI uses
+the same override pattern in `.github/workflows/hetzner-e2e.yml`.
 
 ## 4. Review the Plan
 
