@@ -5,7 +5,28 @@ All notable changes to Inherent are documented here. The format follows
 
 ## [Unreleased]
 
-Nothing yet.
+### Changed
+
+- **MCP tool registry (#100).** Every MCP tool is now declared exactly once in
+  a `_TOOLS` registry (schema + permission + handler); `list_tools`,
+  permission enforcement, and dispatch all derive from it. Previously a tool
+  had to be registered in 4 disjoint places, so it could be advertised but
+  unusable (or callable but hidden) with no compile-time or test signal. No
+  behavior change — same tools, schemas, and permissions.
+
+### Added
+
+- **REST ↔ MCP failure-parity contract suite** (`tests/contract/
+  test_failure_parity.py`): dependency-failure tests (MQ down, vector store
+  down) asserting both surfaces leave the same document state and surface an
+  error. Includes `xfail` pins for #98 (MCP refresh strands documents as
+  'pending' on MQ failure — fix in PR #96) and #99 (upload's compensating
+  mark-failed is not retried), so those contracts flip to enforced the moment
+  the fixes land.
+- **CLAUDE.md defect-prevention rules** from the #98/#99/#100 retrospective:
+  pattern sweep after bug fixes, dual-surface failure parity, compensated
+  state mutations, registry-only MCP tool registration, and friction/unfiled-
+  defect reporting.
 
 ## [0.1.0] — 2026-07-09 — Org-readiness program
 
