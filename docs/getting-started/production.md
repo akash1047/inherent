@@ -25,6 +25,7 @@ Docker Compose runs the application.
 - [Hetzner account](https://www.hetzner.com) with API token
 - SSH key pair (default: `~/.ssh/id_ed25519.pub`)
 - Terraform >= 1.5.0
+- For remote state: Hetzner Object Storage bucket + S3 access keys (create in console)
 
 ## 1. Authenticate with Hetzner
 
@@ -82,11 +83,38 @@ The full list of environment variables is documented in
 
 ## 3. Initialize Terraform
 
+Pick one init path:
+
+| Path | When | Init |
+|------|------|------|
+| Hetzner Object Storage | Long-lived prod VM | copy `backend.hcl.example` → `backend.hcl`, set `AWS_*` env, `terraform init -backend-config=backend.hcl` |
+| Local ephemeral | CI e2e / throwaway laptop | `terraform init -backend=false` |
+
+- `.terraform.lock.hcl` is the **provider lock** — committed to git.
+- `*.tfstate` is **state** — never commit; remote state uses Hetzner Object Storage (S3-compatible).
+- Do not point CI at the production state key.
+- Operator creates the Object Storage bucket and S3 keys in the Hetzner console (out of band).
+
+### Remote state (production)
+
 ```bash
-terraform init
+cp backend.hcl.example backend.hcl
+# Edit backend.hcl: bucket name, state key, Object Storage endpoint
+
+export AWS_ACCESS_KEY_ID="<hetzner-s3-access-key>"
+export AWS_SECRET_ACCESS_KEY="<hetzner-s3-secret-key>"
+export AWS_DEFAULT_REGION="eu-central"
+
+terraform init -backend-config=backend.hcl
 ```
 
-This downloads the Hetzner provider and writes `.terraform.lock.hcl`.
+### Local / CI (ephemeral)
+
+```bash
+terraform init -backend=false
+```
+
+Init downloads the Hetzner provider; the lock file is already committed.
 
 ## 4. Review the Plan
 
@@ -227,8 +255,6 @@ inside the Docker Compose network and does not traverse the firewall.
   persistent data that survives server replacement
 - Floating IP — attach a floating IP to decouple the address from the server
   lifecycle
-- Remote Terraform state — currently uses local state. Migrate to an S3-compatible
-  backend for team use
 - Multiple environments — add `dev/` and `staging/` workspace directories with
   their own `terraform.tfvars`
 - Dedicated VM for Text Embeddings Inference — reduce noise on the shared VM

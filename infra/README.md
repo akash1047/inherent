@@ -8,6 +8,7 @@ remain defined in `docker-compose.release.yml`.
 
 - [Hetzner account](https://www.hetzner.com) with API token
 - SSH key pair (default: `~/.ssh/id_ed25519.pub`)
+- For remote state: Hetzner Object Storage bucket + S3 access keys (create in console)
 
 ## Setup
 
@@ -20,10 +21,40 @@ cd infra
 # Customise configuration (optional)
 cp terraform.tfvars.example terraform.tfvars
 # Edit terraform.tfvars to set server type, location, etc.
+```
 
-# Initialise Terraform
-terraform init
+### Terraform init (pick one path)
 
+| Path | When | Init |
+|------|------|------|
+| Hetzner Object Storage | Long-lived prod VM | copy `backend.hcl.example` → `backend.hcl`, set `AWS_*` env, `terraform init -backend-config=backend.hcl` |
+| Local ephemeral | CI e2e / throwaway laptop | `terraform init -backend=false` |
+
+- `.terraform.lock.hcl` is the **provider lock** — committed to git.
+- `*.tfstate` is **state** — never commit; remote state uses Hetzner Object Storage (S3-compatible).
+- Do not point CI at the production state key.
+- Operator creates the Object Storage bucket and S3 keys in the Hetzner console (out of band).
+
+#### Remote state (production)
+
+```bash
+cp backend.hcl.example backend.hcl
+# Edit backend.hcl: bucket, key, endpoints.s3
+
+export AWS_ACCESS_KEY_ID="<hetzner-s3-access-key>"
+export AWS_SECRET_ACCESS_KEY="<hetzner-s3-secret-key>"
+export AWS_DEFAULT_REGION="eu-central"
+
+terraform init -backend-config=backend.hcl
+```
+
+#### Local / CI (ephemeral)
+
+```bash
+terraform init -backend=false
+```
+
+```bash
 # Review the plan
 terraform plan
 
@@ -90,7 +121,8 @@ This removes the server, firewall, and SSH key from Hetzner.
 
 ```
 infra/
-├── versions.tf              # Terraform & provider versions
+├── versions.tf              # Terraform & provider versions; partial S3 backend
+├── backend.hcl.example      # Hetzner Object Storage backend config template
 ├── providers.tf              # Provider configuration
 ├── variables.tf              # Input variables
 ├── terraform.tfvars.example  # Example variable values
@@ -98,7 +130,8 @@ infra/
 ├── firewall.tf               # Firewall + attachment
 ├── outputs.tf                # Output values
 ├── cloud-init.yaml.tftpl     # Cloud-init user data template
-├── .gitignore                # Terraform ignores
+├── .terraform.lock.hcl       # Provider dependency lock (committed)
+├── .gitignore                # Ignores state, backend.hcl, tfvars
 └── README.md                 # This file
 ```
 
@@ -108,6 +141,5 @@ infra/
 - Load balancer
 - Floating IP
 - Persistent volumes
-- Remote Terraform state
 - Multiple environments (dev/staging/prod)
 - Multi-node deployments
