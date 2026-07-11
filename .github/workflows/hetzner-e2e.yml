@@ -33,10 +33,30 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Require HCLOUD_TOKEN
+      - name: Require HCLOUD_TOKEN and S3 backend secrets/vars
         run: |
+          missing=0
           if [ -z "${{ secrets.HCLOUD_TOKEN }}" ]; then
             echo "::error::secrets.HCLOUD_TOKEN is empty; cannot provision Hetzner VM"
+            missing=1
+          fi
+          if [ -z "${{ secrets.AWS_ACCESS_KEY_ID }}" ]; then
+            echo "::error::secrets.AWS_ACCESS_KEY_ID is empty; cannot use Hetzner Object Storage state"
+            missing=1
+          fi
+          if [ -z "${{ secrets.AWS_SECRET_ACCESS_KEY }}" ]; then
+            echo "::error::secrets.AWS_SECRET_ACCESS_KEY is empty; cannot use Hetzner Object Storage state"
+            missing=1
+          fi
+          if [ -z "${{ vars.HETZNER_S3_BUCKET }}" ]; then
+            echo "::error::vars.HETZNER_S3_BUCKET is empty; cannot use Hetzner Object Storage state"
+            missing=1
+          fi
+          if [ -z "${{ vars.HETZNER_S3_ENDPOINT }}" ]; then
+            echo "::error::vars.HETZNER_S3_ENDPOINT is empty; cannot use Hetzner Object Storage state"
+            missing=1
+          fi
+          if [ "$missing" -ne 0 ]; then
             exit 1
           fi
 
@@ -59,25 +79,41 @@ jobs:
         with:
           enable-cache: true
 
-      # Ephemeral runner-local state only — never Object Storage / prod backend.
-      # Empty partial backend "s3" {} cannot use `init -backend=false` alone on
-      # modern Terraform (plan/apply still demand backend init). Override to
-      # local for this job's workspace only.
-      - name: Terraform init (local state)
+      # Remote CI state on Hetzner Object Storage; never prod key.
+      # Survives runner death for recover workflow.
+      - name: Terraform init (remote S3 state)
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         run: |
-          cat > infra/zzz_ci_backend_override.tf <<'EOF'
-          terraform {
-            backend "local" {
-              path = "terraform.tfstate"
-            }
+          REGION="${{ vars.AWS_DEFAULT_REGION }}"
+          REGION="${REGION:-eu-central}"
+          export AWS_DEFAULT_REGION="$REGION"
+          cat > infra/backend-ci.hcl <<EOF
+          bucket = "${{ vars.HETZNER_S3_BUCKET }}"
+          key    = "inherent/ci/${{ github.run_id }}/terraform.tfstate"
+
+          endpoints = {
+            s3 = "${{ vars.HETZNER_S3_ENDPOINT }}"
           }
+
+          skip_credentials_validation = true
+          skip_metadata_api_check     = true
+          skip_region_validation      = true
+          skip_requesting_account_id  = true
+          use_path_style              = true
           EOF
-          terraform -chdir=infra init -input=false -reconfigure
+          terraform -chdir=infra init -input=false -reconfigure -backend-config=backend-ci.hcl
 
       - name: Terraform apply
         env:
           HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         run: |
+          REGION="${{ vars.AWS_DEFAULT_REGION }}"
+          REGION="${REGION:-eu-central}"
+          export AWS_DEFAULT_REGION="$REGION"
           INHERENT_VERSION="${{ github.event.inputs.inherent_version || 'latest' }}"
           SERVER_TYPE="${{ github.event.inputs.server_type || 'cpx32' }}"
           terraform -chdir=infra apply -auto-approve \
@@ -154,20 +190,53 @@ jobs:
             "root@${SERVER_IPV4}" \
             'docker compose -f /opt/inherent/docker-compose.release.yml logs --no-color --tail=200'
 
-      # Always destroy when local state exists so CI never leaves a paid VM.
+      # Always destroy using remote CI state so CI never leaves a paid VM.
       - name: Terraform destroy
         if: always()
         env:
           HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         run: |
-          if [ ! -f infra/terraform.tfstate ]; then
-            echo "No infra/terraform.tfstate; skipping destroy"
-            exit 0
-          fi
           if [ -z "${HCLOUD_TOKEN}" ]; then
-            echo "::error::HCLOUD_TOKEN empty but state exists; cannot destroy"
+            echo "::error::secrets.HCLOUD_TOKEN is empty; cannot destroy"
             exit 1
           fi
+          if [ -z "${AWS_ACCESS_KEY_ID}" ]; then
+            echo "::error::secrets.AWS_ACCESS_KEY_ID is empty; cannot destroy"
+            exit 1
+          fi
+          if [ -z "${AWS_SECRET_ACCESS_KEY}" ]; then
+            echo "::error::secrets.AWS_SECRET_ACCESS_KEY is empty; cannot destroy"
+            exit 1
+          fi
+          if [ -z "${{ vars.HETZNER_S3_BUCKET }}" ]; then
+            echo "::error::vars.HETZNER_S3_BUCKET is empty; cannot destroy"
+            exit 1
+          fi
+          if [ -z "${{ vars.HETZNER_S3_ENDPOINT }}" ]; then
+            echo "::error::vars.HETZNER_S3_ENDPOINT is empty; cannot destroy"
+            exit 1
+          fi
+          REGION="${{ vars.AWS_DEFAULT_REGION }}"
+          REGION="${REGION:-eu-central}"
+          export AWS_DEFAULT_REGION="$REGION"
+          # Rewrite backend-ci.hcl + re-init so destroy works alone after cancel.
+          cat > infra/backend-ci.hcl <<EOF
+          bucket = "${{ vars.HETZNER_S3_BUCKET }}"
+          key    = "inherent/ci/${{ github.run_id }}/terraform.tfstate"
+
+          endpoints = {
+            s3 = "${{ vars.HETZNER_S3_ENDPOINT }}"
+          }
+
+          skip_credentials_validation = true
+          skip_metadata_api_check     = true
+          skip_region_validation      = true
+          skip_requesting_account_id  = true
+          use_path_style              = true
+          EOF
+          terraform -chdir=infra init -input=false -reconfigure -backend-config=backend-ci.hcl
           INHERENT_VERSION="${{ github.event.inputs.inherent_version || 'latest' }}"
           SERVER_TYPE="${{ github.event.inputs.server_type || 'cpx32' }}"
           terraform -chdir=infra destroy -auto-approve \
