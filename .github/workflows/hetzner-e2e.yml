@@ -226,8 +226,20 @@ jobs:
 
       - name: Export server IP
         if: steps.meta.outputs.skip != 'true'
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ${{ vars.AWS_DEFAULT_REGION }}
         run: |
-          echo "SERVER_IPV4=$(terraform -chdir=infra output -raw server_ipv4)" >> "$GITHUB_ENV"
+          set -euo pipefail
+          REGION="${AWS_DEFAULT_REGION:-eu-central}"
+          export AWS_DEFAULT_REGION="$REGION"
+          IP=$(terraform -chdir=infra output -raw server_ipv4)
+          if [ -z "${IP}" ]; then
+            echo "::error::terraform output server_ipv4 was empty; cannot continue without SERVER_IPV4"
+            exit 1
+          fi
+          echo "SERVER_IPV4=${IP}" >> "$GITHUB_ENV"
 
       - name: Wait for cloud-init then public API healthy
         if: steps.meta.outputs.skip != 'true'

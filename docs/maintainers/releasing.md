@@ -80,9 +80,12 @@ job runs without pausing.
    `-rcN`), [Hetzner e2e](../../.github/workflows/hetzner-e2e.yml) starts via
    `workflow_run`. It pins the same release for checkout, GHCR image tag
    `X.Y.Z`, and compose `compose_git_ref` (the tag). RC tags skip e2e.
-6. Re-run manually: Actions → **Hetzner e2e** → `workflow_dispatch` with
-   `ref` (tag/branch/SHA). Optional `inherent_version` overrides the image tag
-   (default: strip leading `v` from `ref`).
+6. Re-run manually: Actions → **Hetzner e2e** → **Run workflow**. Form fields
+   and examples (Use workflow from vs `ref`, image tag, `cpx32`) live in
+   [infra/README.md § Manual run](../../infra/README.md#manual-run-github-form).
+   Short form: required `ref` (checkout + compose; must include `infra/`);
+   optional `inherent_version` (GHCR tag; empty = strip leading `v` from `ref`);
+   `server_type` default `cpx32`.
 
 `make release-images` prints these steps.
 

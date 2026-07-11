@@ -174,19 +174,59 @@ blast radius cannot touch production servers or SSH keys.
 - **Triggers:**
   - **Release:** successful **Publish images** on a final `vX.Y.Z` tag
     (`workflow_run`). RC tags (`v*-rcN`) skip e2e. Not a PR merge gate.
-  - **Manual:** `workflow_dispatch` with required `ref` (tag/branch/SHA);
-    optional `inherent_version` (default: strip leading `v` from `ref`).
+  - **Manual:** Actions → **Hetzner e2e** → **Run workflow** (see form below).
   - No weekly schedule; does not pull `:latest` by default.
 - **Pin:** `inherent_version` (GHCR image tag, e.g. `X.Y.Z`) +
-  `compose_git_ref` (same git ref for compose checkout). One release unit for
-  image, compose, and test checkout. See
+  `compose_git_ref` (same git ref for compose checkout when possible). See
   [docs/maintainers/releasing.md](../docs/maintainers/releasing.md#cutting-an-image-release).
 - **State:** Hetzner Object Storage key `inherent/ci/<github.run_id>/terraform.tfstate` via workflow-generated `backend-ci.hcl`. Never the prod key.
 - **Server type:** CI defaults to **cpx32** (compose e2e headroom for TEI + stack). Local/prod examples may use `cpx22`.
-- **Flow:** generate `backend-ci.hcl` → `terraform init -reconfigure -backend-config=backend-ci.hcl` → apply (`environment=ci`) → cloud-init wait → `/health` → bootstrap on VM → public-api `pytest -m compose` → always destroy with retries (same remote state).
+- **Flow:** generate `backend-ci.hcl` → `terraform init -reconfigure -backend-config=backend-ci.hcl` → apply (`environment=ci`) → export `SERVER_IPV4` from TF state → cloud-init wait → `/health` → bootstrap on VM → public-api `pytest -m compose` → always destroy with retries (same remote state).
 - **Naming:** unique `server_name` / `ssh_key_name` per run (`inherent-ci-${{ github.run_id }}`).
 - **Image parity:** default env sets `WEAVIATE_API_KEY`, and release compose enables Weaviate API-key auth. The **published** `public-api-svc` image must include Weaviate Bearer client support (see [docs/audit/act-hetzner-e2e-weaviate-401.md](../docs/audit/act-hetzner-e2e-weaviate-401.md)). `/health` alone does not prove Weaviate auth works. Smoke-grep image before long e2e runs ([docs/maintainers/releasing.md](../docs/maintainers/releasing.md)).
 - **Long-lived deploys:** use Hetzner Object Storage via `backend.hcl` (see Setup above and [docs/getting-started/production.md](../docs/getting-started/production.md)).
+
+### Manual run (GitHub form)
+
+1. Actions → left sidebar **Hetzner e2e** → **Run workflow**.
+2. Fill the dialog (maps to `workflow_dispatch` inputs):
+
+| Form field | Input | What it does | Typical value |
+|------------|--------|--------------|---------------|
+| **Use workflow from** | (GHA UI only) | Branch that supplies the **workflow YAML** (not the checkout for TF/compose unless you also set `ref` to it) | `main` (or a feature branch that has this workflow) |
+| **Git tag/branch/SHA…** | `ref` (required) | `actions/checkout` target; also `compose_git_ref` for the VM stack | Branch/tag that **includes `infra/`** and release compose. Old tags without Terraform fail at init (`infra/` missing). |
+| **Docker image tag…** | `inherent_version` | GHCR tag for `public-api-svc` / `ingestion-svc`. Empty → strip one leading `v` from `ref` (`v0.4.1` → `0.4.1`) | Empty when `ref` is a final release tag; or set explicitly (`0.4.1`, `latest`) when `ref` is `main` |
+| **Hetzner server type** | `server_type` | Hetzner plan for the CI VM | `cpx32` (default; keep for compose e2e) |
+
+**Do not confuse** “Use workflow from” with `ref`:
+
+- **Use workflow from** = which commit’s `.github/workflows/hetzner-e2e.yml` runs.
+- **`ref`** = which commit is checked out on the runner and used for compose/TF tree on the job (must have `infra/`).
+
+**Examples**
+
+| Goal | Use workflow from | `ref` | Docker image tag |
+|------|-------------------|-------|------------------|
+| Production-path on current e2e workflow + published release images | `main` | `main` | `0.4.1` (or another published tag) |
+| Full pin when release tag **includes** `infra/` | `main` | `vX.Y.Z` | *(empty → `X.Y.Z`)* |
+| Avoid | any | `v0.4.1` if that tag has no `infra/` | — (init fails: no `infra/backend-ci.hcl` parent dir) |
+
+CLI:
+
+```bash
+gh workflow run "Hetzner e2e" -f ref=main -f inherent_version=0.4.1 -f server_type=cpx32
+```
+
+### Local simulation (`act`)
+
+[nektos/act](https://github.com/nektos/act) can run the workflow file on a laptop. It is **not** a substitute for GHA secrets/vars setup and still needs real Hetzner credentials if apply is not mocked.
+
+- Image skew / Weaviate 401 lessons from a local `act` run:
+  [docs/audit/act-hetzner-e2e-weaviate-401.md](../docs/audit/act-hetzner-e2e-weaviate-401.md)
+- Before long e2e (GHA or act): smoke-grep published `public-api-svc` for Weaviate Bearer —
+  [docs/maintainers/releasing.md § Hetzner / act e2e image parity](../docs/maintainers/releasing.md#hetzner--act-e2e-image-parity)
+
+There is no committed `act` config or Makefile target; operators pass `workflow_dispatch` inputs and secrets per local act setup.
 
 ### Recover orphaned CI resources
 
@@ -196,9 +236,11 @@ This is the **orphan path** when primary destroy fails or the job dies after
 state was written — there is no separate age-sweep job.
 
 - **When:** e2e job died after Terraform wrote remote state (e.g. runner killed mid-run) and destroy did not run.
-- **Input:** `run_id` — the failed workflow run id (state key `inherent/ci/<run_id>/terraform.tfstate`).
+- **UI:** Actions → **Hetzner e2e recover destroy** → **Run workflow**.
+- **Inputs:**
+  - `run_id` (required) — failed workflow run id (URL `.../actions/runs/<run_id>`; state key `inherent/ci/<run_id>/terraform.tfstate`)
+  - `inherent_version` / `server_type` / `compose_git_ref` — match stuck run when known; pure destroy often OK with defaults (`compose_git_ref` defaults to `main`, `server_type` `cpx32`)
 - Re-inits with that CI key and runs `terraform destroy` (with retries).
-- Prefer `inherent_version` / `compose_git_ref` matching the stuck run when known; pure destroy usually OK with defaults (`compose_git_ref` defaults to `main`).
 - **If the job dies before the first state write**, remote state cannot help: delete servers named `inherent-ci-*` in the Hetzner console/API manually (CI project).
 
 ## Out of scope (future iterations)

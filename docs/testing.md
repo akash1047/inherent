@@ -83,14 +83,21 @@ apply on Hetzner (remote state key `inherent/ci/<run_id>/terraform.tfstate`),
 bootstrap, then public-api `pytest -m compose` against the VM. Not a PR gate.
 
 - **Triggers:** successful **Publish images** on a final `vX.Y.Z` tag
-  (`workflow_run`; RCs skipped), or manual `workflow_dispatch` with `ref`.
-- **Pin:** same tag for checkout, GHCR `inherent_version` (`X.Y.Z`), and
-  `compose_git_ref`. No weekly / `:latest` schedule.
+  (`workflow_run`; RCs skipped), or manual **Run workflow** form.
+- **Form / inputs:** [infra/README.md § Manual run](../infra/README.md#manual-run-github-form)
+  — `ref` (required; checkout + compose; needs `infra/`), optional
+  `inherent_version` (GHCR tag), `server_type` (default `cpx32`). “Use workflow
+  from” only selects the workflow YAML branch.
+- **Pin:** prefer aligned image tag + checkout when testing a release; use
+  `ref=main` + explicit `inherent_version` when the release tag lacks `infra/`.
 - **Secrets:** `HCLOUD_TOKEN`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`.
 - **Variables:** `HETZNER_S3_BUCKET`, `HETZNER_S3_ENDPOINT`, optional
   `AWS_DEFAULT_REGION` (default `eu-central`).
 - **Recover orphans:** `.github/workflows/hetzner-e2e-recover.yml` (`run_id`
-  input).
+  input) — same infra README section.
+- **Local `act`:** optional laptop simulation of the workflow; see infra README
+  § Local simulation and [audit/act-hetzner-e2e-weaviate-401.md](audit/act-hetzner-e2e-weaviate-401.md).
+  Smoke image parity before long runs ([releasing](maintainers/releasing.md#hetzner--act-e2e-image-parity)).
 
 See [infra/README.md](../infra/README.md#ci-e2e) and
 [releasing](maintainers/releasing.md#cutting-an-image-release).
