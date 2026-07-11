@@ -43,6 +43,7 @@ EOF
 
   cloud_init = templatefile("${path.module}/cloud-init.yaml.tftpl", {
     env_content_b64 = local.env_content_b64
+    compose_git_ref = var.compose_git_ref
   })
 }
 

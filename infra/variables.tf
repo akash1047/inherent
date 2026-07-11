@@ -46,6 +46,13 @@ variable "inherent_version" {
   default     = "latest"
 }
 
+# CI should pass the release tag; local/prod default main.
+variable "compose_git_ref" {
+  description = "Git ref (branch, tag, or SHA) used to download docker-compose.release.yml on the VM"
+  type        = string
+  default     = "main"
+}
+
 variable "env_file_content" {
   description = "Content of the .env file for Docker Compose. Use to inject production secrets at apply time. If empty, safe defaults are used."
   type        = string

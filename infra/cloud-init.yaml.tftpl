@@ -25,7 +25,7 @@ runcmd:
     mkdir -p /opt/inherent
 
     # Download docker-compose.release.yml
-    curl -fsSL -o /opt/inherent/docker-compose.release.yml https://raw.githubusercontent.com/inherent-prime/inherent/main/docker-compose.release.yml
+    curl -fsSL -o /opt/inherent/docker-compose.release.yml https://raw.githubusercontent.com/inherent-prime/inherent/${compose_git_ref}/docker-compose.release.yml
 
     # Write .env (base64-decoded to avoid YAML multi-line issues)
     echo '${env_content_b64}' | base64 -d > /opt/inherent/.env
