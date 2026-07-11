@@ -3,14 +3,16 @@ terraform {
 
   # .terraform.lock.hcl = provider dependency lock (committed to git).
   # State (*.tfstate) is remote via Hetzner Object Storage (S3-compatible)
-  # for long-lived deploys — never commit state files.
+  # — never commit state files.
   #
-  # Remote (prod):   copy backend.hcl.example → backend.hcl, set AWS_* env,
-  #                  then: terraform init -backend-config=backend.hcl
-  # Ephemeral/local: write a temporary *_override.tf with backend "local" {},
-  #                  then: terraform init -reconfigure
-  #                  (do not use the prod state key; plain -backend=false is
-  #                  not enough with an empty partial s3 backend)
+  # Prod / long-lived: copy backend.hcl.example → backend.hcl (stable key,
+  #   e.g. inherent/prod/...), set AWS_* env,
+  #   then: terraform init -backend-config=backend.hcl
+  # CI e2e:            S3 backend with inherent/ci/<run_id>/terraform.tfstate
+  #   via workflow-generated backend-ci.hcl; never the prod key.
+  # Laptop throwaway:  temporary *_override.tf with backend "local" {},
+  #   then: terraform init -reconfigure (local override only; not for CI).
+  #   Plain -backend=false is not enough with an empty partial s3 backend.
   backend "s3" {}
 
   required_providers {

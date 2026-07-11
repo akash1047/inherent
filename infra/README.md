@@ -25,21 +25,22 @@ cp terraform.tfvars.example terraform.tfvars
 
 ### Terraform init (pick one path)
 
-| Path | When | Init |
-|------|------|------|
-| Hetzner Object Storage | Long-lived prod VM | copy `backend.hcl.example` → `backend.hcl`, set `AWS_*` env, `terraform init -backend-config=backend.hcl` |
-| Local ephemeral | CI e2e / throwaway laptop | temporary `backend "local"` override + `terraform init -reconfigure` |
+| Path | When | State key / backend | Init |
+|------|------|---------------------|------|
+| **Prod / long-lived** | Stable prod VM | `backend.hcl` stable key (e.g. `inherent/prod/...`) | copy `backend.hcl.example` → `backend.hcl`, set `AWS_*` env, `terraform init -backend-config=backend.hcl` |
+| **CI e2e** | GHA Hetzner e2e | Object Storage `inherent/ci/<github.run_id>/terraform.tfstate` via workflow-generated `backend-ci.hcl` | workflow runs `terraform init -reconfigure -backend-config=backend-ci.hcl` |
+| **Laptop throwaway** | Local experiments | temporary local backend override | write `backend "local"` override + `terraform init -reconfigure` |
 
 - `.terraform.lock.hcl` is the **provider lock** — committed to git.
 - `*.tfstate` is **state** — never commit; remote state uses Hetzner Object Storage (S3-compatible).
-- Do not point CI at the production state key.
+- **Hard rule:** never point CI at the production state key.
 - Operator creates the Object Storage bucket and S3 keys in the Hetzner console (out of band).
 
 #### Remote state (production)
 
 ```bash
 cp backend.hcl.example backend.hcl
-# Edit backend.hcl: bucket, key, endpoints.s3
+# Edit backend.hcl: bucket, key (e.g. inherent/prod/...), endpoints.s3
 
 export AWS_ACCESS_KEY_ID="<hetzner-s3-access-key>"
 export AWS_SECRET_ACCESS_KEY="<hetzner-s3-secret-key>"
@@ -48,10 +49,11 @@ export AWS_DEFAULT_REGION="eu-central"
 terraform init -backend-config=backend.hcl
 ```
 
-#### Local / CI (ephemeral)
+#### Laptop throwaway (local override only)
 
 Empty partial `backend "s3" {}` still requires a configured backend for
-`plan`/`apply`. For throwaway runs, override to local (do not commit the override):
+`plan`/`apply`. For laptop throwaway runs only — not CI — override to local
+(do not commit the override):
 
 ```bash
 cat > zzz_local_backend_override.tf <<'EOF'
@@ -69,7 +71,7 @@ terraform apply
 rm zzz_local_backend_override.tf
 ```
 
-CI does the same override inside `.github/workflows/hetzner-e2e.yml`.
+CI e2e does **not** use local state; see [CI e2e](#ci-e2e) below.
 
 ## What happens
 
@@ -148,13 +150,34 @@ infra/
 
 Workflow: [`.github/workflows/hetzner-e2e.yml`](../.github/workflows/hetzner-e2e.yml).
 
-- **Secret:** `HCLOUD_TOKEN` (repo secret).
+### GitHub Actions configuration
+
+| Kind | Name | Notes |
+|------|------|-------|
+| Secret | `HCLOUD_TOKEN` | Hetzner Cloud API token |
+| Secret | `AWS_ACCESS_KEY_ID` | Hetzner Object Storage S3 access key |
+| Secret | `AWS_SECRET_ACCESS_KEY` | Hetzner Object Storage S3 secret key |
+| Variable | `HETZNER_S3_BUCKET` | Object Storage bucket name |
+| Variable | `HETZNER_S3_ENDPOINT` | S3 endpoint URL |
+| Variable | `AWS_DEFAULT_REGION` | optional; default `eu-central` |
+
+### Behaviour
+
 - **Triggers:** `workflow_dispatch` + weekly schedule. Not a PR merge gate.
-- **Flow:** local backend override → `terraform init -reconfigure` → apply → wait `/health` → bootstrap on VM → public-api `pytest -m compose` → always destroy.
+- **State:** Hetzner Object Storage key `inherent/ci/<github.run_id>/terraform.tfstate` via workflow-generated `backend-ci.hcl`. Never the prod key.
+- **Flow:** generate `backend-ci.hcl` → `terraform init -reconfigure -backend-config=backend-ci.hcl` → apply → wait `/health` → bootstrap on VM → public-api `pytest -m compose` → always destroy (same remote state).
 - **Naming:** unique `server_name` / `ssh_key_name` per run (`inherent-ci-${{ github.run_id }}`).
-- **State:** ephemeral local state only — never the prod Object Storage key.
 - **Image parity:** default env sets `WEAVIATE_API_KEY`, and release compose enables Weaviate API-key auth. The **published** `public-api-svc` image must include Weaviate Bearer client support (see [docs/audit/act-hetzner-e2e-weaviate-401.md](../docs/audit/act-hetzner-e2e-weaviate-401.md)). `/health` alone does not prove Weaviate auth works. Smoke-grep image before long e2e runs ([docs/maintainers/releasing.md](../docs/maintainers/releasing.md)).
 - **Long-lived deploys:** use Hetzner Object Storage via `backend.hcl` (see Setup above and [docs/getting-started/production.md](../docs/getting-started/production.md)).
+
+### Recover orphaned CI resources
+
+Workflow: [`.github/workflows/hetzner-e2e-recover.yml`](../.github/workflows/hetzner-e2e-recover.yml).
+
+- **When:** e2e job died after Terraform wrote remote state (e.g. runner killed mid-run) and destroy did not run.
+- **Input:** `run_id` — the failed workflow run id (state key `inherent/ci/<run_id>/terraform.tfstate`).
+- Re-inits with that CI key and runs `terraform destroy`.
+- **If the job dies before the first state write**, remote state cannot help: delete servers named `inherent-ci-*` in the Hetzner console/API manually.
 
 ## Out of scope (future iterations)
 

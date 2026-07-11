@@ -85,21 +85,22 @@ The full list of environment variables is documented in
 
 Pick one init path:
 
-| Path | When | Init |
-|------|------|------|
-| Hetzner Object Storage | Long-lived prod VM | copy `backend.hcl.example` → `backend.hcl`, set `AWS_*` env, `terraform init -backend-config=backend.hcl` |
-| Local ephemeral | CI e2e / throwaway laptop | temporary `backend "local"` override + `terraform init -reconfigure` |
+| Path | When | State key / backend | Init |
+|------|------|---------------------|------|
+| **Prod / long-lived** | Stable prod VM | `backend.hcl` stable key (e.g. `inherent/prod/...`) | copy `backend.hcl.example` → `backend.hcl`, set `AWS_*` env, `terraform init -backend-config=backend.hcl` |
+| **CI e2e** | GHA Hetzner e2e | Object Storage `inherent/ci/<github.run_id>/terraform.tfstate` via workflow-generated `backend-ci.hcl` | see [infra/README.md § CI e2e](../../infra/README.md#ci-e2e) |
+| **Laptop throwaway** | Local experiments | temporary local backend override | write `backend "local"` override + `terraform init -reconfigure` |
 
 - `.terraform.lock.hcl` is the **provider lock** — committed to git.
 - `*.tfstate` is **state** — never commit; remote state uses Hetzner Object Storage (S3-compatible).
-- Do not point CI at the production state key.
+- **Hard rule:** never point CI at the production state key.
 - Operator creates the Object Storage bucket and S3 keys in the Hetzner console (out of band).
 
 ### Remote state (production)
 
 ```bash
 cp backend.hcl.example backend.hcl
-# Edit backend.hcl: bucket name, state key, Object Storage endpoint
+# Edit backend.hcl: bucket name, state key (e.g. inherent/prod/...), Object Storage endpoint
 
 export AWS_ACCESS_KEY_ID="<hetzner-s3-access-key>"
 export AWS_SECRET_ACCESS_KEY="<hetzner-s3-secret-key>"
@@ -108,10 +109,11 @@ export AWS_DEFAULT_REGION="eu-central"
 terraform init -backend-config=backend.hcl
 ```
 
-### Local / CI (ephemeral)
+### Laptop throwaway (local override only)
 
 Empty partial `backend "s3" {}` still requires a configured backend for
-`plan`/`apply`. For throwaway runs, override to local (do not commit the override):
+`plan`/`apply`. For laptop throwaway runs only — not CI — override to local
+(do not commit the override):
 
 ```bash
 cat > zzz_local_backend_override.tf <<'EOF'
@@ -125,8 +127,13 @@ terraform init -input=false -reconfigure
 ```
 
 Init downloads the Hetzner provider; the lock file is already committed.
-Remove the override file when you switch back to Object Storage init. CI uses
-the same override pattern in `.github/workflows/hetzner-e2e.yml`.
+Remove the override file when you switch back to Object Storage init.
+
+### CI e2e (remote state)
+
+GHA Hetzner e2e uses Object Storage under `inherent/ci/<run_id>/`, not local
+state. Configure secrets/vars, recover workflow, and orphan cleanup in
+[infra/README.md § CI e2e](../../infra/README.md#ci-e2e).
 
 ## 4. Review the Plan
 

@@ -79,9 +79,15 @@ make test-integration   # public-api compose suite (stack must be up)
 against a laptop stack).
 
 **Hetzner production-path e2e:** `.github/workflows/hetzner-e2e.yml` — Terraform
-apply on Hetzner, bootstrap, then public-api `pytest -m compose` against the
-VM. Requires repo secret `HCLOUD_TOKEN`. Dispatch + schedule only; not a PR gate.
-See [infra/README.md](../infra/README.md#ci-e2e).
+apply on Hetzner (remote state key `inherent/ci/<run_id>/terraform.tfstate`),
+bootstrap, then public-api `pytest -m compose` against the VM. Dispatch +
+schedule only; not a PR gate.
+
+Secrets: `HCLOUD_TOKEN`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`.
+Variables: `HETZNER_S3_BUCKET`, `HETZNER_S3_ENDPOINT`, optional
+`AWS_DEFAULT_REGION` (default `eu-central`). Recover orphans via
+`.github/workflows/hetzner-e2e-recover.yml` (`run_id` input). See
+[infra/README.md](../infra/README.md#ci-e2e).
 
 ## Markers
 
