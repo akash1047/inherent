@@ -58,7 +58,7 @@ resource "hcloud_server" "default" {
   user_data   = local.cloud_init
 
   labels = {
-    environment = "production"
+    environment = var.environment
     service     = "inherent"
   }
 }

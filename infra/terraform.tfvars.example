@@ -6,3 +6,7 @@ server_backups      = false
 ssh_public_key_path = "~/.ssh/id_ed25519.pub"
 ssh_key_name        = "inherent-prod-key"
 inherent_version    = "latest"
+environment         = "production"
+# Restrict in production (defaults are open to the world):
+# ssh_allowed_ips = ["203.0.113.10/32"]
+# api_allowed_ips = ["203.0.113.0/24"]

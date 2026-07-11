@@ -59,3 +59,23 @@ variable "env_file_content" {
   default     = ""
   sensitive   = true
 }
+
+# CIDR allowlists for the Hetzner firewall (only barrier for Docker-published ports).
+variable "ssh_allowed_ips" {
+  description = "Source CIDRs allowed to SSH (port 22)"
+  type        = list(string)
+  default     = ["0.0.0.0/0", "::/0"]
+}
+
+variable "api_allowed_ips" {
+  description = "Source CIDRs allowed to the Public API (port 18000)"
+  type        = list(string)
+  default     = ["0.0.0.0/0", "::/0"]
+}
+
+# Server label (e.g. production, ci). CI e2e passes environment=ci.
+variable "environment" {
+  description = "Environment label applied to the Hetzner server"
+  type        = string
+  default     = "production"
+}

@@ -1,11 +1,13 @@
-# Firewall protecting the Inherent server
+# Firewall protecting the Inherent server.
+# This is the only network barrier for Docker-published ports (SSH, Public API).
+# Restrict ssh_allowed_ips / api_allowed_ips in production; defaults are open.
 resource "hcloud_firewall" "default" {
   name = "${var.server_name}-firewall"
 
   rule {
     direction   = "in"
     protocol    = "tcp"
-    source_ips  = ["0.0.0.0/0", "::/0"]
+    source_ips  = var.ssh_allowed_ips
     port        = "22"
     description = "SSH"
   }
@@ -13,7 +15,7 @@ resource "hcloud_firewall" "default" {
   rule {
     direction   = "in"
     protocol    = "tcp"
-    source_ips  = ["0.0.0.0/0", "::/0"]
+    source_ips  = var.api_allowed_ips
     port        = "18000"
     description = "Inherent Public API"
   }
