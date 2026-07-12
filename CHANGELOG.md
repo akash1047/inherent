@@ -5,7 +5,19 @@ All notable changes to Inherent are documented here. The format follows
 
 ## [Unreleased]
 
-Nothing yet.
+### Fixed
+
+- **Compensating mark-failed writes are retried (#99).** When an MQ publish
+  fails and the compensating `mark_document_failed` write also fails, the mark
+  is now retried with exponential backoff (3 attempts) via the new
+  `src/services/compensation.py` helper. Exhaustion emits a CRITICAL log and
+  bumps the new `document_compensation_exhausted_total{operation}` Prometheus
+  counter instead of silently orphaning the row as `pending` while the
+  response says `failed`. Applies to all three compensation sites: upload
+  intake (shared REST + MCP), REST refresh, MCP refresh. The #99 contract in
+  `tests/contract/test_failure_parity.py` is now enforced (xfail removed) and
+  the refresh double-failure pair is pinned on both surfaces. Durable lesson
+  recorded in [docs/developer/learnings.md](docs/developer/learnings.md).
 
 ## [0.2.0] — 2026-07-09 — Org-readiness program
 
