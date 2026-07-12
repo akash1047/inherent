@@ -54,6 +54,7 @@ from mcp.types import TextContent, Tool
 from src.config.constants import ALLOWED_MIME_TYPES, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE
 from src.models.api_key import APIKeyInfo
 from src.models.evals import FeedbackRequest
+from src.services.compensation import mark_document_failed_with_retry
 from src.services.database import get_database
 from src.services.document_intake import intake_document
 from src.services.eval_feedback import EventNotFoundError, submit_feedback
@@ -607,22 +608,21 @@ async def _handle_refresh_stale_source(key_info: APIKeyInfo, arguments: dict) ->
         # must mark it failed — exactly as the REST twin
         # (POST /v1/documents/{id}/refresh) does — instead of stranding it as
         # permanently 'pending'. Both surfaces must leave the SAME state on an MQ
-        # outage (dual-surface failure parity, CLAUDE.md). A failure of the mark
-        # itself is logged, not swallowed into a success; retrying that mark is
-        # the separate #99 recovery contract.
+        # outage (dual-surface failure parity, CLAUDE.md). The mark is retried
+        # with backoff; on exhaustion the helper emits the CRITICAL log + metric
+        # that flag the orphaned 'pending' row (#99).
         logger.error(
             "MQ publish failed during refresh — re-ingestion not enqueued",
             error=str(exc),
             document_id=document_id,
         )
-        try:
-            await database.mark_document_failed(document_id, workspace_id, "refresh enqueue failed")
-        except Exception as mark_exc:
-            logger.error(
-                "Failed to mark document failed after refresh enqueue failure",
-                error=str(mark_exc),
-                document_id=document_id,
-            )
+        await mark_document_failed_with_retry(
+            database,
+            document_id,
+            workspace_id,
+            "refresh enqueue failed",
+            operation="refresh_enqueue",
+        )
         return [
             TextContent(
                 type="text",

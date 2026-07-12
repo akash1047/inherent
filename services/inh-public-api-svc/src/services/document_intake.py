@@ -16,6 +16,7 @@ from src.config import settings
 from src.config.constants import ALLOWED_MIME_TYPES, MAX_UPLOAD_SIZE_BYTES
 from src.core.exceptions import BadRequestError, ServiceUnavailableError
 from src.models.document import DocumentUploadResponse
+from src.services.compensation import mark_document_failed_with_retry
 from src.services.database import DatabaseService
 from src.services.mq import get_mq_service
 from src.services.storage import get_storage_service
@@ -188,15 +189,15 @@ async def intake_document(
             error=str(exc),
             document_id=document_id,
         )
-        enqueue_error = "ingestion enqueue failed"
-        try:
-            await database.mark_document_failed(document_id, workspace_id, enqueue_error)
-        except Exception as mark_exc:
-            logger.error(
-                "Failed to mark document as failed after enqueue failure",
-                error=str(mark_exc),
-                document_id=document_id,
-            )
+        # The mark is retried with backoff; on exhaustion the helper emits the
+        # CRITICAL log + metric that flag the orphaned 'pending' row (#99).
+        await mark_document_failed_with_retry(
+            database,
+            document_id,
+            workspace_id,
+            "ingestion enqueue failed",
+            operation="upload_enqueue",
+        )
 
         return DocumentUploadResponse(
             document_id=document_id,
