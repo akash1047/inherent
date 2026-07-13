@@ -7,7 +7,7 @@ All notable changes to Inherent are documented here. The format follows
 
 Nothing yet.
 
-## [0.5.0] — 2026-07-12 — Org-readiness program
+## [0.5.0] — 2026-07-13 — Org-readiness program
 
 Repository-level release tag, continuing from the last published tag
 `v0.4.1` (an out-of-band ingestion-svc hotfix — see below). `v0.1.0`/
@@ -19,6 +19,21 @@ package versions (independent of this tag) moved to `inh-contracts` 2.0.0,
 
 ### Fixed
 
+- **Re-uploading identical content no longer re-indexes it (#109).** A
+  content-hash dedup match (#75) means the exact bytes are already ingested, so
+  the shared `document_intake` (REST + MCP) now returns the existing document
+  as-is instead of resetting its row to `pending` and re-running
+  extract→chunk→embed→index. Besides saving the agent redundant compute, this
+  removes a hazard: because the ingestion workflow id is fixed per document,
+  a redundant re-index could serialize behind the in-flight run and strand the
+  document non-`processed` for minutes under load. Filename-dedup and
+  edited-content re-uploads (#60) differ in content_hash and still re-index; a
+  match on a `failed` document still re-indexes to recover. The deeper
+  fixed-workflow-id re-index stall (still reachable via edited-content re-upload
+  and refresh under load) is tracked in #110. Also un-blocks the Compose e2e
+  release gate (`integration.yml`), which had been red since the per-key rate
+  limiter (#5) 429'd the throughput-heavy compose suite — the CI stack now runs
+  rate-limiting disabled (local/dev + release parity unchanged).
 - **Compensating mark-failed writes are retried (#99).** When an MQ publish
   fails and the compensating `mark_document_failed` write also fails, the mark
   is now retried with exponential backoff (3 attempts) via the new

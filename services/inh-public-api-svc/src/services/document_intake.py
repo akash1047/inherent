@@ -103,6 +103,38 @@ async def intake_document(
             filename=filename,
             dedup_reason=dedup_reason,
         )
+
+        # Identical-content short-circuit (#75). A content-hash match means the
+        # exact bytes are already known to this workspace, so re-running the
+        # extract→chunk→embed→index pipeline would produce byte-identical chunks
+        # and embeddings — pure wasted compute for the agent. It is also unsafe
+        # under load: the ingestion workflow id is fixed per document
+        # (`ingest-{document_id}`), so a redundant re-index serializes behind the
+        # in-flight one and can leave the document stranded non-'processed' for
+        # minutes. Unless the existing document actually needs recovery (status
+        # 'failed'), return it as-is without re-uploading, resetting the row, or
+        # re-enqueuing. Filename dedup and edited-content re-uploads (#60) have a
+        # DIFFERENT content_hash, so they still fall through and re-index.
+        if dedup_reason == "content_hash":
+            existing = await database.get_document(document_id, workspace_id)
+            if existing is not None and existing.status != "failed":
+                upload_fields = await database.get_document_upload_fields(document_id, workspace_id)
+                logger.info(
+                    "Identical content already ingested; skipping redundant re-index",
+                    document_id=document_id,
+                    workspace_id=workspace_id,
+                    status=existing.status,
+                )
+                return DocumentUploadResponse(
+                    document_id=document_id,
+                    name=existing.name,
+                    workspace_id=workspace_id,
+                    storage_url=(upload_fields or {}).get("storage_url") or "",
+                    mime_type=existing.mime_type or content_type,
+                    size_bytes=existing.size_bytes or size_bytes,
+                    status=existing.status,
+                    message="Identical content already ingested; returning existing document.",
+                )
     else:
         document_id = str(uuid.uuid4())
         logger.info(
