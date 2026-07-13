@@ -300,6 +300,13 @@ services:
       AWS_S3_REGION: ${AWS_REGION:-us-east-1}
       EMBEDDING_SERVICE_URL: http://text-embeddings-inference:80
       EMBEDDING_DIM: 384
+      # Rate limiting is ON by default for local/dev parity with the release
+      # stack. CI's compose e2e (integration + retrieval evals + throughput
+      # benchmarks) deliberately bursts far past any per-minute limit on the
+      # single bootstrapped dev key, so it exports RATE_LIMIT_ENABLED=false to
+      # exercise the ingestion→search path unthrottled. Rate-limit behavior has
+      # its own offline coverage (tests/integration/test_rate_limiting.py).
+      RATE_LIMIT_ENABLED: ${RATE_LIMIT_ENABLED:-true}
       LOG_LEVEL: INFO
     depends_on:
       postgres-init:

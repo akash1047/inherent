@@ -91,6 +91,17 @@ search_errors_total = Counter(
     ["mode", "error_type"],
 )
 
+# Compensation metrics (#99)
+# Labeled by operation (bounded set: upload_enqueue, refresh_enqueue), never
+# by document/workspace id — those are unbounded (#20) and live in the
+# CRITICAL log line emitted alongside this counter.
+document_compensation_exhausted_total = Counter(
+    "document_compensation_exhausted_total",
+    "Compensating mark-failed writes that exhausted retries, leaving a "
+    "document orphaned as 'pending' (#99) — alert on any increase",
+    ["operation"],
+)
+
 # Health check metrics
 HEALTH_CHECK_STATUS = Gauge(
     "health_check_status",
@@ -167,6 +178,11 @@ def record_search_chunks_missing_token_count(count: int) -> None:
 def record_search_error(mode: str, error_type: str) -> None:
     """Record a search error by mode and error type."""
     search_errors_total.labels(mode=mode, error_type=error_type).inc()
+
+
+def record_compensation_exhausted(operation: str) -> None:
+    """Record a compensating mark-failed write that exhausted its retries (#99)."""
+    document_compensation_exhausted_total.labels(operation=operation).inc()
 
 
 def set_health_status(component: str, status: str) -> None:

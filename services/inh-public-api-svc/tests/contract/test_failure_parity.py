@@ -196,15 +196,10 @@ class TestDeleteVectorStoreDownParity:
 class TestUploadDoubleFailureRecovery:
     """When MQ publish fails AND mark_document_failed also fails, the document
     is orphaned: DB says 'pending', the response says 'failed', and nothing can
-    reconcile them. #99 asks for a retry (then alert/flag) so the divergence
-    can't happen silently."""
+    reconcile them. #99: the mark is retried with backoff; exhaustion emits a
+    CRITICAL log + document_compensation_exhausted_total so the divergence is
+    never silent (see src/services/compensation.py)."""
 
-    @pytest.mark.xfail(
-        reason="#99: mark_document_failed is attempted once and its failure is "
-        "swallowed — no retry, no metric, orphaned 'pending' row. Remove this "
-        "marker when the recovery contract is implemented.",
-        strict=False,
-    )
     async def test_upload_mark_failed_failure_is_retried(self):
         key = _write_key()
         db = _mock_db()
@@ -227,9 +222,11 @@ class TestUploadDoubleFailureRecovery:
         application.dependency_overrides[get_database] = lambda: db
         try:
             with (
-                patch("src.api.v1.documents.get_storage_service", return_value=storage),
+                # Upload storage/MQ acquisition lives in the shared intake
+                # pipeline since #87 — patch there, not the REST module.
+                patch("src.services.document_intake.get_storage_service", return_value=storage),
                 patch(
-                    "src.api.v1.documents.get_mq_service",
+                    "src.services.document_intake.get_mq_service",
                     new_callable=AsyncMock,
                     return_value=failing_mq,
                 ),
@@ -248,4 +245,66 @@ class TestUploadDoubleFailureRecovery:
         assert response.json()["status"] == "failed"
         # The recovery half is the #99 ask: the failed mark must be retried so
         # a transient DB blip can't orphan the row as 'pending'.
+        assert db.mark_document_failed.await_count >= 2
+
+
+# ---------------------------------------------------------------------------
+# Refresh: the compensating mark itself fails — both surfaces (#99 sweep)
+# ---------------------------------------------------------------------------
+
+
+class TestRefreshDoubleFailureRecoveryParity:
+    """The #99 orphan exists on every compensation site, not just upload: the
+    refresh handlers (REST and MCP) also mark the pending reset failed when MQ
+    is down, and that mark can itself fail. Both surfaces must retry the mark
+    (same helper, same contract) so no surface can silently strand a document
+    as 'pending'."""
+
+    async def test_rest_refresh_mark_failed_failure_is_retried(self):
+        key = _write_key()
+        db = _mock_db()
+        db.mark_document_failed = AsyncMock(side_effect=RuntimeError("db degraded"))
+        failing_mq = AsyncMock()
+        failing_mq.publish = AsyncMock(side_effect=RuntimeError("mq down"))
+
+        application = create_app()
+        application.dependency_overrides[resolve_workspace_write] = lambda: ResolvedAuth(
+            key_info=key, workspace_id=WS
+        )
+        application.dependency_overrides[get_database] = lambda: db
+        try:
+            with patch(
+                "src.api.v1.documents.get_mq_service",
+                new_callable=AsyncMock,
+                return_value=failing_mq,
+            ):
+                transport = ASGITransport(app=application)
+                async with AsyncClient(transport=transport, base_url="http://test") as ac:
+                    response = await ac.post(
+                        "/v1/documents/doc-1/refresh",
+                        headers={"X-API-Key": "ink_test_key"},
+                    )
+        finally:
+            application.dependency_overrides.clear()
+
+        # Response half: the caller sees a real error, never success.
+        assert response.status_code == 503
+        # Recovery half: the failed mark is retried, not swallowed.
+        assert db.mark_document_failed.await_count >= 2
+
+    async def test_mcp_refresh_mark_failed_failure_is_retried(self):
+        db = _mock_db()
+        db.mark_document_failed = AsyncMock(side_effect=RuntimeError("db degraded"))
+        failing_mq = AsyncMock()
+        failing_mq.publish = AsyncMock(side_effect=RuntimeError("mq down"))
+
+        with patch("src.services.mq.get_mq_service", new=AsyncMock(return_value=failing_mq)):
+            result = await _call_mcp_tool(
+                "refresh_stale_source",
+                {"api_key": "ink_k", "document_id": "doc-1"},
+                db,
+            )
+
+        # Parity with REST: error surfaced AND the mark retried.
+        assert "Error" in result[0].text
         assert db.mark_document_failed.await_count >= 2

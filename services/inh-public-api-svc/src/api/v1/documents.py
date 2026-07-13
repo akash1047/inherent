@@ -9,6 +9,7 @@ from src.config import settings
 from src.core.exceptions import BadRequestError, ServiceUnavailableError
 from src.models.document import Document, DocumentListResponse, DocumentUploadResponse
 from src.services.auth import ResolvedAuth, resolve_workspace_read, resolve_workspace_write
+from src.services.compensation import mark_document_failed_with_retry
 from src.services.database import DatabaseService, get_database
 from src.services.deletion import delete_document_everywhere
 from src.services.document_intake import intake_document
@@ -326,15 +327,15 @@ async def refresh_document(
             error=str(exc),
             document_id=document_id,
         )
-        enqueue_error = "refresh enqueue failed"
-        try:
-            await database.mark_document_failed(document_id, workspace_id, enqueue_error)
-        except Exception as mark_exc:
-            logger.error(
-                "Failed to mark document failed after refresh enqueue failure",
-                error=str(mark_exc),
-                document_id=document_id,
-            )
+        # The mark is retried with backoff; on exhaustion the helper emits the
+        # CRITICAL log + metric that flag the orphaned 'pending' row (#99).
+        await mark_document_failed_with_retry(
+            database,
+            document_id,
+            workspace_id,
+            "refresh enqueue failed",
+            operation="refresh_enqueue",
+        )
         raise ServiceUnavailableError(
             service_name="mq",
             detail="Failed to queue the document for re-processing. Please try again later.",

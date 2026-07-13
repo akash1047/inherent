@@ -19,7 +19,11 @@ Guidance for working in this repository.
 
 ## Defect Prevention
 
-Rules from the #98/#99/#100 retrospective. Apply before closing any task:
+Rules from the #98/#99/#100 retrospective. Apply before closing any task.
+Durable lessons behind these rules live in
+[docs/developer/learnings.md](docs/developer/learnings.md) — read the matching
+entry before touching a related area; add one when a shipped defect teaches
+something new.
 
 - **Pattern sweep**: after fixing a bug, grep both services for the same defect
   pattern. State the sweep result (hits or "clean") in the PR description.
@@ -30,7 +34,10 @@ Rules from the #98/#99/#100 retrospective. Apply before closing any task:
   any pair you touch in
   `services/inh-public-api-svc/tests/contract/test_failure_parity.py`.
 - **Compensate state mutations**: a state write followed by a publish (or any
-  second fallible step) needs a tested compensating mark-failed path.
+  second fallible step) needs a tested compensating mark-failed path. The
+  compensation is itself fallible (#99): route it through
+  `services/inh-public-api-svc/src/services/compensation.py::mark_document_failed_with_retry`
+  — never a bare `mark_document_failed` inside an `except` block.
   Log-and-swallow is acceptable only for observability side-channels (metrics,
   lineage, audit) — never when it leaves persistent state contradicting the
   response.

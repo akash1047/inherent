@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import uuid
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -78,6 +79,11 @@ def mock_db():
     db.get_document_id_by_filename = AsyncMock(return_value=None)
     db.create_or_reset_pending_document = AsyncMock(return_value=None)
     db.mark_document_failed = AsyncMock(return_value=None)
+    # Default off for the identical-content short-circuit: no existing row and
+    # no stored upload fields, so an unrelated test can't trip the fast path via
+    # a bare AsyncMock (which would await to a non-str storage_url/status).
+    db.get_document = AsyncMock(return_value=None)
+    db.get_document_upload_fields = AsyncMock(return_value=None)
     return db
 
 
@@ -888,12 +894,26 @@ class TestUploadContentDedup:
 
         This is the #75 flood case: filename dedup would MISS (returns None) but
         content-hash dedup must still reuse the existing document_id so a verbatim
-        copy does not create a duplicate document/chunks/embeddings.
+        copy does not create a duplicate document/chunks/embeddings. Because the
+        original is already 'processed', the identical-content short-circuit
+        returns it as-is with no redundant re-index.
         """
         existing_id = "original-doc-id-abc"
         mock_db.get_document_id_by_content_hash = AsyncMock(return_value=existing_id)
         # Filename dedup would NOT match — the copy has a different name.
         mock_db.get_document_id_by_filename = AsyncMock(return_value=None)
+        # The matched document already exists and is fully processed.
+        mock_db.get_document = AsyncMock(
+            return_value=SimpleNamespace(
+                status="processed",
+                name="guide.md",
+                mime_type="text/markdown",
+                size_bytes=8,
+            )
+        )
+        mock_db.get_document_upload_fields = AsyncMock(
+            return_value={"storage_url": "s3://inherent-documents/ws/orig/guide.md"}
+        )
 
         application = self._app(write_key, mock_db, mock_storage, mock_mq)
         with (
@@ -918,11 +938,12 @@ class TestUploadContentDedup:
         # Filename dedup must never have been the deciding factor: content match
         # short-circuits, so the filename lookup is not even consulted.
         mock_db.get_document_id_by_filename.assert_not_awaited()
-        # The reused id propagates to the pending row and the MQ message.
-        assert (
-            mock_db.create_or_reset_pending_document.call_args.kwargs["document_id"] == existing_id
-        )
-        assert mock_mq.publish.call_args[0][1]["document_id"] == existing_id
+        # Identical, already-processed content is returned as-is: no pending-row
+        # reset and no re-enqueue, so a verbatim copy can never create duplicate
+        # chunks/embeddings (#75) — and can't strand the doc via a redundant
+        # re-index under load.
+        mock_db.create_or_reset_pending_document.assert_not_awaited()
+        mock_mq.publish.assert_not_awaited()
         application.dependency_overrides.clear()
 
     async def test_distinct_content_gets_distinct_document_ids(
@@ -1003,9 +1024,23 @@ class TestUploadContentDedup:
             by_hash.setdefault(kwargs["content_hash"], kwargs["document_id"])
             by_name.setdefault(kwargs["original_filename"], kwargs["document_id"])
 
+        async def _get(document_id, workspace_id):
+            # A stored document is fully processed, so the second and third
+            # verbatim copies hit the identical-content short-circuit and
+            # collapse onto it without re-indexing.
+            if document_id in set(by_hash.values()):
+                return SimpleNamespace(
+                    status="processed",
+                    name="guide.md",
+                    mime_type="text/markdown",
+                    size_bytes=10,
+                )
+            return None
+
         mock_db.get_document_id_by_content_hash = AsyncMock(side_effect=_by_hash)
         mock_db.get_document_id_by_filename = AsyncMock(side_effect=_by_name)
         mock_db.create_or_reset_pending_document = AsyncMock(side_effect=_create)
+        mock_db.get_document = AsyncMock(side_effect=_get)
 
         application = self._app(write_key, mock_db, mock_storage, mock_mq)
         body = b"# API Authentication Guide\nidentical bytes across all copies"
