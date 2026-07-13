@@ -5,14 +5,13 @@ terraform {
   # State (*.tfstate) is remote via Hetzner Object Storage (S3-compatible)
   # — never commit state files.
   #
-  # Prod / long-lived: copy backend.hcl.example → backend.hcl (stable key,
-  #   e.g. inherent/prod/...), set AWS_* env,
+  # All paths use Hetzner Object Storage (S3-compatible) via partial backend "s3".
+  # Prod / long-lived: backend.hcl stable key (e.g. inherent/prod/...), AWS_* env,
   #   then: terraform init -backend-config=backend.hcl
-  # CI e2e:            S3 backend with inherent/ci/<run_id>/terraform.tfstate
-  #   via workflow-generated backend-ci.hcl; never the prod key.
-  # Laptop throwaway:  temporary *_override.tf with backend "local" {},
-  #   then: terraform init -reconfigure (local override only; not for CI).
-  #   Plain -backend=false is not enough with an empty partial s3 backend.
+  # Laptop test:       backend.hcl key e.g. inherent/local/laptop/terraform.tfstate
+  #   (see docs/getting-started/local-vm-test.md). Never prod or CI keys.
+  # CI e2e:            backend-ci.hcl with inherent/ci/<run_id>/terraform.tfstate
+  #   Never the prod key.
   backend "s3" {}
 
   required_providers {

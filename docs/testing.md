@@ -78,6 +78,10 @@ make test-integration   # public-api compose suite (stack must be up)
 **Local compose CI:** `.github/workflows/integration.yml` (or `make test-integration`
 against a laptop stack).
 
+**Laptop Hetzner VM (manual):** [getting-started/local-vm-test.md](getting-started/local-vm-test.md)
+— Terraform apply from your machine with Object Storage remote state, smoke
+`/health`, optional bootstrap and `pytest -m compose`. Destroy when done.
+
 **Hetzner production-path e2e:** `.github/workflows/hetzner-e2e.yml` — Terraform
 apply on Hetzner (remote state key `inherent/ci/<run_id>/terraform.tfstate`),
 bootstrap, then public-api `pytest -m compose` against the VM. Not a PR gate.

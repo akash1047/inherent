@@ -91,12 +91,12 @@ Pick one init path:
 | Path | When | State key / backend | Init |
 |------|------|---------------------|------|
 | **Prod / long-lived** | Stable prod VM | `backend.hcl` stable key (e.g. `inherent/prod/...`) | copy `backend.hcl.example` → `backend.hcl`, set `AWS_*` env, `terraform init -backend-config=backend.hcl` |
+| **Laptop test** | Local experiments | `backend.hcl` key e.g. `inherent/local/laptop/...` | same Object Storage; see [local-vm-test.md](local-vm-test.md) |
 | **CI e2e** | GHA Hetzner e2e | Object Storage `inherent/ci/<github.run_id>/terraform.tfstate` via workflow-generated `backend-ci.hcl` | see [infra/README.md § CI e2e](../../infra/README.md#ci-e2e) |
-| **Laptop throwaway** | Local experiments | temporary local backend override | write `backend "local"` override + `terraform init -reconfigure` |
 
 - `.terraform.lock.hcl` is the **provider lock** — committed to git.
 - `*.tfstate` is **state** — never commit; remote state uses Hetzner Object Storage (S3-compatible).
-- **Hard rule:** never point CI at the production state key.
+- **Hard rule:** never point CI or laptop tests at the production state key.
 - Operator creates the Object Storage bucket and S3 keys in the Hetzner console (out of band).
 
 ### Remote state (production)
@@ -112,25 +112,11 @@ export AWS_DEFAULT_REGION="eu-central"
 terraform init -backend-config=backend.hcl
 ```
 
-### Laptop throwaway (local override only)
+### Laptop test (Object Storage)
 
-Empty partial `backend "s3" {}` still requires a configured backend for
-`plan`/`apply`. For laptop throwaway runs only — not CI — override to local
-(do not commit the override):
-
-```bash
-cat > zzz_local_backend_override.tf <<'EOF'
-terraform {
-  backend "local" {
-    path = "terraform.tfstate"
-  }
-}
-EOF
-terraform init -input=false -reconfigure
-```
-
-Init downloads the Hetzner provider; the lock file is already committed.
-Remove the override file when you switch back to Object Storage init.
+Step-by-step smoke path (remote state, bootstrap, destroy):
+[local-vm-test.md](local-vm-test.md). Uses the same S3 backend with a dedicated
+key such as `inherent/local/laptop/terraform.tfstate`.
 
 ### CI e2e (remote state)
 
