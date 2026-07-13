@@ -28,8 +28,8 @@ cp terraform.tfvars.example terraform.tfvars
 | Path | When | State key / backend | Init |
 |------|------|---------------------|------|
 | **Prod / long-lived** | Stable prod VM | `backend.hcl` stable key (e.g. `inherent/prod/...`) | copy `backend.hcl.example` → `backend.hcl`, set `AWS_*` env, `terraform init -backend-config=backend.hcl` |
+| **Laptop test** | Local experiments | `backend.hcl` key e.g. `inherent/local/laptop/terraform.tfstate` | same Object Storage backend; set `HCLOUD_TOKEN` + S3 `AWS_*`; full steps: [docs/getting-started/local-vm-test.md](../docs/getting-started/local-vm-test.md) |
 | **CI e2e** | GHA Hetzner e2e | Object Storage `inherent/ci/<github.run_id>/terraform.tfstate` via workflow-generated `backend-ci.hcl` | workflow runs `terraform init -reconfigure -backend-config=backend-ci.hcl` |
-| **Laptop throwaway** | Local experiments | temporary local backend override | write `backend "local"` override + `terraform init -reconfigure` |
 
 - `.terraform.lock.hcl` is the **provider lock** — committed to git.
 - `*.tfstate` is **state** — never commit; remote state uses Hetzner Object Storage (S3-compatible).
@@ -49,29 +49,23 @@ export AWS_DEFAULT_REGION="eu-central"
 terraform init -backend-config=backend.hcl
 ```
 
-#### Laptop throwaway (local override only)
+#### Laptop test (Object Storage, dedicated key)
 
-Empty partial `backend "s3" {}` still requires a configured backend for
-`plan`/`apply`. For laptop throwaway runs only — not CI — override to local
-(do not commit the override):
+Use the same S3 backend as prod, with a **dedicated** state key (e.g.
+`inherent/local/laptop/terraform.tfstate`). Export credentials however you prefer:
 
 ```bash
-cat > zzz_local_backend_override.tf <<'EOF'
-terraform {
-  backend "local" {
-    path = "terraform.tfstate"
-  }
-}
-EOF
-terraform init -input=false -reconfigure
-# Review / provision
-terraform plan
-terraform apply
-# Remove override when done so prod init stays S3-oriented
-rm zzz_local_backend_override.tf
+export HCLOUD_TOKEN="<hetzner-cloud-api-token>"
+export AWS_ACCESS_KEY_ID="<hetzner-object-storage-access-key>"
+export AWS_SECRET_ACCESS_KEY="<hetzner-object-storage-secret-key>"
+export AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-eu-central}"
+
+# backend.hcl: bucket + endpoint + key=inherent/local/laptop/terraform.tfstate
+terraform init -input=false -reconfigure -backend-config=backend.hcl
 ```
 
-CI e2e does **not** use local state; see [CI e2e](#ci-e2e) below.
+Full steps: [docs/getting-started/local-vm-test.md](../docs/getting-started/local-vm-test.md).
+CI e2e uses `inherent/ci/<run_id>/` — see [CI e2e](#ci-e2e) below.
 
 ## What happens
 
