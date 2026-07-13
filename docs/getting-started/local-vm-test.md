@@ -6,7 +6,7 @@ release Compose stack via cloud-init, smoke-test the Public API, then destroy.
 **Costs real Hetzner money.** Destroy when finished.
 
 State lives in **Hetzner Object Storage** (S3-compatible) — same backend style as
-prod/CI. Do **not** use a local `backend "local"` override.
+prod/CI, with a dedicated laptop state key.
 
 For long-lived production deploys (stable state key, firewall lockdown), see
 [production.md](production.md) and [infra/README.md](../../infra/README.md).
@@ -83,13 +83,9 @@ skip_requesting_account_id  = true
 use_path_style              = true
 ```
 
-Init:
+Init (from `infra/`):
 
 ```bash
-# still in infra/
-# Ensure no leftover local override from older docs
-rm -f zzz_local_backend_override.tf zzz_*_backend_override.tf
-
 terraform init -input=false -reconfigure -backend-config=backend.hcl
 ```
 
@@ -288,7 +284,6 @@ Prefer a **versioned** `inherent_version` (e.g. `0.4.x` after a known-good publi
 | Symptom | Check |
 | --- | --- |
 | `terraform init` wants S3 / AWS creds | Export `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`; confirm `backend.hcl` |
-| Init still picks local backend | Remove `zzz_*_backend_override.tf`; re-run `terraform init -reconfigure -backend-config=backend.hcl` |
 | State key conflict | Use `inherent/local/...` — do not share prod or CI keys |
 | Empty or wrong SSH | `ssh_public_key_path` exists; key registered as `ssh_key_name` |
 | Compose file download fails | `compose_git_ref` exists on GitHub with `docker-compose.release.yml` |
