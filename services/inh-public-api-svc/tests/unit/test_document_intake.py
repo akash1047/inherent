@@ -271,9 +271,7 @@ class TestIntakeDocumentDedup:
         mock_mq.publish.assert_not_awaited()
         mock_storage.upload_file.assert_not_awaited()
 
-    async def test_content_hash_match_failed_doc_reindexes(
-        self, mock_db, mock_storage, mock_mq
-    ):
+    async def test_content_hash_match_failed_doc_reindexes(self, mock_db, mock_storage, mock_mq):
         """A content match on a 'failed' document must still re-index to recover."""
         existing_id = "failed-doc-id"
         mock_db.get_document_id_by_content_hash = AsyncMock(return_value=existing_id)

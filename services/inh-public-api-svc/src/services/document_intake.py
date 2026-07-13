@@ -118,9 +118,7 @@ async def intake_document(
         if dedup_reason == "content_hash":
             existing = await database.get_document(document_id, workspace_id)
             if existing is not None and existing.status != "failed":
-                upload_fields = await database.get_document_upload_fields(
-                    document_id, workspace_id
-                )
+                upload_fields = await database.get_document_upload_fields(document_id, workspace_id)
                 logger.info(
                     "Identical content already ingested; skipping redundant re-index",
                     document_id=document_id,
