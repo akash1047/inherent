@@ -30,6 +30,12 @@ jobs:
         run: cp .env.example .env
 
       - name: Start the Compose stack
+        # The compose suite (throughput benchmark especially) issues far more
+        # than the default 100 req/min per key, so run the stack unthrottled;
+        # rate-limit enforcement is covered by the offline suites. Compose reads
+        # RATE_LIMIT_ENABLED from the shell env for its ${VAR:-true} default.
+        env:
+          RATE_LIMIT_ENABLED: "false"
         run: docker compose up -d --build --wait
 
       - name: Wait for the public API to be healthy
