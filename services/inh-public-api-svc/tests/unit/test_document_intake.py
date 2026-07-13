@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import uuid
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -30,6 +31,11 @@ def mock_db():
     db.get_document_id_by_filename = AsyncMock(return_value=None)
     db.create_or_reset_pending_document = AsyncMock(return_value=None)
     db.mark_document_failed = AsyncMock(return_value=None)
+    # Default: no existing row, so the identical-content short-circuit is off
+    # unless a test opts in (see TestIntakeDocumentDedup). A bare AsyncMock
+    # would otherwise auto-return a truthy mock and mis-trigger the fast path.
+    db.get_document = AsyncMock(return_value=None)
+    db.get_document_upload_fields = AsyncMock(return_value=None)
     return db
 
 
@@ -221,6 +227,80 @@ class TestIntakeDocumentDedup:
 
         assert result.document_id == existing_id
         mock_db.get_document_id_by_filename.assert_not_awaited()
+
+    async def test_content_hash_match_already_ingested_short_circuits(
+        self, mock_db, mock_storage, mock_mq
+    ):
+        """Identical content whose existing doc is not 'failed' must NOT re-index.
+
+        A content-hash match means the exact bytes are already known; re-running
+        the pipeline yields byte-identical chunks/embeddings (wasted compute) and
+        a redundant re-index can strand the document non-'processed' under load.
+        The fast path returns the existing document without resetting its row,
+        re-uploading to S3, or re-publishing an ingestion event.
+        """
+        existing_id = "already-ingested-id"
+        mock_db.get_document_id_by_content_hash = AsyncMock(return_value=existing_id)
+        mock_db.get_document = AsyncMock(
+            return_value=SimpleNamespace(
+                status="processed",
+                name="guide.md",
+                mime_type="text/markdown",
+                size_bytes=8,
+            )
+        )
+        mock_db.get_document_upload_fields = AsyncMock(
+            return_value={"storage_url": "s3://inherent-documents/ws/existing/guide.md"}
+        )
+
+        p1, p2 = _patches(mock_storage, mock_mq)
+        with p1, p2:
+            result = await document_intake.intake_document(
+                database=mock_db,
+                workspace_id="test-workspace-id",
+                user_id="test-user-id",
+                content_bytes=b"verbatim",
+                filename="guide-copy.md",
+                content_type="text/markdown",
+            )
+
+        assert result.document_id == existing_id
+        assert result.status == "processed"
+        # No side effects: the row is untouched and nothing is re-enqueued.
+        mock_db.create_or_reset_pending_document.assert_not_awaited()
+        mock_mq.publish.assert_not_awaited()
+        mock_storage.upload_file.assert_not_awaited()
+
+    async def test_content_hash_match_failed_doc_reindexes(
+        self, mock_db, mock_storage, mock_mq
+    ):
+        """A content match on a 'failed' document must still re-index to recover."""
+        existing_id = "failed-doc-id"
+        mock_db.get_document_id_by_content_hash = AsyncMock(return_value=existing_id)
+        mock_db.get_document = AsyncMock(
+            return_value=SimpleNamespace(
+                status="failed",
+                name="guide.md",
+                mime_type="text/markdown",
+                size_bytes=8,
+            )
+        )
+
+        p1, p2 = _patches(mock_storage, mock_mq)
+        with p1, p2:
+            result = await document_intake.intake_document(
+                database=mock_db,
+                workspace_id="test-workspace-id",
+                user_id="test-user-id",
+                content_bytes=b"verbatim",
+                filename="guide.md",
+                content_type="text/markdown",
+            )
+
+        assert result.document_id == existing_id
+        # Recovery: the row is reset and a fresh ingestion event is published.
+        mock_db.create_or_reset_pending_document.assert_awaited_once()
+        mock_mq.publish.assert_awaited_once()
 
     async def test_new_content_generates_new_uuid(self, mock_db, mock_storage, mock_mq):
         p1, p2 = _patches(mock_storage, mock_mq)
