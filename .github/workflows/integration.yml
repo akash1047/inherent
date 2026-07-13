@@ -98,9 +98,30 @@ jobs:
           uv sync --frozen --extra dev --group dev
           uv run pytest -m compose
 
+      - name: Dump document state on failure
+        if: failure()
+        # The compose tests fail as "document <id> not processed within Ns"
+        # without saying whether the doc errored, dead-lettered, or was just
+        # slow behind the worker backlog. Dump the full document + dead-letter
+        # tables so the fate of every doc is visible. Defensive (|| true) so a
+        # diagnostic hiccup never masks the real test failure.
+        run: |
+          echo "### processed_documents"
+          docker compose exec -T postgres psql -U postgres -d knowledge_base -P pager=off \
+            -c "SELECT document_id, status, error_message, chunk_count, created_at, processed_at FROM processed_documents ORDER BY created_at;" || true
+          echo "### dead_letter_jobs"
+          docker compose exec -T postgres psql -U postgres -d knowledge_base -P pager=off \
+            -c "SELECT job_id, status, error, created_at FROM dead_letter_jobs ORDER BY created_at;" || true
+
       - name: Dump Compose logs on failure
         if: failure()
-        run: docker compose logs --no-color --tail=200
+        # Full ingestion log (not tail-limited): the doc lifecycle — including
+        # any Temporal activity failure or dead-letter — is logged here, and a
+        # stuck doc's lines are near the START of a 10-minute run, beyond any
+        # short tail. Other services stay tail-limited to keep output readable.
+        run: |
+          echo "### ingestion (full)"; docker compose logs --no-color inh-ingestion-svc || true
+          echo "### other services (tail)"; docker compose logs --no-color --tail=200 || true
 
       - name: Tear down
         if: always()
