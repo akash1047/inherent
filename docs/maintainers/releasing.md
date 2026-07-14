@@ -1,3 +1,8 @@
+---
+search:
+  exclude: true
+---
+
 # Releasing
 
 This repository does not assume an automated release train.
@@ -21,8 +26,24 @@ This repository does not assume an automated release train.
    locally via `make dev` + `make test-integration`).
 3. Confirm the latest `integration.yml` (Compose e2e gate) and coverage floors
    are green in CI.
-4. Summarize user-visible changes in the release notes or tag message.
-5. Tag from a clean commit history that does not include private planning artifacts.
+4. Cut the changelog: rename `[Unreleased]` in `CHANGELOG.md` to
+   `[X.Y.Z] — YYYY-MM-DD — <one-line theme>` and add a fresh empty
+   `[Unreleased]` above it. Lead the new section with a 2–3 bullet
+   **TL;DR** before the category headings. Thanks to the CLAUDE.md
+   release-tagging rule, every shipped change is already listed — do not
+   reconstruct history at release time.
+5. Tag from a clean commit history that does not include unpublished or private planning artifacts (`docs/superpowers/` specs and plans are public by policy).
+6. Publish the GitHub Release after pushing the final tag:
+   ```bash
+   gh release create vX.Y.Z --verify-tag \
+     --title "vX.Y.Z — <one-line theme>" \
+     --notes-file <notes.md>
+   ```
+   Distill the notes from the changelog section: TL;DR first, then
+   Added/Changed/Fixed, then **Upgrade notes** (new migrations, new/changed
+   env vars, breaking changes). `-rcN` tags get `--prerelease`.
+7. Verify the `Docs` workflow deployed green on `main` and the site's
+   Release Notes page shows the new version.
 
 The full set of gating suites, coverage floors, and the README-claim → test
 mapping is in the
@@ -77,12 +98,12 @@ job runs without pausing.
    a reviewer approves the run in the **Actions** tab. Nothing is pushed to GHCR
    without that approval.
 5. After a **successful** Publish images run on a **final** `vX.Y.Z` tag (not
-   `-rcN`), [Hetzner e2e](../../.github/workflows/hetzner-e2e.yml) starts via
+   `-rcN`), [Hetzner e2e](https://github.com/inherent-prime/inherent/blob/main/.github/workflows/hetzner-e2e.yml) starts via
    `workflow_run`. It pins the same release for checkout, GHCR image tag
    `X.Y.Z`, and compose `compose_git_ref` (the tag). RC tags skip e2e.
 6. Re-run manually: Actions → **Hetzner e2e** → **Run workflow**. Form fields
    and examples (Use workflow from vs `ref`, image tag, `cpx32`) live in
-   [infra/README.md § Manual run](../../infra/README.md#manual-run-github-form).
+   [infra/README.md § Manual run](https://github.com/inherent-prime/inherent/blob/main/infra/README.md#manual-run-github-form).
    Short form: required `ref` (checkout + compose; must include `infra/`);
    optional `inherent_version` (GHCR tag; empty = strip leading `v` from `ref`);
    `server_type` default `cpx32`.

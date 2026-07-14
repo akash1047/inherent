@@ -26,3 +26,6 @@ eval-report.json
 .DS_Store
 
 graphify-out/
+
+# MkDocs build output
+site/

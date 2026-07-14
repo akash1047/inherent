@@ -88,7 +88,7 @@ bootstrap, then public-api `pytest -m compose` against the VM. Not a PR gate.
 
 - **Triggers:** successful **Publish images** on a final `vX.Y.Z` tag
   (`workflow_run`; RCs skipped), or manual **Run workflow** form.
-- **Form / inputs:** [infra/README.md § Manual run](../infra/README.md#manual-run-github-form)
+- **Form / inputs:** [infra/README.md § Manual run](https://github.com/inherent-prime/inherent/blob/main/infra/README.md#manual-run-github-form)
   — `ref` (required; checkout + compose; needs `infra/`), optional
   `inherent_version` (GHCR tag), `server_type` (default `cpx32`). “Use workflow
   from” only selects the workflow YAML branch.
@@ -101,9 +101,9 @@ bootstrap, then public-api `pytest -m compose` against the VM. Not a PR gate.
   input) — same infra README section.
 - **Local `act`:** optional laptop simulation of the workflow; see infra README
   § Local simulation and [audit/act-hetzner-e2e-weaviate-401.md](audit/act-hetzner-e2e-weaviate-401.md).
-  Smoke image parity before long runs ([releasing](maintainers/releasing.md#hetzner--act-e2e-image-parity)).
+  Smoke image parity before long runs ([releasing](maintainers/releasing.md#hetzner-act-e2e-image-parity)).
 
-See [infra/README.md](../infra/README.md#ci-e2e) and
+See [infra/README.md](https://github.com/inherent-prime/inherent/blob/main/infra/README.md#ci-e2e) and
 [releasing](maintainers/releasing.md#cutting-an-image-release).
 
 ## Markers

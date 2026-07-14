@@ -1,3 +1,8 @@
+---
+search:
+  exclude: true
+---
+
 # Engineering Learnings
 
 Durable lessons from defects that survived to `main`. CLAUDE.md references

@@ -7,6 +7,21 @@ Guidance for working in this repository.
 - Always thinks the end user as an AI agent, so always develop solutions that is performant and cost effective for the end user.
 - The Definition of Done is considered when all tests are passing and documentations is updated. 
 
+## Release Tagging & Docs
+
+- Every merged PR that changes behavior, API surface, configuration, or
+  deployment MUST add a one-line entry under `[Unreleased]` in
+  `CHANGELOG.md`, in a Keep a Changelog category (Added / Changed / Fixed /
+  Deprecated / Removed / Security), ending with `(#PR, #issue)` refs.
+  Docs-only, CI-only, and test-only changes are exempt. Cutting a release =
+  renaming `[Unreleased]` to the version — this is how every piece of work
+  is tagged to a release and categorized.
+- Update the docs a change invalidates (site pages under `docs/`, reference
+  pages, examples) in the same PR — the `Docs` CI check must stay green. At
+  release time the docs are already current: releasing is rename + tag +
+  publish (see [docs/maintainers/releasing.md](docs/maintainers/releasing.md)),
+  never a catch-up docs sweep.
+
 ## Coding Standards
 
 - Follow strict coding standard maximize for explanability to humans
