@@ -1,3 +1,8 @@
+---
+search:
+  exclude: true
+---
+
 # Release Acceptance Matrix
 
 The suites that must pass before tagging a release, why each exists, and the

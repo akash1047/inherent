@@ -1,3 +1,8 @@
+---
+search:
+  exclude: true
+---
+
 # Act Hetzner e2e failure — Weaviate 401 (stale public-api image)
 
 **Date:** 2026-07-11  
