@@ -5,6 +5,38 @@ this file — read the matching entry before touching the related area. Add an
 entry when a shipped defect teaches something a rule alone can't carry: one
 entry per root cause, newest first.
 
+## #112 — Writing release notes is not the same as publishing them (2026-07-13)
+
+**Defect.** `v0.5.0` shipped with a well-written annotated tag message and a
+matching `CHANGELOG.md` entry, but neither is where a consumer looks first.
+No tag — `v0.1.0`, `v0.4.1`, `v0.5.0` — had ever been published as a GitHub
+Release, so the Releases tab was empty. Separately, the GHCR package page for
+both images showed "No description provided": `publish.yml`'s "Build and
+push" step passed `labels: ${{ steps.meta.outputs.labels }}` but not
+`annotations:`, and for a multi-platform build GHCR's package UI reads OCI
+annotations on the manifest index, not labels baked into each per-arch image
+config — so the metadata `docker/metadata-action` generated never reached the
+registry UI.
+
+**Learnings.**
+
+- Writing content and publishing it to the surface people actually check are
+  two different steps. A checklist item that says "summarize changes" is
+  satisfied by content existing *somewhere*; it needs to name the destination
+  (Releases tab, package page) or it will be satisfied by content nobody
+  finds.
+- Multi-platform image metadata has two independent channels — `labels`
+  (per-arch image config) and `annotations` (manifest index) — and a registry
+  UI may read only one of them. When a build-push-action step consumes a
+  `metadata-action` output for one, check whether it should also consume the
+  other.
+
+**Mandatory pattern.** `docs/maintainers/releasing.md`'s checklist has an
+explicit "publish a GitHub Release from the tag" step; do not consider a
+release's notes done until that Release exists. `publish.yml`'s "Build and
+push" step passes both `labels:` and `annotations:` from `steps.meta.outputs`
+for both services — do not drop `annotations:` when touching that step.
+
 ## #99 — A compensating write is itself a fallible step (2026-07-12)
 
 **Defect.** `intake_document` marked a document `failed` after an MQ publish
