@@ -21,8 +21,24 @@ This repository does not assume an automated release train.
    locally via `make dev` + `make test-integration`).
 3. Confirm the latest `integration.yml` (Compose e2e gate) and coverage floors
    are green in CI.
-4. Summarize user-visible changes in the release notes or tag message.
+4. Cut the changelog: rename `[Unreleased]` in `CHANGELOG.md` to
+   `[X.Y.Z] — YYYY-MM-DD — <one-line theme>` and add a fresh empty
+   `[Unreleased]` above it. Lead the new section with a 2–3 bullet
+   **TL;DR** before the category headings. Thanks to the CLAUDE.md
+   release-tagging rule, every shipped change is already listed — do not
+   reconstruct history at release time.
 5. Tag from a clean commit history that does not include private planning artifacts.
+6. Publish the GitHub Release after pushing the final tag:
+   ```bash
+   gh release create vX.Y.Z --verify-tag \
+     --title "vX.Y.Z — <one-line theme>" \
+     --notes-file <notes.md>
+   ```
+   Distill the notes from the changelog section: TL;DR first, then
+   Added/Changed/Fixed, then **Upgrade notes** (new migrations, new/changed
+   env vars, breaking changes). `-rcN` tags get `--prerelease`.
+7. Verify the `Docs` workflow deployed green on `main` and the site's
+   Release Notes page shows the new version.
 
 The full set of gating suites, coverage floors, and the README-claim → test
 mapping is in the
