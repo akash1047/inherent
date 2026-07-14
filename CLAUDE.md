@@ -21,6 +21,17 @@ Guidance for working in this repository.
   release time the docs are already current: releasing is rename + tag +
   publish (see [docs/maintainers/releasing.md](docs/maintainers/releasing.md)),
   never a catch-up docs sweep.
+- **Naming — bare version, no codenames.** Release titles, git tags, and
+  `CHANGELOG.md` version headings are the version and nothing else:
+  `v0.5.0` / `## [0.5.0] — 2026-07-13`. Never a marketing codename or theme
+  ("Org-readiness program", "Ingestion hardening") — no ` — <name>` suffix,
+  ever. The narrative belongs in the release body, not the title.
+- **Release body — terse changelog, not prose.** The GitHub Release body is
+  the version's `CHANGELOG.md` entry condensed to one-line bullets under Keep
+  a Changelog categories (Added / Changed / Fixed / Security / Breaking /
+  Upgrade), each ending with `(#PR)`. Lead with a one-line package-versions
+  line; close with a link to `CHANGELOG.md`. No paragraph intro, no "TL;DR",
+  no emoji beyond `⚠️` on breaking bullets. Write for an agent scanning it.
 
 ## Coding Standards
 

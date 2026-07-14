@@ -13,7 +13,7 @@ All notable changes to Inherent are documented here. The format follows
   check builds with `--strict` on every PR. Release tagging + docs-currency
   rules added to `CLAUDE.md` and `docs/maintainers/releasing.md`. (#115)
 
-## [0.5.0] — 2026-07-13 — Org-readiness program
+## [0.5.0] — 2026-07-13
 
 Repository-level release tag, continuing from the last published tag
 `v0.4.1` (an out-of-band ingestion-svc hotfix — see below). `v0.1.0`/
@@ -256,7 +256,7 @@ A codescan-driven pass fixing correctness, isolation, and durability defects.
   `010_document_content_hash.sql` (nullable `content_hash` column + lookup
   index) plus unit coverage and a compose E2E content-flood regression test.
 
-## [0.4.1] — 2026-07-04 — ingestion-svc NUL-byte fix
+## [0.4.1] — 2026-07-04
 
 Out-of-band repository-level hotfix tag, published ahead of the 0.5.0
 org-readiness release above (this entry was backfilled retroactively — the
