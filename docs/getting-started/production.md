@@ -272,7 +272,7 @@ not traverse the firewall.
 
 ## Next Steps
 
-- Browse [docs/README.md](../index.md) for the full documentation index.
+- Browse [the docs index](../index.md) for the full documentation index.
 - Open the Public API docs at `http://<server-ip>:18000/docs`.
 - Temporal UI is **not** opened on the Hetzner firewall (only 22, 18000, ICMP).
   Reach it via SSH tunnel:

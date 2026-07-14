@@ -24,6 +24,7 @@ on:
       - "SECURITY.md"
       - "SUPPORT.md"
       - ".github/workflows/docs.yml"
+  workflow_dispatch:
 
 permissions:
   contents: read

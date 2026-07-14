@@ -24,7 +24,7 @@ and binds all datastore ports to `127.0.0.1`.
 | --- | --- | --- |
 | `SERVICE_MODE` | `both` | `api`, `mcp`, or `both` (`both` starts REST; run MCP as a separate `mcp` process) |
 | `PORT` / `API_PORT` | `8080` / unset | HTTP port; `API_PORT` overrides `PORT` when set |
-| `MCP_PORT` | `8001` | MCP server port |
+| `MCP_PORT` | `8001` | Reserved — unused; MCP runs on stdio (see the MCP tools reference) |
 | `ENVIRONMENT` | `development` | `development`/`production`; gates HSTS and CORS behavior |
 | `LOG_LEVEL` | `INFO` | Logging verbosity |
 
@@ -32,7 +32,7 @@ and binds all datastore ports to `127.0.0.1`.
 
 | Variable | Default | Effect | Secret |
 | --- | --- | --- | --- |
-| `DATABASE_URL` | `postgresql://postgres:postgres@localhost:5432/knowledge_base` | Read-only PostgreSQL connection | yes |
+| `DATABASE_URL` | `postgresql://postgres:postgres@localhost:5432/knowledge_base` | PostgreSQL connection (reads + document/eval writes) | yes |
 | `MONGODB_URI` | `mongodb://localhost:27017/main` | Read-only Mongo for workspace/user ownership | yes |
 | `MONGODB_DB_NAME` | `main` | Mongo database name | no |
 | `WEAVIATE_URL` | unset | Full Weaviate URL; overrides host/port below | no |

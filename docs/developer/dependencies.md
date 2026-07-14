@@ -1,3 +1,8 @@
+---
+search:
+  exclude: true
+---
+
 # Dependency & Dev-Tooling Conventions
 
 This monorepo contains three Python packages, each with its own
@@ -92,5 +97,5 @@ Service-specific dev deps stay local to the service that needs them, e.g.
 
 The repo-root [`.pre-commit-config.yaml`](https://github.com/inherent-prime/inherent/blob/main/.pre-commit-config.yaml) is the
 canonical hook set and shells out to each service's `uv run`, so hooks always
-use the pinned versions above. See [CONTRIBUTING.md](../community/contributing.md) for
+use the pinned versions above. See [Contributing](../community/contributing.md) for
 install/run instructions.

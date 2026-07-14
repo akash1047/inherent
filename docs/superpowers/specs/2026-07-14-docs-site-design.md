@@ -42,7 +42,7 @@ release tagging + docs currency a mandatory, categorizable part of every change.
 | Architecture | `adr/README.md` + ADRs 0001–0003, `threat-models/rag-poisoning-injection.md` |
 | Community | root `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `SECURITY.md`, `SUPPORT.md` rendered on-site (same include mechanism as CHANGELOG) |
 
-Not in nav (stay repo-only): `docs/audit/` test reports, `docs/maintainers/`
+Not in nav (built but unlisted; excluded from site search): `docs/audit/` test reports, `docs/maintainers/`
 (linked from Community/Contributing prose, not a consumer tab),
 `docs/superpowers/` specs/plans, `docs/developer/` internals (linked from
 Contributing), `docs/examples/` non-Markdown assets (bruno, postman, scripts —

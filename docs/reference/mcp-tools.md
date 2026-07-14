@@ -45,7 +45,7 @@ All tools require `api_key` (string). Additional parameters below.
 
 | Tool | Parameters | Purpose | REST twin |
 | --- | --- | --- | --- |
-| `upload_document` | `filename`, `content` (required); `content_type` (`text/markdown` default — `text/plain`, `text/csv`, `text/html` accepted), `workspace_id` | **Text-only** ingestion sharing REST's validate/dedup/store/enqueue pipeline. Binary formats (PDF/DOCX/PNG) are REST-only — use `POST /v1/documents`. If the key owns several workspaces, `workspace_id` is required | `POST /v1/documents` |
+| `upload_document` | `filename`, `content` (required); `content_type` (`text/markdown` default — `text/plain`, `text/csv`, `text/html` accepted), `workspace_id` | **Text-only** ingestion sharing REST's validate/dedup/store/enqueue pipeline. Binary formats (PDF/DOCX/PNG) and JSON are REST-only — use `POST /v1/documents`. If the key owns several workspaces, `workspace_id` is required | `POST /v1/documents` |
 | `delete_document` | `document_id` (required) | Permanently delete document + vectors + chunks + stored bytes | `DELETE /v1/documents/{id}` |
 | `refresh_stale_source` | `document_id` (required) | Re-enqueue an uploaded document to clear staleness; on MQ failure a retried best-effort compensation marks it `failed`, matching REST (see the REST reference for exhaustion behavior) | `POST /v1/documents/{id}/refresh` |
 

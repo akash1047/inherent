@@ -1,3 +1,8 @@
+---
+search:
+  exclude: true
+---
+
 # Releasing
 
 This repository does not assume an automated release train.
@@ -27,7 +32,7 @@ This repository does not assume an automated release train.
    **TL;DR** before the category headings. Thanks to the CLAUDE.md
    release-tagging rule, every shipped change is already listed — do not
    reconstruct history at release time.
-5. Tag from a clean commit history that does not include private planning artifacts.
+5. Tag from a clean commit history that does not include unpublished or private planning artifacts (`docs/superpowers/` specs and plans are public by policy).
 6. Publish the GitHub Release after pushing the final tag:
    ```bash
    gh release create vX.Y.Z --verify-tag \
