@@ -27,21 +27,24 @@ This repository does not assume an automated release train.
 3. Confirm the latest `integration.yml` (Compose e2e gate) and coverage floors
    are green in CI.
 4. Cut the changelog: rename `[Unreleased]` in `CHANGELOG.md` to
-   `[X.Y.Z] — YYYY-MM-DD — <one-line theme>` and add a fresh empty
-   `[Unreleased]` above it. Lead the new section with a 2–3 bullet
-   **TL;DR** before the category headings. Thanks to the CLAUDE.md
+   `[X.Y.Z] — YYYY-MM-DD` (bare version + date — no codename or theme) and
+   add a fresh empty `[Unreleased]` above it. Thanks to the CLAUDE.md
    release-tagging rule, every shipped change is already listed — do not
    reconstruct history at release time.
 5. Tag from a clean commit history that does not include unpublished or private planning artifacts (`docs/superpowers/` specs and plans are public by policy).
 6. Publish the GitHub Release after pushing the final tag:
    ```bash
    gh release create vX.Y.Z --verify-tag \
-     --title "vX.Y.Z — <one-line theme>" \
+     --title "vX.Y.Z" \
      --notes-file <notes.md>
    ```
-   Distill the notes from the changelog section: TL;DR first, then
-   Added/Changed/Fixed, then **Upgrade notes** (new migrations, new/changed
-   env vars, breaking changes). `-rcN` tags get `--prerelease`.
+   The title is the bare tag — no codename, no theme, no ` — <name>` suffix.
+   The notes body is the changelog section condensed to one-line bullets:
+   lead with a package-versions line, then Added/Changed/Fixed/Security/
+   Breaking/Upgrade category headings (each bullet ending `(#PR)`), and close
+   with a link to `CHANGELOG.md`. No prose intro, no TL;DR, no emoji beyond
+   `⚠️` on breaking bullets — an agent should be able to scan it. `-rcN` tags
+   get `--prerelease`.
 7. Verify the `Docs` workflow deployed green on `main` and the site's
    Release Notes page shows the new version.
 
