@@ -45,7 +45,7 @@ Guidance for working in this repository.
 
 ## Defect Prevention
 
-Rules from the #98/#99/#100 retrospective. Apply before closing any task.
+Rules from the #98/#99/#100/#112 retrospective. Apply before closing any task.
 Durable lessons behind these rules live in
 [docs/developer/learnings.md](docs/developer/learnings.md) — read the matching
 entry before touching a related area; add one when a shipped defect teaches
@@ -77,6 +77,13 @@ something new.
 - **Adversarial pass**: review the diff for swallowed exceptions, failure-path
   asymmetries, and state/response divergence before pushing — tests-green is
   not done.
+- **Release visibility**: writing release notes is not the same as publishing
+  them (#112). A release is only discoverable when there is a GitHub Release
+  on the tag (not just an annotated tag message or a CHANGELOG entry) and the
+  GHCR package pages carry a description (`publish.yml` must pass both
+  `labels:` and `annotations:` from `metadata-action` — a multi-platform
+  build's GHCR page reads annotations, not labels). Check both before calling
+  a release done.
 
 ## Writing Standards
 

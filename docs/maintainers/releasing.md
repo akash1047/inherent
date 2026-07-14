@@ -110,6 +110,12 @@ job runs without pausing.
    Short form: required `ref` (checkout + compose; must include `infra/`);
    optional `inherent_version` (GHCR tag; empty = strip leading `v` from `ref`);
    `server_type` default `cpx32`.
+7. **Publish a GitHub Release from the final tag** (Releases → Draft a new
+   release → pick `vX.Y.Z`). Title it `vX.Y.Z — <theme>` and paste the tag
+   message plus a link to the matching `CHANGELOG.md` entry. Writing notes into
+   the tag message or CHANGELOG alone does not make them visible — the
+   Releases tab is where consumers actually look, and the tagged git object
+   and GHCR package page do not surface either on their own (#112).
 
 `make release-images` prints these steps.
 
