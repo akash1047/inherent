@@ -59,7 +59,7 @@ Select a workspace with the `X-Workspace-Id` header.
 | GET | `/v1/documents/{id}` | `read` | Document metadata (`status`, `chunk_count`, `mime_type`, timestamps). `404` if not found |
 | DELETE | `/v1/documents/{id}` | `write` | Delete document + vectors + chunks + stored bytes. `204`; `404` if already gone; `503` on vector-store outage (document left intact, retry safe) |
 | GET | `/v1/documents/{id}/lineage` | `read` | Provenance + freshness: `source_uri`, `content_hash`, `ingested_at`, `is_stale`. Optional `chunk_id` query param |
-| POST | `/v1/documents/{id}/refresh` | `write` + `read` | Re-ingest an uploaded document to clear staleness. `404` if missing; `503` on DB/MQ failure (document marked `failed`, never stranded `pending`) |
+| POST | `/v1/documents/{id}/refresh` | `write` + `read` | Re-ingest an uploaded document to clear staleness. `404` if missing; `503` on DB/MQ failure. On MQ failure a retried compensation marks the document `failed`; if retries exhaust it can remain `pending` (CRITICAL log + `document_compensation_exhausted_total` metric) — check document status before retrying |
 
 ### Chunks
 
