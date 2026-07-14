@@ -11,7 +11,7 @@ All notable changes to Inherent are documented here. The format follows
   from `docs/`, with REST API / MCP tools / configuration reference pages
   and on-site release notes rendered from this changelog. New `Docs` CI
   check builds with `--strict` on every PR. Release tagging + docs-currency
-  rules added to `CLAUDE.md` and `docs/maintainers/releasing.md`.
+  rules added to `CLAUDE.md` and `docs/maintainers/releasing.md`. (#115)
 
 ## [0.5.0] — 2026-07-13 — Org-readiness program
 
