@@ -82,7 +82,7 @@ Treat that as a known limitation. If omitted, the server starts with safe
 defaults that you can update later via SSH.
 
 The full list of environment variables is documented in
-[.env.example](../../.env.example) at the repository root.
+[.env.example](https://github.com/inherent-prime/inherent/blob/main/.env.example) at the repository root.
 
 ## 3. Initialize Terraform
 
@@ -92,7 +92,7 @@ Pick one init path:
 |------|------|---------------------|------|
 | **Prod / long-lived** | Stable prod VM | `backend.hcl` stable key (e.g. `inherent/prod/...`) | copy `backend.hcl.example` → `backend.hcl`, set `AWS_*` env, `terraform init -backend-config=backend.hcl` |
 | **Laptop test** | Local experiments | `backend.hcl` key e.g. `inherent/local/laptop/...` | same Object Storage; see [local-vm-test.md](local-vm-test.md) |
-| **CI e2e** | GHA Hetzner e2e | Object Storage `inherent/ci/<github.run_id>/terraform.tfstate` via workflow-generated `backend-ci.hcl` | see [infra/README.md § CI e2e](../../infra/README.md#ci-e2e) |
+| **CI e2e** | GHA Hetzner e2e | Object Storage `inherent/ci/<github.run_id>/terraform.tfstate` via workflow-generated `backend-ci.hcl` | see [infra/README.md § CI e2e](https://github.com/inherent-prime/inherent/blob/main/infra/README.md#ci-e2e) |
 
 - `.terraform.lock.hcl` is the **provider lock** — committed to git.
 - `*.tfstate` is **state** — never commit; remote state uses Hetzner Object Storage (S3-compatible).
@@ -122,7 +122,7 @@ key such as `inherent/local/laptop/terraform.tfstate`.
 
 GHA Hetzner e2e uses Object Storage under `inherent/ci/<run_id>/`, not local
 state. Configure secrets/vars, recover workflow, and orphan cleanup in
-[infra/README.md § CI e2e](../../infra/README.md#ci-e2e).
+[infra/README.md § CI e2e](https://github.com/inherent-prime/inherent/blob/main/infra/README.md#ci-e2e).
 
 ## 4. Review the Plan
 
@@ -272,7 +272,7 @@ not traverse the firewall.
 
 ## Next Steps
 
-- Browse [docs/README.md](../README.md) for the full documentation index.
+- Browse [docs/README.md](../index.md) for the full documentation index.
 - Open the Public API docs at `http://<server-ip>:18000/docs`.
 - Temporal UI is **not** opened on the Hetzner firewall (only 22, 18000, ICMP).
   Reach it via SSH tunnel:
@@ -283,5 +283,5 @@ not traverse the firewall.
   ```
 
 - Run the end-to-end local smoke test from the
-  [root README](../../README.md#local-smoke-test) against your production server
+  [root README](https://github.com/inherent-prime/inherent/blob/main/README.md#local-smoke-test) against your production server
   to verify the full upload-ingest-search path.

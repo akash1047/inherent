@@ -12,7 +12,7 @@ Nothing yet.
 Repository-level release tag, continuing from the last published tag
 `v0.4.1` (an out-of-band ingestion-svc hotfix — see below). `v0.1.0`/
 `v0.1.0-rc1` and `v0.2.0` were never fully published (see
-[releasing.md](docs/maintainers/releasing.md) for the image-publishing flow);
+[releasing.md](https://github.com/inherent-prime/inherent/blob/main/docs/maintainers/releasing.md) for the image-publishing flow);
 this is the first repository-level tag published since `v0.4.1`. Per-service
 package versions (independent of this tag) moved to `inh-contracts` 2.0.0,
 `inh-ingestion-svc` 0.5.0, and `inh-public-api-svc` 0.2.0 alongside this tag.
@@ -44,14 +44,14 @@ package versions (independent of this tag) moved to `inh-contracts` 2.0.0,
   intake (shared REST + MCP), REST refresh, MCP refresh. The #99 contract in
   `tests/contract/test_failure_parity.py` is now enforced (xfail removed) and
   the refresh double-failure pair is pinned on both surfaces. Durable lesson
-  recorded in [docs/developer/learnings.md](docs/developer/learnings.md).
+  recorded in [docs/developer/learnings.md](https://github.com/inherent-prime/inherent/blob/main/docs/developer/learnings.md).
 
 A milestone-by-milestone push to make Inherent a self-hostable, permission-aware
 agent **memory substrate** an organization can run on day one. Delivered as a
 stack of reviewable PRs (merge order: #65 → #66 → #67 → #68 → #69 → #70, on top
 of the already-merged M0–M2 #62/#63/#64). See
-[docs/maintainers/org-readiness-requirements.md](docs/maintainers/org-readiness-requirements.md)
-and [ADR 0001](docs/adr/0001-agent-memory-substrate.md).
+[docs/maintainers/org-readiness-requirements.md](https://github.com/inherent-prime/inherent/blob/main/docs/maintainers/org-readiness-requirements.md)
+and [ADR 0001](https://github.com/inherent-prime/inherent/blob/main/docs/adr/0001-agent-memory-substrate.md).
 
 ### Changed
 
@@ -92,8 +92,8 @@ and [ADR 0001](docs/adr/0001-agent-memory-substrate.md).
   `EVAL_RETENTION_DAYS` (default 30) or on demand. Adds migration `015_evals.sql`.
   Design boundary — retrieval-layer evals only, no answer/task grading, no LLM
   judge, no second service — is recorded in
-  [ADR 0003](docs/adr/0003-traffic-mined-retrieval-evals.md); quickstart in
-  [docs/getting-started/local.md](docs/getting-started/local.md#6-judge-retrieval-quality-evals).
+  [ADR 0003](https://github.com/inherent-prime/inherent/blob/main/docs/adr/0003-traffic-mined-retrieval-evals.md); quickstart in
+  [docs/getting-started/local.md](https://github.com/inherent-prime/inherent/blob/main/docs/getting-started/local.md#6-judge-retrieval-quality-evals).
 - **Document delete — REST + MCP (#87 P1).** An agent can finally retract
   knowledge: `DELETE /v1/documents/{id}` and the MCP `delete_document` tool
   remove a document's Weaviate objects (tenant-scoped), its PostgreSQL row +

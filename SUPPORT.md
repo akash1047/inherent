@@ -16,7 +16,7 @@ Open a PR when you already have a concrete fix or improvement.
 
 ## Security Reports
 
-Use [SECURITY.md](SECURITY.md). Do not report vulnerabilities in public issues.
+Use [SECURITY.md](https://github.com/inherent-prime/inherent/blob/main/SECURITY.md). Do not report vulnerabilities in public issues.
 
 ## Maintainer Contact
 

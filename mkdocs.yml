@@ -1,0 +1,91 @@
+site_name: Inherent
+site_description: >-
+  Self-hostable, permission-aware agent memory substrate — ingestion,
+  indexing, storage, and retrieval for private RAG.
+site_url: https://inherent-prime.github.io/inherent/
+repo_url: https://github.com/inherent-prime/inherent
+repo_name: inherent-prime/inherent
+edit_uri: edit/main/docs/
+docs_dir: docs
+
+theme:
+  name: material
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: black
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: black
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+  features:
+    - navigation.tabs
+    - navigation.top
+    - navigation.footer
+    - search.suggest
+    - search.highlight
+    - content.action.edit
+    - content.code.copy
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.highlight
+  - pymdownx.superfences
+  - pymdownx.details
+  - pymdownx.snippets:
+      base_path: ["."]
+      check_paths: true
+
+plugins:
+  - search
+
+# Internal artifacts never published to the site.
+# /README.md would collide with index.md (both map to site root).
+exclude_docs: |
+  /README.md
+  superpowers/
+  examples/__pycache__/
+
+# Built (so in-repo links keep working) but intentionally not in the nav.
+not_in_nav: |
+  audit/
+  maintainers/
+  developer/
+
+nav:
+  - Home: index.md
+  - Getting Started:
+      - Local quickstart: getting-started/local.md
+      - Production (Hetzner + Terraform): getting-started/production.md
+      - Laptop VM test: getting-started/local-vm-test.md
+  - Guides:
+      - Production hardening: deploy/production.md
+      - Testing: testing.md
+      - Advanced indexes: advanced-indexes.md
+  - Reference:
+      - API examples: examples/README.md
+      - REST API: reference/rest-api.md
+      - MCP tools: reference/mcp-tools.md
+      - Configuration: reference/configuration.md
+  - Release Notes: release-notes.md
+  - Architecture:
+      - ADR index: adr/README.md
+      - 0001 — Agent memory substrate: adr/0001-agent-memory-substrate.md
+      - 0002 — Weaviate multi-tenancy scale: adr/0002-weaviate-multi-tenancy-scale.md
+      - 0003 — Traffic-mined retrieval evals: adr/0003-traffic-mined-retrieval-evals.md
+      - Threat model — RAG poisoning: threat-models/rag-poisoning-injection.md
+  - Community:
+      - Contributing: community/contributing.md
+      - Code of Conduct: community/code-of-conduct.md
+      - Security policy: community/security.md
+      - Support: community/support.md

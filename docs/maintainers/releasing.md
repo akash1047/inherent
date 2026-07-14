@@ -77,12 +77,12 @@ job runs without pausing.
    a reviewer approves the run in the **Actions** tab. Nothing is pushed to GHCR
    without that approval.
 5. After a **successful** Publish images run on a **final** `vX.Y.Z` tag (not
-   `-rcN`), [Hetzner e2e](../../.github/workflows/hetzner-e2e.yml) starts via
+   `-rcN`), [Hetzner e2e](https://github.com/inherent-prime/inherent/blob/main/.github/workflows/hetzner-e2e.yml) starts via
    `workflow_run`. It pins the same release for checkout, GHCR image tag
    `X.Y.Z`, and compose `compose_git_ref` (the tag). RC tags skip e2e.
 6. Re-run manually: Actions → **Hetzner e2e** → **Run workflow**. Form fields
    and examples (Use workflow from vs `ref`, image tag, `cpx32`) live in
-   [infra/README.md § Manual run](../../infra/README.md#manual-run-github-form).
+   [infra/README.md § Manual run](https://github.com/inherent-prime/inherent/blob/main/infra/README.md#manual-run-github-form).
    Short form: required `ref` (checkout + compose; must include `infra/`);
    optional `inherent_version` (GHCR tag; empty = strip leading `v` from `ref`);
    `server_type` default `cpx32`.
