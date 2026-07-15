@@ -6,6 +6,8 @@ from typing import Literal
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from src.config.constants import DEFAULT_DATABASE_NAME
+
 
 class Settings(BaseSettings):
     """Application configuration from environment variables."""
@@ -39,7 +41,7 @@ class Settings(BaseSettings):
     version: str = "0.2.0"
 
     # Database (Read-only access)
-    database_url: str = "postgresql://postgres:postgres@localhost:5432/knowledge_base"
+    database_url: str = f"postgresql://postgres:postgres@localhost:5432/{DEFAULT_DATABASE_NAME}"
 
     # MongoDB (Read-only — for workspace ownership lookups; control-plane truth)
     mongodb_uri: str = Field(
@@ -59,7 +61,7 @@ class Settings(BaseSettings):
     use_cloud_sql_connector: bool = False
     # Format: project:region:instance
     cloud_sql_instance: str | None = None
-    cloud_sql_database: str = "knowledge_base"
+    cloud_sql_database: str = DEFAULT_DATABASE_NAME
     cloud_sql_user: str = "ingestion_user"
     # Password for Cloud SQL (optional - if not set, uses IAM authentication)
     cloud_sql_password: str | None = None

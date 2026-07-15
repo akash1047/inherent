@@ -5,6 +5,11 @@ from typing import Final, Literal
 # API version
 API_VERSION: Final[str] = "v1"
 
+# Default Postgres database name — single-sourced so the local DATABASE_URL
+# default and the Cloud SQL database default can't drift apart (they name
+# the same database).
+DEFAULT_DATABASE_NAME: Final[str] = "knowledge_base"
+
 # Rate limits by pricing tier (requests per minute)
 PLAN_RATE_LIMITS: Final[dict[str, int]] = {
     "starter": 100,  # $149/month
