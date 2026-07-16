@@ -6,7 +6,7 @@
 
 <p align="center">
   <a href="https://inherent.sh/">Website</a> ·
-  <a href="https://docs.inherent.sh/">Docs</a> ·
+  <a href="https://docs.inherent.sh/](https://inherent-prime.github.io/inherent/">Docs</a> ·
   <a href="https://inherent.sh/#pricing">Pricing</a> ·
   <a href="https://inherent.sh/blog">Blog</a> ·
   <a href="https://app.inherent.sh/">Try the Sandbox</a>
