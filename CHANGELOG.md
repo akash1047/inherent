@@ -13,6 +13,14 @@ All notable changes to Inherent are documented here. The format follows
   check builds with `--strict` on every PR. Release tagging + docs-currency
   rules added to `CLAUDE.md` and `docs/maintainers/releasing.md`. (#115)
 
+### Removed
+
+- **Unused runtime dependencies dropped** to shrink the install surface of
+  both service images: `aiobreaker` and `psycopg[binary]` from
+  `inh-public-api-svc` (DB access is async-only via `asyncpg`; no circuit
+  breaker or sync driver is imported), and `packaging` from
+  `inh-ingestion-svc` (not imported anywhere). No behavior change.
+
 ## [0.5.0] — 2026-07-13
 
 Repository-level release tag, continuing from the last published tag
