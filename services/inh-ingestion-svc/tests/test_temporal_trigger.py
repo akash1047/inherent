@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 import src.temporal.trigger as trigger_mod
+from src.models.document import DocumentUploadMessage
 from src.temporal.trigger import TemporalWorkflowTrigger, get_workflow_trigger
 
 # ---------------------------------------------------------------------------
@@ -19,6 +20,26 @@ def _make_settings():
     settings.temporal_namespace = "default"
     settings.temporal_task_queue = "ingestion"
     return settings
+
+
+def _make_upload_message(**overrides) -> DocumentUploadMessage:
+    """Build a minimal valid DocumentUploadMessage, with overrides for the
+    ingestion-source fields under test (#187)."""
+    base = {
+        "event_type": "document.uploaded",
+        "document_id": "doc-1",
+        "workspace_id": "ws-1",
+        "user_id": "user-1",
+        "filename": "stored.txt",
+        "original_filename": "original.txt",
+        "content_type": "text/plain",
+        "size_bytes": 10,
+        "storage_backend": "local",
+        "storage_path": "workspaces/ws-1/stored.txt",
+        "timestamp": "2024-01-15T10:30:00Z",
+    }
+    base.update(overrides)
+    return DocumentUploadMessage(**base)
 
 
 # ---------------------------------------------------------------------------
@@ -214,3 +235,97 @@ class TestAsyncTriggerPoisonHandling:
 
         # Transient errors must NOT be dead-lettered — the message must redeliver.
         db.add_dead_letter_job.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Ingestion-source Temporal memo tests (#187)
+# ---------------------------------------------------------------------------
+
+
+class TestBuildSourceMemo:
+    """Unit tests for TemporalWorkflowTrigger._build_source_memo (#187).
+
+    Memo needs no namespace search-attribute registration and surfaces
+    directly in the Temporal UI workflow summary panel.
+    """
+
+    def test_connector_sourced_message_includes_connection_and_sync_id(self):
+        upload_message = _make_upload_message(
+            source="connector:notion", connection_id="conn_123", sync_id="sync_456"
+        )
+
+        memo = TemporalWorkflowTrigger._build_source_memo(upload_message)
+
+        assert memo == {
+            "source": "connector:notion",
+            "connection_id": "conn_123",
+            "sync_id": "sync_456",
+        }
+
+    def test_source_only_message_omits_absent_connector_ids(self):
+        upload_message = _make_upload_message(source="public-api")
+
+        memo = TemporalWorkflowTrigger._build_source_memo(upload_message)
+
+        assert memo == {"source": "public-api"}
+        assert "connection_id" not in memo
+        assert "sync_id" not in memo
+
+    def test_legacy_message_without_source_defaults_to_unknown(self):
+        # Legacy/in-flight messages produced before #187 have no source field
+        # at all, which Pydantic leaves as None.
+        upload_message = _make_upload_message()
+        assert upload_message.source is None
+
+        memo = TemporalWorkflowTrigger._build_source_memo(upload_message)
+
+        assert memo == {"source": "unknown"}
+
+
+class TestTriggerWorkflowAsyncMemoIntegration:
+    """Verify trigger_workflow_async threads the memo through to the actual
+    Temporal client.start_workflow call (not just the helper in isolation)."""
+
+    def _ready_trigger(self) -> TemporalWorkflowTrigger:
+        trigger = TemporalWorkflowTrigger(_make_settings())
+        trigger._initialized = True
+        trigger._client = MagicMock()
+        trigger._client.start_workflow = AsyncMock(return_value=MagicMock())
+        return trigger
+
+    @pytest.mark.asyncio
+    async def test_connector_sourced_message_passes_full_memo(
+        self, sample_upload_message_connector_sourced
+    ):
+        trigger = self._ready_trigger()
+
+        await trigger.trigger_workflow_async(sample_upload_message_connector_sourced)
+
+        _, kwargs = trigger._client.start_workflow.call_args
+        assert kwargs["memo"] == {
+            "source": "connector:notion",
+            "connection_id": "conn_123",
+            "sync_id": "sync_456",
+        }
+
+    @pytest.mark.asyncio
+    async def test_public_api_message_passes_source_only_memo(
+        self, sample_upload_message_public_api
+    ):
+        trigger = self._ready_trigger()
+
+        await trigger.trigger_workflow_async(sample_upload_message_public_api)
+
+        _, kwargs = trigger._client.start_workflow.call_args
+        assert kwargs["memo"] == {"source": "public-api"}
+
+    @pytest.mark.asyncio
+    async def test_legacy_message_without_source_passes_unknown_memo(self, sample_upload_message):
+        # sample_upload_message has no "source" key at all — simulates an
+        # in-flight message produced before #187 shipped on the intg-svc side.
+        trigger = self._ready_trigger()
+
+        await trigger.trigger_workflow_async(sample_upload_message)
+
+        _, kwargs = trigger._client.start_workflow.call_args
+        assert kwargs["memo"] == {"source": "unknown"}

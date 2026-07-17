@@ -49,7 +49,26 @@ class DocumentUploadMessage(BaseModel):
         "older messages produced without it still validate.",
     )
 
-    @field_validator("storage_bucket", "storage_url", mode="before")
+    # Ingestion source labeling (#187). intg-svc's uploadDocument() derives one
+    # of "connector:<provider>" | "public-api" | "manual" for every upload.
+    # Optional + defaulted to None so in-flight/legacy messages produced before
+    # this field existed still validate (backward compat) — consumers treat a
+    # missing source as "unknown".
+    source: str | None = Field(
+        None,
+        description="Ingestion source: connector:<provider> | public-api | manual. "
+        "Absent on messages produced before this field existed.",
+    )
+    connection_id: str | None = Field(
+        None, description="Connector connection identifier (connector-sourced uploads only)"
+    )
+    sync_id: str | None = Field(
+        None, description="Connector sync run identifier (connector-sourced uploads only)"
+    )
+
+    @field_validator(
+        "storage_bucket", "storage_url", "source", "connection_id", "sync_id", mode="before"
+    )
     @classmethod
     def unwrap_avro_union(cls, v: None | str | dict) -> str | None:
         """Unwrap Avro union type format.
@@ -85,6 +104,9 @@ class DocumentUploadMessage(BaseModel):
                 "storage_bucket": "documents",
                 "storage_url": "https://storage.googleapis.com/documents/workspaces/...",
                 "timestamp": "2024-01-15T10:30:00Z",
+                "source": "connector:notion",
+                "connection_id": "conn_123",
+                "sync_id": "sync_456",
             }
         }
     )

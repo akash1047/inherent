@@ -93,6 +93,26 @@ class TemporalWorkflowTrigger:
             return "fetch_failed"
         return "unknown"
 
+    @staticmethod
+    def _build_source_memo(upload_message: DocumentUploadMessage) -> dict[str, str]:
+        """Build the Temporal memo describing where an ingestion came from (#187).
+
+        Memo needs no namespace search-attribute registration and renders
+        directly in the Temporal UI workflow summary panel, so operators can
+        tell a connector sync apart from a manual or public-API upload.
+
+        Backward compatible: messages produced before the ``source`` field
+        existed have it as None, which maps to "unknown" rather than crashing
+        the consumer. ``connection_id``/``sync_id`` are omitted entirely when
+        absent (only set for connector-sourced uploads).
+        """
+        memo: dict[str, str] = {"source": upload_message.source or "unknown"}
+        if upload_message.connection_id:
+            memo["connection_id"] = upload_message.connection_id
+        if upload_message.sync_id:
+            memo["sync_id"] = upload_message.sync_id
+        return memo
+
     async def _record_dead_letter(
         self,
         document_id: str,
@@ -208,6 +228,7 @@ class TemporalWorkflowTrigger:
                 workflow_input,
                 id=workflow_id,
                 task_queue=self.settings.temporal_task_queue,
+                memo=self._build_source_memo(upload_message),
             )
 
             logger.info(
@@ -329,6 +350,7 @@ class TemporalWorkflowTrigger:
             workflow_input,
             id=workflow_id,
             task_queue=self.settings.temporal_task_queue,
+            memo=self._build_source_memo(upload_message),
         )
 
         # Record admission latency: MQ-receive → Temporal-accepted.
