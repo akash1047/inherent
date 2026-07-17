@@ -14,6 +14,11 @@ from src.services.ranking_metrics import mrr, ndcg_at_k, recall_at_k
 
 pytestmark = pytest.mark.retrieval_eval
 
+# Known query categories (Oracle-style archetypes, #37 corpus expansion).
+# "abstention" is exempt from the "must have a relevant doc" rule in
+# test_corpus_covers_multiple_queries below -- it deliberately has none.
+KNOWN_CATEGORIES = {"general", "exact_id", "stale_version", "paraphrase", "abstention"}
+
 
 def test_corpus_is_well_formed(golden_corpus):
     """Every judgment references a real fixture, with sane fields."""
@@ -29,16 +34,39 @@ def test_corpus_is_well_formed(golden_corpus):
         assert (sample_dir / doc).exists(), f"qrel references missing fixture: {doc}"
         assert isinstance(j.get("chunk_index"), int) and j["chunk_index"] >= 0
         assert 0 <= int(j["relevance"]) <= 3, f"relevance out of range: {j}"
+        category = j.get("category", "general")
+        assert category in KNOWN_CATEGORIES, f"unknown category: {j}"
 
 
 def test_corpus_covers_multiple_queries(golden_corpus):
-    """The corpus must exercise several distinct queries with relevant docs."""
+    """The corpus must exercise several distinct queries with relevant docs.
+
+    Exempts ``abstention`` queries: they exist precisely to have zero relevant
+    documents (there is nothing in the corpus that answers them), so requiring
+    a positive judgment there would contradict the category's purpose.
+    """
     queries = golden_corpus["queries"]
     relevant = golden_corpus["relevant"]
+    category = golden_corpus["category"]
     assert len(queries) >= 4, "expected at least 4 distinct queries"
-    # Every query should have at least one positively-judged document.
     for qid in queries:
+        if category.get(qid) == "abstention":
+            assert not relevant.get(qid), f"abstention query {qid} unexpectedly has relevant docs"
+            continue
         assert relevant.get(qid), f"query {qid} has no relevant documents"
+
+
+def test_corpus_covers_oracle_style_categories(golden_corpus):
+    """The corpus exercises at least one query per production-RAG archetype (#37).
+
+    Pins the expansion so a future edit can't silently drop a category back to
+    just generic doc-lookup queries.
+    """
+    category = golden_corpus["category"]
+    represented = set(category.values())
+    required = {"exact_id", "stale_version", "paraphrase", "abstention"}
+    missing = required - represented
+    assert not missing, f"golden corpus is missing query categories: {missing}"
 
 
 def test_metric_harness_perfect_ranking(golden_corpus):

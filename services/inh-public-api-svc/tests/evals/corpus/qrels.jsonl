@@ -12,3 +12,9 @@
 {"query_id": "q7", "query": "X-API-Key authentication header for /v1/ routes", "document_id": "sample.md", "chunk_index": 0, "relevance": 2}
 {"query_id": "q8", "query": "Weaviate vector index and Temporal workflows architecture", "document_id": "sample.md", "chunk_index": 0, "relevance": 3}
 {"query_id": "q9", "query": "turning company knowledge into something AI systems can query", "document_id": "sample.txt", "chunk_index": 0, "relevance": 3}
+{"query_id": "q10", "query": "what does error code ERR-4130 mean", "document_id": "error-codes.txt", "chunk_index": 0, "relevance": 3, "category": "exact_id"}
+{"query_id": "q11", "query": "what is the current default chunk size and overlap", "document_id": "release-notes-v2.txt", "chunk_index": 0, "relevance": 3, "category": "stale_version"}
+{"query_id": "q11", "query": "what is the current default chunk size and overlap", "document_id": "release-notes-v1.txt", "chunk_index": 0, "relevance": 0, "category": "stale_version"}
+{"query_id": "q12", "query": "in plain terms, how does search blend keyword matches with embedding similarity", "document_id": "sample.md", "chunk_index": 0, "relevance": 3, "category": "paraphrase"}
+{"query_id": "q12", "query": "in plain terms, how does search blend keyword matches with embedding similarity", "document_id": "sample.txt", "chunk_index": 0, "relevance": 2, "category": "paraphrase"}
+{"query_id": "q13", "query": "what is the refund policy for enterprise annual contracts", "document_id": "sample.txt", "chunk_index": 0, "relevance": 0, "category": "abstention"}

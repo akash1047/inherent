@@ -12,6 +12,12 @@ on:
     - cron: "0 4 * * *"
   workflow_dispatch:
 
+# Least-privilege default; the two governance jobs below each grant themselves
+# only the extra scope they need (contents: write to ratchet the baseline,
+# issues: write to file/update a regression alert).
+permissions:
+  contents: read
+
 jobs:
   compose-integration:
     name: Compose ingestion-to-search
@@ -126,3 +132,97 @@ jobs:
       - name: Tear down
         if: always()
         run: docker compose down -v
+
+  # Retrieval-eval hard gate lives inside the pytest assertion itself
+  # (tests/evals/test_compose_retrieval_regression.py), so a regression already
+  # fails `compose-integration` above. This job only runs after a GREEN gate on
+  # `main` and ratchets the committed baseline up to the just-measured numbers
+  # (never down -- see tests/evals/eval_gate.py) plus appends a trend-history
+  # line, so "beats baseline" has both an enforced floor and a visible score
+  # over time (#37 -> hard gate + history).
+  eval-baseline-ratchet:
+    name: Ratchet retrieval-eval baseline
+    needs: compose-integration
+    if: github.ref == 'refs/heads/main' && success()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Download retrieval eval report
+        uses: actions/download-artifact@v4
+        with:
+          name: retrieval-eval-report
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Ratchet baseline (max(current, baseline) per mode/metric)
+        working-directory: services/inh-public-api-svc
+        run: |
+          uv run python tests/evals/eval_gate.py ratchet \
+            --report "$GITHUB_WORKSPACE/eval-report.json" \
+            --baseline tests/evals/corpus/retrieval_baseline.json \
+            --out tests/evals/corpus/retrieval_baseline.json
+
+      - name: Append trend history
+        run: |
+          jq -c --arg sha "$GITHUB_SHA" --arg date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{sha: $sha, date: $date, metrics: .}' eval-report.json \
+            >> services/inh-public-api-svc/tests/evals/corpus/retrieval_history.jsonl
+
+      - name: Commit and push if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add services/inh-public-api-svc/tests/evals/corpus/retrieval_baseline.json \
+                  services/inh-public-api-svc/tests/evals/corpus/retrieval_history.jsonl
+          if git diff --cached --quiet; then
+            echo "no baseline/history change"
+          else
+            git commit -m "chore(evals): ratchet retrieval baseline [skip ci]"
+            # Best-effort: branch protection may reject a direct bot push. That
+            # must not turn a passing eval run red -- warn and move on.
+            git push origin HEAD:main || echo "::warning::could not push ratcheted baseline (branch protection?)"
+          fi
+
+  # Post-merge regression only (per policy: this does not gate PRs, since the
+  # full stack is too slow/expensive to run on every PR). When the gate above
+  # fails on `main` or nightly, file (or update) a tracking issue instead of
+  # letting a regression sit silently until someone notices the red run.
+  eval-regression-alert:
+    name: File/update retrieval-eval regression issue
+    needs: compose-integration
+    if: always() && needs.compose-integration.result == 'failure'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Open or update the regression issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          RUN_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          gh label create retrieval-eval-regression \
+            --repo "$GITHUB_REPOSITORY" \
+            --color FF0000 \
+            --description "Retrieval-eval CI gate regression (auto-filed)" 2>/dev/null || true
+          existing=$(gh issue list --repo "$GITHUB_REPOSITORY" \
+            --label retrieval-eval-regression --state open \
+            --json number --jq '.[0].number')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" \
+              --body "Regression detected again on \`$GITHUB_REF_NAME\`: $RUN_URL"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" \
+              --title "Retrieval-eval regression detected on $GITHUB_REF_NAME" \
+              --label retrieval-eval-regression \
+              --body "The compose retrieval-eval gate (tests/evals/test_compose_retrieval_regression.py) failed: $RUN_URL. See the run's step summary or the retrieval-eval-report artifact for which mode/metric regressed vs the committed baseline (services/inh-public-api-svc/tests/evals/corpus/retrieval_baseline.json)."
+          fi

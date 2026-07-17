@@ -7,11 +7,41 @@ All notable changes to Inherent are documented here. The format follows
 
 ### Added
 
+- **Retrieval-eval hard gate, baseline ratcheting, and trend history (#139).**
+  Implements the "v2" items ADR 0003 deferred (run-over-run regression deltas,
+  a CLI/CI gate). The compose retrieval-eval baseline diff
+  (`corpus/retrieval_baseline.json`) is no longer print-only: any per-mode
+  metric regressing beyond `EVAL_GATE_TOLERANCE` (default 0.02) now fails the
+  build (`tests/evals/eval_gate.py`), on top of the existing absolute-floor
+  backstop. A green gate on `main` ratchets the baseline up to
+  `max(current, baseline)` per mode/metric (never down) and appends a line to
+  a new `corpus/retrieval_history.jsonl` trend log
+  (`.github/workflows/integration.yml`); a failed gate on `main` or nightly
+  files/updates a tracking issue instead of only failing silently in CI logs.
+  Still post-merge only, not a PR gate (the full Compose stack stays too
+  slow/expensive to run on every PR). Golden corpus expanded with
+  `exact_id`/`stale_version`/`paraphrase`/`abstention` query categories
+  (new fixtures `error-codes.txt`, `release-notes-v1.txt`/`v2.txt`) and
+  per-category reporting, so "beats baseline" covers more than generic
+  doc-lookup queries. No new eval-scoring dependency — metrics stay
+  dependency-free/in-process per ADR 0003's no-LLM-judge boundary.
+
 - **Documentation site.** MkDocs Material site published to GitHub Pages
   from `docs/`, with REST API / MCP tools / configuration reference pages
   and on-site release notes rendered from this changelog. New `Docs` CI
   check builds with `--strict` on every PR. Release tagging + docs-currency
   rules added to `CLAUDE.md` and `docs/maintainers/releasing.md`. (#115)
+
+### Fixed
+
+- **`uv.lock` drift from the unused-deps removal.** Both services' lock files
+  still listed `aiobreaker`/`psycopg[binary]` (`inh-public-api-svc`) and
+  `packaging` (`inh-ingestion-svc`) as locked dependencies after those were
+  dropped from `pyproject.toml`; `uv sync --frozen` (used in CI) installs
+  straight from the lock without re-checking it against `pyproject.toml`, so
+  the stale packages kept installing silently. Regenerated both lock files —
+  no behavior change, but the image install surface actually shrinks now as
+  intended.
 
 ### Removed
 
