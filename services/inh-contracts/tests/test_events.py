@@ -21,6 +21,10 @@ CANONICAL_UPLOAD_KEYS_V1 = {
     "storage_url",
     "timestamp",
     "contract_version",
+    # Ingestion source labeling (#187) — additive, optional, backward compatible.
+    "source",
+    "connection_id",
+    "sync_id",
 }
 
 
@@ -40,6 +44,9 @@ def _canonical_upload_event() -> dict:
         "storage_url": "https://storage.googleapis.com/documents/workspaces/doc.pdf",
         "timestamp": "2024-01-15T10:30:00Z",
         "contract_version": CONTRACT_VERSION,
+        "source": "connector:notion",
+        "connection_id": "conn_123",
+        "sync_id": "sync_456",
     }
 
 
@@ -73,6 +80,47 @@ def test_upload_event_unwraps_avro_union() -> None:
     msg = DocumentUploadMessage(**event)
     assert msg.storage_bucket == "documents"
     assert msg.storage_url is None
+
+
+def test_upload_event_without_source_defaults_to_none() -> None:
+    """Legacy/in-flight messages produced before #187 have no source field at
+    all — must still validate, with source/connection_id/sync_id all None."""
+    event = _canonical_upload_event()
+    del event["source"]
+    del event["connection_id"]
+    del event["sync_id"]
+
+    msg = DocumentUploadMessage(**event)
+    assert msg.source is None
+    assert msg.connection_id is None
+    assert msg.sync_id is None
+
+
+def test_upload_event_source_only_no_connection_or_sync() -> None:
+    """public-api / manual uploads carry source but no connection_id/sync_id."""
+    event = _canonical_upload_event()
+    event["source"] = "public-api"
+    del event["connection_id"]
+    del event["sync_id"]
+
+    msg = DocumentUploadMessage(**event)
+    assert msg.source == "public-api"
+    assert msg.connection_id is None
+    assert msg.sync_id is None
+
+
+def test_upload_event_unwraps_avro_union_for_source_fields() -> None:
+    """source/connection_id/sync_id travel the same Avro-wrapped-union wire
+    format as storage_bucket/storage_url, so they need the same unwrapping."""
+    event = _canonical_upload_event()
+    event["source"] = {"string": "connector:notion"}
+    event["connection_id"] = {"string": "conn_123"}
+    event["sync_id"] = None
+
+    msg = DocumentUploadMessage(**event)
+    assert msg.source == "connector:notion"
+    assert msg.connection_id == "conn_123"
+    assert msg.sync_id is None
 
 
 def test_completion_message_round_trip() -> None:
