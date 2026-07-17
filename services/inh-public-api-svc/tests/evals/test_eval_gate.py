@@ -60,9 +60,7 @@ def test_load_metrics_invalid_json_returns_empty(tmp_path):
 
 def test_load_doc_keys_returns_only_underscore_keys(tmp_path):
     path = tmp_path / "baseline.json"
-    path.write_text(
-        json.dumps({"_comment": "policy", "hybrid": {"recall@5": 0.5}})
-    )
+    path.write_text(json.dumps({"_comment": "policy", "hybrid": {"recall@5": 0.5}}))
     assert load_doc_keys(path) == {"_comment": "policy"}
 
 
@@ -82,9 +80,7 @@ def test_cli_ratchet_preserves_comment_and_ratchets(tmp_path):
     drop _comment (which documents the hard-gate policy) entirely.
     """
     baseline = tmp_path / "baseline.json"
-    baseline.write_text(
-        json.dumps({"_comment": "policy note", "hybrid": {"recall@5": 0.50}})
-    )
+    baseline.write_text(json.dumps({"_comment": "policy note", "hybrid": {"recall@5": 0.50}}))
     report = tmp_path / "report.json"
     report.write_text(json.dumps({"hybrid": {"recall@5": 0.70}}))
     out = tmp_path / "out.json"
