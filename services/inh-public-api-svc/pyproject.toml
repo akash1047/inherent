@@ -14,7 +14,6 @@ dependencies = [
     "sqlalchemy>=2.0.36",
     "greenlet>=3.1.1",
     "asyncpg>=0.30.0",
-    "psycopg[binary]>=3.2.3",
     # Cloud SQL connector (for production on Cloud Run)
     "cloud-sql-python-connector[asyncpg]>=1.0.0",
     # MCP
@@ -33,8 +32,6 @@ dependencies = [
     "python-multipart>=0.0.12",
     # Metrics
     "prometheus-client>=0.19.0",
-    # Circuit breaker
-    "aiobreaker>=1.2.0",
     # MongoDB (read-only — for workspace ownership lookups; control-plane truth)
     "motor>=3.6.0",
 ]
