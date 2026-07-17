@@ -55,6 +55,21 @@ def load_metrics(path: Path) -> MetricsByMode:
     return {k: v for k, v in raw.items() if not k.startswith("_") and isinstance(v, dict)}
 
 
+def load_doc_keys(path: Path) -> dict:
+    """Return only the ``_``-prefixed documentation keys from a metrics file.
+
+    The ratchet writes a fresh baseline from the per-mode metrics alone, so
+    without carrying these forward the file's ``_comment`` (which documents the
+    hard-gate + ratchet policy) would be silently dropped on the first ratchet.
+    Best-effort: an unreadable/invalid file just yields no doc keys.
+    """
+    try:
+        raw = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
+    return {k: v for k, v in raw.items() if k.startswith("_")}
+
+
 @dataclass(frozen=True)
 class Regression:
     """A single (mode, metric) that dropped beyond tolerance vs. the baseline."""
@@ -137,8 +152,11 @@ def _cmd_ratchet(args: argparse.Namespace) -> int:
     current = load_metrics(Path(args.report))
     baseline = load_metrics(Path(args.baseline))
     updated = ratchet_baseline(current, baseline)
+    # Carry the source baseline's documentation keys (e.g. _comment) through, so
+    # the committed policy note is not lost on the first ratchet.
+    doc_keys = load_doc_keys(Path(args.baseline))
     out_path = Path(args.out)
-    out_path.write_text(json.dumps(updated, indent=2, sort_keys=True) + "\n")
+    out_path.write_text(json.dumps({**doc_keys, **updated}, indent=2, sort_keys=True) + "\n")
     changed = updated != baseline
     print(f"[eval-gate] wrote ratcheted baseline to {out_path} (changed={changed})")
     return 0
