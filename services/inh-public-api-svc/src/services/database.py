@@ -1,4 +1,4 @@
-"""Read-only database service for PostgreSQL access.
+"""PostgreSQL access for the public API (reads + document/eval writes).
 
 Supports two connection modes:
 1. Direct connection via DATABASE_URL (local development)
@@ -47,10 +47,10 @@ def _merge_chunk_provenance(row) -> dict:
 
 
 class DatabaseService:
-    """Read-only database service for PostgreSQL.
+    """PostgreSQL service for API keys, documents/chunks, and eval state.
 
-    This service provides read-only access to the PostgreSQL database
-    for API key validation and document/chunk queries.
+    Supports reads (search, listing, auth) and writes (document intake,
+    delete, status updates, eval capture/runs).
 
     Connection Modes:
         - Direct: Uses DATABASE_URL with asyncpg driver
