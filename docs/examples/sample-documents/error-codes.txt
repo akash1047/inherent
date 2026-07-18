@@ -1,0 +1,10 @@
+Inherent Knowledge Base — Error Code Reference
+
+This document lists error codes returned by the inh-public-api-svc REST API.
+
+ERR-4010: Invalid or missing X-API-Key header. The request was not authenticated.
+ERR-4030: The API key does not have access to the requested workspace.
+ERR-4040: The requested document_id was not found in this workspace.
+ERR-4130: The document payload exceeds the 50 MB upload size limit.
+ERR-5000: An unexpected internal error occurred while processing the request.
+ERR-5030: The vector index is temporarily unavailable; retry the request.

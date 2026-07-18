@@ -146,6 +146,37 @@ cd services/inh-ingestion-svc && uv run pytest -m failure_injection
 cd services/<svc> && uv run pytest -m benchmark
 ```
 
+## Retrieval-eval gate, baseline ratchet, and trend history (#139)
+
+`test_compose_retrieval_regression.py` (`retrieval_eval` + `compose`) hard-gates
+on regression, not just reporting: any per-mode metric (recall@5/MRR/nDCG@5)
+that drops more than `EVAL_GATE_TOLERANCE` (default `0.02`) below the committed
+`corpus/retrieval_baseline.json` fails the build, via
+`tests/evals/eval_gate.py`. An absolute-floor backstop
+(`RETRIEVAL_MIN_RECALL5`, default `0.15`) still applies underneath it.
+
+On a green gate on `main`, `.github/workflows/integration.yml`'s
+`eval-baseline-ratchet` job ratchets the baseline up to
+`max(current, baseline)` per mode/metric (never down) and appends a line to
+`corpus/retrieval_history.jsonl` — a durable, checked-in trend log of every
+main-branch run's scores, so retrieval quality over time is queryable without
+standing up new infra. On gate failure (push-to-main or nightly), the
+`eval-regression-alert` job files or updates an issue labeled
+`retrieval-eval-regression`. This does **not** gate PRs — the full Compose
+stack stays too slow/expensive to run on every PR (see the note at the top of
+`integration.yml`); regressions are caught post-merge, same as the rest of
+this workflow.
+
+The golden corpus (`corpus/qrels.jsonl`) tags each judgment with an optional
+`category`: `general`, `exact_id`, `stale_version`, `paraphrase`, or
+`abstention` (a query with no relevant document — the correct signal is zero
+recall/MRR/nDCG, not a fabricated match). Per-category scores are printed and
+written to the eval report (`_by_category`) for visibility; only the per-mode
+pooled averages are gated, and `abstention` queries are excluded from that
+pool since they can never contribute a positive score by construction.
+Permission/tenancy boundaries are deliberately not a category here — that's
+owned by the `security` marker suite, not this ranking-quality corpus.
+
 ## Coverage
 
 Coverage is enabled by default (`--cov=src --cov-report=term-missing`). To run
