@@ -38,7 +38,7 @@ class Settings(BaseSettings):
     environment: str = "development"
     version: str = "0.2.0"
 
-    # Database (Read-only access)
+    # Database (reads + document/eval writes; not a read-only role)
     database_url: str = "postgresql://postgres:postgres@localhost:5432/knowledge_base"
 
     # MongoDB (Read-only — for workspace ownership lookups; control-plane truth)
