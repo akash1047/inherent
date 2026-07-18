@@ -39,7 +39,7 @@ sequenceDiagram
         AU-->>EP: header id if owned, else 403
     else no header
         AU->>PG: get_user_workspace_ids(user_id)
-        AU-->>EP: single workspace → use it; multiple → workspace_id = None
+        AU-->>EP: single workspace → use it, multiple → workspace_id = None
     end
 
     alt Single workspace (workspace_id resolved)
@@ -57,7 +57,7 @@ sequenceDiagram
             EP->>SS: search(ws_N, user_id, request, query_vector)
         end
         Note over EP: per-workspace exception → log warning,<br/>contribute [] (partial-result policy #13)
-        EP->>EP: merge; sort by (-score, chunk_id, document_id);<br/>truncate to limit; wall-clock ms around gather
+        EP->>EP: merge, sort by (-score, chunk_id, document_id),<br/>truncate to limit, wall-clock ms around gather
     end
 
     Note over EP,QG: Adaptive quality gate + ONE bounded fallback (#43)
@@ -70,7 +70,7 @@ sequenceDiagram
             EP->>SS: retry with min_score=0, limit×2 capped at 100 (broadened_query)
         end
         EP->>QG: re-evaluate retry results (final verdict — never loops)
-        EP->>EP: replace results; performed_fallback=true;<br/>processing_time_ms += retry ms
+        EP->>EP: replace results, performed_fallback=true,<br/>processing_time_ms += retry ms
     end
 
     opt include_context=true (single-workspace scope only)
@@ -85,10 +85,10 @@ sequenceDiagram
 
     EP->>BG: schedule publish_audit_event<br/>(snippets, chunk_ids, risk counts, verdict, fallback)
     opt eval capture enabled for workspace
-        EP->>BG: mint event_id → response.event_id;<br/>schedule record_query_event
+        EP->>BG: mint event_id → response.event_id,<br/>schedule record_query_event
     end
     EP-->>C: 200 SearchResponse{results, total_results, processing_time_ms,<br/>search_mode, quality_verdict, performed_fallback, total_tokens, event_id}
-    Note over BG: background tasks run AFTER the response is sent<br/>(fire-and-forget; can never slow or fail the search)
+    Note over BG: background tasks run AFTER the response is sent<br/>(fire-and-forget, can never slow or fail the search)
 ```
 
 ## 2. Micro level — inside `SearchService.search()`
@@ -145,7 +145,7 @@ sequenceDiagram
 
     loop per chunk
         SS->>SS: score resolution:<br/>_additional.score (bm25/hybrid) → certainty →<br/>max(0, 1 − distance/2) → 0.0
-        SS->>SS: score provenance: score_source = bm25 | hybrid | vector;<br/>echo bm25_score / vector_similarity / alpha
+        SS->>SS: score provenance: score_source = bm25 | hybrid | vector,<br/>echo bm25_score / vector_similarity / alpha
         SS->>SS: drop chunk if score < min_score (client-side filter)
         SS->>SS: metadata passthrough (non-core fields kept)
         SS->>SS: freshness (#42): parse ingested_at →<br/>is_stale if older than freshness_max_age_days (flagged, never dropped)
@@ -179,7 +179,7 @@ sequenceDiagram
         Note over SS: identical internals — Diagram 2
         SS-->>T: results, tagged with workspace_id
     end
-    T->>T: sort by (-score, chunk_id, document_id); truncate to limit (#28)
+    T->>T: sort by (-score, chunk_id, document_id), truncate to limit (#28)
     T-->>A: markdown summary + structured JSON<br/>{workspace_id, chunk_id, document_id, content, score,<br/>score_source, is_stale, source_uri, content_hash}
 ```
 
