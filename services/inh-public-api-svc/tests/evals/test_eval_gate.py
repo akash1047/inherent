@@ -16,7 +16,9 @@ from tests.evals.eval_gate import (
     Regression,
     find_regressions,
     format_regressions,
+    load_doc_keys,
     load_metrics,
+    main,
     ratchet_baseline,
 )
 
@@ -49,6 +51,48 @@ def test_load_metrics_invalid_json_returns_empty(tmp_path):
     path = tmp_path / "bad.json"
     path.write_text("not json")
     assert load_metrics(path) == {}
+
+
+# ---------------------------------------------------------------------------
+# load_doc_keys
+# ---------------------------------------------------------------------------
+
+
+def test_load_doc_keys_returns_only_underscore_keys(tmp_path):
+    path = tmp_path / "baseline.json"
+    path.write_text(json.dumps({"_comment": "policy", "hybrid": {"recall@5": 0.5}}))
+    assert load_doc_keys(path) == {"_comment": "policy"}
+
+
+def test_load_doc_keys_missing_file_returns_empty(tmp_path):
+    assert load_doc_keys(tmp_path / "nope.json") == {}
+
+
+# ---------------------------------------------------------------------------
+# ratchet CLI (main) preserves documentation keys
+# ---------------------------------------------------------------------------
+
+
+def test_cli_ratchet_preserves_comment_and_ratchets(tmp_path):
+    """The ratchet CLI must keep the baseline's _comment and raise metrics.
+
+    Regression guard for the doc-key-stripping bug: the first ratchet used to
+    drop _comment (which documents the hard-gate policy) entirely.
+    """
+    baseline = tmp_path / "baseline.json"
+    baseline.write_text(json.dumps({"_comment": "policy note", "hybrid": {"recall@5": 0.50}}))
+    report = tmp_path / "report.json"
+    report.write_text(json.dumps({"hybrid": {"recall@5": 0.70}}))
+    out = tmp_path / "out.json"
+
+    exit_code = main(
+        ["ratchet", "--report", str(report), "--baseline", str(baseline), "--out", str(out)]
+    )
+
+    assert exit_code == 0
+    written = json.loads(out.read_text())
+    assert written["_comment"] == "policy note"
+    assert written["hybrid"]["recall@5"] == 0.70
 
 
 # ---------------------------------------------------------------------------
