@@ -245,18 +245,60 @@ jobs:
         if: steps.meta.outputs.skip != 'true'
         run: |
           set -euo pipefail
-          # Split cloud-init failures from app /health failures.
-          echo "Waiting for cloud-init to finish on ${SERVER_IPV4}..."
-          if ! timeout 600 ssh -i "$HETZNER_SSH_KEY" \
-            -o StrictHostKeyChecking=accept-new \
-            -o UserKnownHostsFile=/dev/null \
-            -o ConnectTimeout=30 \
+          SSH_OPTS=(-i "$HETZNER_SSH_KEY" -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o BatchMode=yes)
+
+          # Hetzner reports the server created before sshd is listening; a single
+          # ssh attempt right after apply routinely hits "Connection refused".
+          # Retry until sshd answers or a deadline passes, separately from the
+          # cloud-init wait below, so a refused connection is never misreported
+          # as a cloud-init timeout (#106).
+          echo "Waiting for SSH on ${SERVER_IPV4}..."
+          ssh_ready=0
+          last_err=""
+          ssh_deadline=$(( $(date +%s) + 180 ))
+          attempt=0
+          while [ "$(date +%s)" -lt "$ssh_deadline" ]; do
+            attempt=$((attempt + 1))
+            if last_err=$(ssh "${SSH_OPTS[@]}" "root@${SERVER_IPV4}" true 2>&1); then
+              ssh_ready=1
+              echo "SSH reachable after ${attempt} attempt(s)"
+              break
+            fi
+            # Auth/host-key failures are permanent, not a startup race — fail
+            # fast instead of burning the full budget retrying something that
+            # will never succeed, and surface the real reason (#106 follow-up:
+            # these were previously indistinguishable from "sshd not up yet"
+            # because stderr was discarded).
+            if echo "$last_err" | grep -qiE 'permission denied|host key verification failed'; then
+              echo "::error::SSH to ${SERVER_IPV4} failed with an auth/host-key error, not a connectivity race: ${last_err}"
+              exit 1
+            fi
+            echo "SSH not ready yet (attempt ${attempt}): ${last_err}"
+            sleep 5
+          done
+          if [ "$ssh_ready" -ne 1 ]; then
+            echo "::error::SSH to ${SERVER_IPV4} never became reachable within 180s (last error: ${last_err})"
+            exit 1
+          fi
+
+          echo "SSH reachable; waiting for cloud-init to finish on ${SERVER_IPV4}..."
+          if timeout 600 ssh "${SSH_OPTS[@]}" \
             "root@${SERVER_IPV4}" \
             "cloud-init status --wait"; then
-            echo "::error::cloud-init did not complete within 600s on ${SERVER_IPV4}"
-            ssh -i "$HETZNER_SSH_KEY" \
-              -o StrictHostKeyChecking=accept-new \
-              -o UserKnownHostsFile=/dev/null \
+            cloud_init_rc=0
+          else
+            cloud_init_rc=$?
+          fi
+          if [ "$cloud_init_rc" -ne 0 ]; then
+            # timeout(1) exits 124 specifically when it killed the command for
+            # running too long; any other non-zero code is ssh/cloud-init
+            # itself failing, not a 600s timeout, so say so distinctly.
+            if [ "$cloud_init_rc" -eq 124 ]; then
+              echo "::error::cloud-init did not complete within 600s on ${SERVER_IPV4}"
+            else
+              echo "::error::cloud-init check failed on ${SERVER_IPV4} (ssh/cloud-init exited ${cloud_init_rc}, not a 600s timeout)"
+            fi
+            ssh "${SSH_OPTS[@]}" \
               "root@${SERVER_IPV4}" \
               "cloud-init status || true; journalctl -u cloud-final --no-pager -n 80 || true" || true
             exit 1
@@ -274,9 +316,18 @@ jobs:
         if: steps.meta.outputs.skip != 'true'
         run: |
           # Pass per-run key into bootstrap (scripts/dev/bootstrap.sh reads API_KEY).
+          # ConnectTimeout/BatchMode bound connection setup and rule out an
+          # interactive prompt hang; SSH is already confirmed reachable by the
+          # previous step, so no retry loop needed here, just the same
+          # connect-time bounds (#106 follow-up: this was the one remaining
+          # unbounded ssh call in the job).
           ssh -i "$HETZNER_SSH_KEY" \
             -o StrictHostKeyChecking=accept-new \
             -o UserKnownHostsFile=/dev/null \
+            -o ConnectTimeout=10 \
+            -o BatchMode=yes \
+            -o ServerAliveInterval=5 \
+            -o ServerAliveCountMax=3 \
             "root@${SERVER_IPV4}" \
             "API_KEY=${INTEGRATION_API_KEY} bash -s" < scripts/dev/bootstrap.sh
 
@@ -322,11 +373,21 @@ jobs:
         if: failure() && steps.meta.outputs.skip != 'true'
         continue-on-error: true
         run: |
-          ssh -i "$HETZNER_SSH_KEY" \
-            -o StrictHostKeyChecking=accept-new \
-            -o UserKnownHostsFile=/dev/null \
+          # SSH may still be down here if the failure happened before it ever
+          # came up; check first so this reports cleanly instead of another
+          # confusing "Connection refused" (#106). Reuse the same bounded
+          # options for the real dump call too, plus keepalives so a session
+          # that blackholes post-connect gets torn down instead of hanging —
+          # a hung step here would block the always() Terraform destroy below
+          # and leave a paid VM running.
+          SSH_OPTS=(-i "$HETZNER_SSH_KEY" -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o BatchMode=yes -o ServerAliveInterval=5 -o ServerAliveCountMax=3)
+          if ! ssh "${SSH_OPTS[@]}" "root@${SERVER_IPV4}" true 2>/dev/null; then
+            echo "SSH to ${SERVER_IPV4} unreachable; skipping compose log dump"
+            exit 0
+          fi
+          timeout 60 ssh "${SSH_OPTS[@]}" \
             "root@${SERVER_IPV4}" \
-            'docker compose -f /opt/inherent/docker-compose.release.yml logs --no-color --tail=200'
+            'docker compose -f /opt/inherent/docker-compose.release.yml logs --no-color --tail=200' || true
 
       # Always destroy using remote CI state so CI never leaves a paid VM.
       - name: Terraform destroy
