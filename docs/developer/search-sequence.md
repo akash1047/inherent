@@ -3,11 +3,12 @@
 Traces the full search path at micro level. All file references are relative to
 `services/inh-public-api-svc/src/`.
 
-Three diagrams:
+Four diagrams:
 
 1. [End-to-end REST flow](#1-end-to-end-rest-flow--post-v1search) — `POST /v1/search`
 2. [Micro level inside `SearchService.search()`](#2-micro-level--inside-searchservicesearch)
 3. [MCP surface](#3-mcp-surface--search_documents--search_memory-tools) — `search_documents` / `search_memory`
+4. [Storage roles — upload to query](#4-storage-roles--weaviate-vs-postgres-upload-to-query) — how Weaviate and Postgres split the work
 
 ## 1. End-to-end REST flow — `POST /v1/search`
 
@@ -202,3 +203,81 @@ sequenceDiagram
 - **Nothing after retrieval slows the response**: audit publishing, eval
   capture, and metrics are background/best-effort; a cold DB or down MQ never
   affects the serving path.
+
+## 4. Storage roles — Weaviate vs Postgres (upload to query)
+
+Dual-store architecture: **Weaviate is the search index, Postgres is the
+system of record**. A single search touches both, at different moments, for
+different jobs. Ingestion file references are relative to
+`services/inh-ingestion-svc/src/`.
+
+### Ingestion — one document, two stores
+
+The live path is the Temporal workflow
+(`temporal/workflows/document_ingestion.py`). After extraction and chunking,
+staged chunks are written to both stores in parallel activities.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as User / Agent
+    participant WF as Temporal workflow<br/>document_ingestion.py
+    participant ST as Staging
+    participant PG as Postgres
+    participant TEI as TEI sidecar<br/>(MiniLM-L6-v2, 384-dim)
+    participant WV as Weaviate
+
+    U->>WF: upload document (via public API → MQ)
+    WF->>WF: fetch → extract_text → chunk_document
+    WF->>ST: stage chunk dicts (content, chunk_index,<br/>start/end_char, token_count, content_risk)
+
+    par store_in_postgresql (activities/store.py)
+        WF->>PG: processed_documents row (owner user_id, workspace_id,<br/>filename, status) + document_chunks rows<br/>(FK, chunk_index, content, token_count,<br/>start/end_char, content_hash, source_uri, ingested_at)
+        Note over PG: unique (processed_document_id, chunk_index) —<br/>chunk ORDER is a relational fact
+    and store_in_weaviate (activities/store.py)
+        WF->>TEI: embed_texts(all chunk texts) — ONE batch,<br/>asyncio.to_thread (#19)
+        TEI-->>WF: 384-dim vector per chunk
+        WF->>WV: ensure collection Ws_<base32(workspace_id)><br/>+ tenant <base32(user_id)>, then insert objects<br/>{vector + text + metadata} (Vectorizer.none —<br/>vectors always computed client-side)
+        Note over WV: text is also BM25-indexed →<br/>serves keyword and hybrid modes too
+        Note over WF,WV: Weaviate down → activity raises,<br/>Temporal retries, doc marked failed —<br/>never silently half-indexed
+    end
+```
+
+After upload the same chunk exists twice: in Weaviate as
+*(vector + text + metadata)* for retrieval, in Postgres as an ordered row for
+everything else.
+
+### Query — how the stores alternate
+
+1. **Postgres — authorization first.** API-key validation and
+   `get_user_workspace_ids(user_id)` decide which workspaces the fan-out may
+   touch. Weaviate is never queried for a workspace Postgres didn't authorize.
+2. **TEI — query becomes a vector.** Same model as ingestion, so query↔chunk
+   cosine comparison is meaningful. Keyword mode skips this.
+3. **Weaviate — the actual search.** `nearVector` / `hybrid` / `bm25` per
+   workspace, scoped to collection + tenant. Ranking and scoring is purely
+   Weaviate — Postgres plays no part.
+4. **Postgres — context expansion.** With `include_context=true`,
+   `ContextWindowBuilder` fetches the chunks *around* each match
+   (`[idx−k, idx+k]`) from `document_chunks` in one batched range query —
+   trivial in SQL, awkward in a vector store; this is why the dual store
+   exists. The join to `processed_documents.user_id` stops a shared workspace
+   leaking another user's neighbour chunks (#41). The rows' `token_count`
+   powers `total_tokens`, so an agent knows the context-budget cost up front.
+5. **Postgres — after the response.** Eval-capture events are written in
+   background tasks, never on the serving path.
+
+### Division of labour
+
+| Concern | Store |
+|---|---|
+| Who are you, which workspaces you may search | Postgres |
+| Which chunks match the query (rank + score) | Weaviate |
+| What surrounds a match (context windows, chunk order) | Postgres |
+| Token accounting (`total_tokens`) | Postgres (`token_count`) |
+| Document delete | Both — vectors deleted first, then the DB row, so orphaned vectors never survive a "deleted" document (#87) |
+
+Failure-mode consequence of the split: Postgres may hold a document's rows
+before its vectors land in Weaviate (the ingest→search race) — the document
+only becomes findable once Weaviate has it; until then search returns empty,
+not an error.
