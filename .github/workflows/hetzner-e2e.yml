@@ -254,20 +254,30 @@ jobs:
           # as a cloud-init timeout (#106).
           echo "Waiting for SSH on ${SERVER_IPV4}..."
           ssh_ready=0
+          last_err=""
           ssh_deadline=$(( $(date +%s) + 180 ))
           attempt=0
           while [ "$(date +%s)" -lt "$ssh_deadline" ]; do
             attempt=$((attempt + 1))
-            if ssh "${SSH_OPTS[@]}" "root@${SERVER_IPV4}" true 2>/dev/null; then
+            if last_err=$(ssh "${SSH_OPTS[@]}" "root@${SERVER_IPV4}" true 2>&1); then
               ssh_ready=1
               echo "SSH reachable after ${attempt} attempt(s)"
               break
             fi
-            echo "SSH not ready yet (attempt ${attempt}); retrying in 5s..."
+            # Auth/host-key failures are permanent, not a startup race — fail
+            # fast instead of burning the full budget retrying something that
+            # will never succeed, and surface the real reason (#106 follow-up:
+            # these were previously indistinguishable from "sshd not up yet"
+            # because stderr was discarded).
+            if echo "$last_err" | grep -qiE 'permission denied|host key verification failed'; then
+              echo "::error::SSH to ${SERVER_IPV4} failed with an auth/host-key error, not a connectivity race: ${last_err}"
+              exit 1
+            fi
+            echo "SSH not ready yet (attempt ${attempt}): ${last_err}"
             sleep 5
           done
           if [ "$ssh_ready" -ne 1 ]; then
-            echo "::error::SSH to ${SERVER_IPV4} never became reachable within 180s"
+            echo "::error::SSH to ${SERVER_IPV4} never became reachable within 180s (last error: ${last_err})"
             exit 1
           fi
 
@@ -306,9 +316,18 @@ jobs:
         if: steps.meta.outputs.skip != 'true'
         run: |
           # Pass per-run key into bootstrap (scripts/dev/bootstrap.sh reads API_KEY).
+          # ConnectTimeout/BatchMode bound connection setup and rule out an
+          # interactive prompt hang; SSH is already confirmed reachable by the
+          # previous step, so no retry loop needed here, just the same
+          # connect-time bounds (#106 follow-up: this was the one remaining
+          # unbounded ssh call in the job).
           ssh -i "$HETZNER_SSH_KEY" \
             -o StrictHostKeyChecking=accept-new \
             -o UserKnownHostsFile=/dev/null \
+            -o ConnectTimeout=10 \
+            -o BatchMode=yes \
+            -o ServerAliveInterval=5 \
+            -o ServerAliveCountMax=3 \
             "root@${SERVER_IPV4}" \
             "API_KEY=${INTEGRATION_API_KEY} bash -s" < scripts/dev/bootstrap.sh
 
