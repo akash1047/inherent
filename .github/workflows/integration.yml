@@ -182,7 +182,12 @@ jobs:
   eval-baseline-ratchet:
     name: Ratchet retrieval-eval baseline
     needs: compose-integration
-    if: github.ref == 'refs/heads/main' && success()
+    # Guard to the upstream repo only: on a fork this job would otherwise push
+    # a "chore(evals): ratchet retrieval baseline" commit straight back to the
+    # fork's main on every sync, creating a fork-vs-upstream divergence loop
+    # (force-pushing to resync doesn't break it -- it's still a push to main,
+    # so the workflow just fires and commits again).
+    if: github.repository == 'inherent-prime/inherent' && github.ref == 'refs/heads/main' && success()
     runs-on: ubuntu-latest
     permissions:
       contents: write
