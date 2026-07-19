@@ -272,10 +272,22 @@ jobs:
           fi
 
           echo "SSH reachable; waiting for cloud-init to finish on ${SERVER_IPV4}..."
-          if ! timeout 600 ssh "${SSH_OPTS[@]}" \
+          if timeout 600 ssh "${SSH_OPTS[@]}" \
             "root@${SERVER_IPV4}" \
             "cloud-init status --wait"; then
-            echo "::error::cloud-init did not complete within 600s on ${SERVER_IPV4}"
+            cloud_init_rc=0
+          else
+            cloud_init_rc=$?
+          fi
+          if [ "$cloud_init_rc" -ne 0 ]; then
+            # timeout(1) exits 124 specifically when it killed the command for
+            # running too long; any other non-zero code is ssh/cloud-init
+            # itself failing, not a 600s timeout, so say so distinctly.
+            if [ "$cloud_init_rc" -eq 124 ]; then
+              echo "::error::cloud-init did not complete within 600s on ${SERVER_IPV4}"
+            else
+              echo "::error::cloud-init check failed on ${SERVER_IPV4} (ssh/cloud-init exited ${cloud_init_rc}, not a 600s timeout)"
+            fi
             ssh "${SSH_OPTS[@]}" \
               "root@${SERVER_IPV4}" \
               "cloud-init status || true; journalctl -u cloud-final --no-pager -n 80 || true" || true
@@ -344,19 +356,15 @@ jobs:
         run: |
           # SSH may still be down here if the failure happened before it ever
           # came up; check first so this reports cleanly instead of another
-          # confusing "Connection refused" (#106).
-          if ! ssh -i "$HETZNER_SSH_KEY" \
-            -o StrictHostKeyChecking=accept-new \
-            -o UserKnownHostsFile=/dev/null \
-            -o ConnectTimeout=10 \
-            -o BatchMode=yes \
-            "root@${SERVER_IPV4}" true 2>/dev/null; then
+          # confusing "Connection refused" (#106). Reuse the same bounded
+          # options for the real dump call too, so a connection that goes
+          # flaky between the probe and the dump can't hang the step.
+          SSH_OPTS=(-i "$HETZNER_SSH_KEY" -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o BatchMode=yes)
+          if ! ssh "${SSH_OPTS[@]}" "root@${SERVER_IPV4}" true 2>/dev/null; then
             echo "SSH to ${SERVER_IPV4} unreachable; skipping compose log dump"
             exit 0
           fi
-          ssh -i "$HETZNER_SSH_KEY" \
-            -o StrictHostKeyChecking=accept-new \
-            -o UserKnownHostsFile=/dev/null \
+          ssh "${SSH_OPTS[@]}" \
             "root@${SERVER_IPV4}" \
             'docker compose -f /opt/inherent/docker-compose.release.yml logs --no-color --tail=200'
 
