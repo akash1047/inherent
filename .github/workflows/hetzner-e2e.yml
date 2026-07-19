@@ -245,18 +245,38 @@ jobs:
         if: steps.meta.outputs.skip != 'true'
         run: |
           set -euo pipefail
-          # Split cloud-init failures from app /health failures.
-          echo "Waiting for cloud-init to finish on ${SERVER_IPV4}..."
-          if ! timeout 600 ssh -i "$HETZNER_SSH_KEY" \
-            -o StrictHostKeyChecking=accept-new \
-            -o UserKnownHostsFile=/dev/null \
-            -o ConnectTimeout=30 \
+          SSH_OPTS=(-i "$HETZNER_SSH_KEY" -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o BatchMode=yes)
+
+          # Hetzner reports the server created before sshd is listening; a single
+          # ssh attempt right after apply routinely hits "Connection refused".
+          # Retry until sshd answers or a deadline passes, separately from the
+          # cloud-init wait below, so a refused connection is never misreported
+          # as a cloud-init timeout (#106).
+          echo "Waiting for SSH on ${SERVER_IPV4}..."
+          ssh_ready=0
+          ssh_deadline=$(( $(date +%s) + 180 ))
+          attempt=0
+          while [ "$(date +%s)" -lt "$ssh_deadline" ]; do
+            attempt=$((attempt + 1))
+            if ssh "${SSH_OPTS[@]}" "root@${SERVER_IPV4}" true 2>/dev/null; then
+              ssh_ready=1
+              echo "SSH reachable after ${attempt} attempt(s)"
+              break
+            fi
+            echo "SSH not ready yet (attempt ${attempt}); retrying in 5s..."
+            sleep 5
+          done
+          if [ "$ssh_ready" -ne 1 ]; then
+            echo "::error::SSH to ${SERVER_IPV4} never became reachable within 180s"
+            exit 1
+          fi
+
+          echo "SSH reachable; waiting for cloud-init to finish on ${SERVER_IPV4}..."
+          if ! timeout 600 ssh "${SSH_OPTS[@]}" \
             "root@${SERVER_IPV4}" \
             "cloud-init status --wait"; then
             echo "::error::cloud-init did not complete within 600s on ${SERVER_IPV4}"
-            ssh -i "$HETZNER_SSH_KEY" \
-              -o StrictHostKeyChecking=accept-new \
-              -o UserKnownHostsFile=/dev/null \
+            ssh "${SSH_OPTS[@]}" \
               "root@${SERVER_IPV4}" \
               "cloud-init status || true; journalctl -u cloud-final --no-pager -n 80 || true" || true
             exit 1
@@ -322,6 +342,18 @@ jobs:
         if: failure() && steps.meta.outputs.skip != 'true'
         continue-on-error: true
         run: |
+          # SSH may still be down here if the failure happened before it ever
+          # came up; check first so this reports cleanly instead of another
+          # confusing "Connection refused" (#106).
+          if ! ssh -i "$HETZNER_SSH_KEY" \
+            -o StrictHostKeyChecking=accept-new \
+            -o UserKnownHostsFile=/dev/null \
+            -o ConnectTimeout=10 \
+            -o BatchMode=yes \
+            "root@${SERVER_IPV4}" true 2>/dev/null; then
+            echo "SSH to ${SERVER_IPV4} unreachable; skipping compose log dump"
+            exit 0
+          fi
           ssh -i "$HETZNER_SSH_KEY" \
             -o StrictHostKeyChecking=accept-new \
             -o UserKnownHostsFile=/dev/null \
