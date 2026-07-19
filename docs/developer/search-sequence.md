@@ -1,3 +1,8 @@
+---
+search:
+  exclude: true
+---
+
 # Search — sequence diagrams
 
 Traces the full search path at micro level. All file references are relative to
@@ -16,7 +21,7 @@ Four diagrams:
 sequenceDiagram
     autonumber
     participant C as Agent / Client
-    participant MW as Middleware stack<br/>(RateLimiting → Audit → Auth → RequestCtx → SecHeaders → CORS)
+    participant MW as Middleware stack<br/>(CORS → SecHeaders → RequestCtx → Auth → Audit → RateLimiting)
     participant EP as search_documents()<br/>api/v1/search.py
     participant AU as Auth deps<br/>services/auth.py
     participant PG as Postgres<br/>DatabaseService
@@ -26,7 +31,7 @@ sequenceDiagram
     participant BG as BackgroundTasks
 
     C->>MW: POST /v1/search {query, limit, min_score, document_ids,<br/>include_context, context_window, search_mode, alpha}<br/>Headers: X-API-Key, X-Workspace-Id?, X-Source?
-    MW->>EP: request passes rate limit + audit logging middleware
+    MW->>EP: request passes CORS → SecHeaders → RequestCtx → Auth → Audit → RateLimiting
 
     Note over EP,AU: FastAPI dependency resolution (before handler body)
     EP->>AU: get_api_key_info(X-API-Key or Authorization: Bearer)
@@ -50,7 +55,7 @@ sequenceDiagram
     else Multi-workspace (workspace_id = None)
         EP->>PG: get_user_workspace_ids(user_id)
         opt no workspaces
-            EP-->>C: empty SearchResponse + quality_verdict(no_results)
+            EP-->>C: empty SearchResponse + quality_verdict<br/>verdict=insufficient_evidence, reason_code=no_results
         end
         EP->>SS: embed_query_vector(request) once<br/>(asyncio.to_thread, skipped for keyword mode)
         par asyncio.gather, bounded by Semaphore(search_max_workspace_concurrency)
@@ -71,10 +76,10 @@ sequenceDiagram
             EP->>SS: retry with min_score=0, limit×2 capped at 100 (broadened_query)
         end
         EP->>QG: re-evaluate retry results (final verdict — never loops)
-        EP->>EP: replace results, performed_fallback=true,<br/>processing_time_ms += retry ms
+        EP->>EP: replace results, performed_fallback=true,<br/>fallback_strategy set, processing_time_ms += retry ms
     end
 
-    opt include_context=true (single-workspace scope only)
+    opt include_context=true (single-workspace-scoped request only)
         EP->>CW: expand(matches, workspace_id, user_id, k=context_window)
         CW->>CW: _compute_ranges: per match [idx−k, idx+k],<br/>merge overlapping/adjacent per document
         CW->>PG: get_context_chunks(workspace_id, user_id, ranges)<br/>— ONE batched query, user-scoped (#41)
@@ -85,10 +90,11 @@ sequenceDiagram
     EP->>EP: Prometheus counters (best-effort, never fails request)
 
     EP->>BG: schedule publish_audit_event<br/>(snippets, chunk_ids, risk counts, verdict, fallback)
-    opt eval capture enabled for workspace
+    opt single-workspace scope and eval capture enabled for workspace
         EP->>BG: mint event_id → response.event_id,<br/>schedule record_query_event
+        Note over EP,BG: multi-workspace search never sets event_id
     end
-    EP-->>C: 200 SearchResponse{results, total_results, processing_time_ms,<br/>search_mode, quality_verdict, performed_fallback, total_tokens, event_id}
+    EP-->>C: 200 SearchResponse{query, results, total_results, processing_time_ms,<br/>search_mode, quality_verdict, performed_fallback, fallback_strategy,<br/>total_tokens, event_id}
     Note over BG: background tasks run AFTER the response is sent<br/>(fire-and-forget, can never slow or fail the search)
 ```
 
@@ -99,7 +105,7 @@ sequenceDiagram
     autonumber
     participant SS as SearchService
     participant EM as embedder.embed_query()<br/>(LRU cache 1024)
-    participant TEI as TEI sidecar<br/>(MiniLM-L6-v2, 384-dim)
+    participant TEI as TEI sidecar<br/>(BAAI/bge-small-en-v1.5, 384-dim)
     participant WV as Weaviate
 
     Note over SS: search() → _search_weaviate() → _apply_advanced_methods() (no-op)
@@ -181,7 +187,7 @@ sequenceDiagram
         SS-->>T: results, tagged with workspace_id
     end
     T->>T: sort by (-score, chunk_id, document_id), truncate to limit (#28)
-    T-->>A: markdown summary + structured JSON<br/>{workspace_id, chunk_id, document_id, content, score,<br/>score_source, is_stale, source_uri, content_hash}
+    T-->>A: markdown summary + structured JSON<br/>{workspace_id, chunk_id, document_id, document_name, content, score,<br/>score_source, is_stale, source_uri, content_hash}
 ```
 
 ## Behavioural invariants
@@ -190,9 +196,11 @@ sequenceDiagram
   bounded to one attempt by construction — the retry's verdict is recorded but
   never triggers another fallback, and a fallback exception is swallowed so it
   can never fail the original request.
-- **Context expansion skipped for multi-workspace**: expanding a match against
-  a workspace that isn't its own risks a cross-tenant neighbour read (#30), so
-  `include_context` is honoured only when the user has exactly one workspace.
+- **Context expansion only for single-workspace-scoped requests**: expanding a
+  match against a workspace that isn't its own risks a cross-tenant neighbour
+  read (#30), so `include_context` is honoured only when the request resolves
+  to a single `workspace_id` (workspace-scoped key, `X-Workspace-Id`, or sole
+  owned workspace). Multi-workspace fan-out (`workspace_id is None`) skips it.
 - **Three-layer tenant isolation**: workspace collection + user tenant on every
   Weaviate query, `_require_safe_name` against GraphQL injection, and the
   fan-out only over `get_user_workspace_ids` — a fallback retry can never widen
@@ -200,6 +208,9 @@ sequenceDiagram
 - **MCP vs REST**: MCP searches workspaces sequentially (no semaphore/gather)
   and has no quality gate/fallback and no context-window expansion — those are
   REST-endpoint features layered above `SearchService`.
+- **Eval capture is single-workspace only**: `event_id` / `record_query_event`
+  run only when the REST request resolved a single `workspace_id`. Multi-
+  workspace search never sets `event_id`.
 - **Nothing after retrieval slows the response**: audit publishing, eval
   capture, and metrics are background/best-effort; a cold DB or down MQ never
   affects the serving path.
@@ -224,17 +235,17 @@ sequenceDiagram
     participant WF as Temporal workflow<br/>document_ingestion.py
     participant ST as Staging
     participant PG as Postgres
-    participant TEI as TEI sidecar<br/>(MiniLM-L6-v2, 384-dim)
+    participant TEI as TEI sidecar<br/>(BAAI/bge-small-en-v1.5, 384-dim)
     participant WV as Weaviate
 
     U->>WF: upload document (via public API → MQ)
-    WF->>WF: fetch → extract_text → chunk_document
+    WF->>WF: fetch → extract_text → chunk_text
     WF->>ST: stage chunk dicts (content, chunk_index,<br/>start/end_char, token_count, content_risk)
 
-    par store_in_postgresql (activities/store.py)
+    par store_in_postgresql (temporal/activities/store.py)
         WF->>PG: processed_documents row (owner user_id, workspace_id,<br/>filename, status) + document_chunks rows<br/>(FK, chunk_index, content, token_count,<br/>start/end_char, content_hash, source_uri, ingested_at)
         Note over PG: unique (processed_document_id, chunk_index) —<br/>chunk ORDER is a relational fact
-    and store_in_weaviate (activities/store.py)
+    and store_in_weaviate (temporal/activities/store.py)
         WF->>TEI: embed_texts(all chunk texts) — ONE batch,<br/>asyncio.to_thread (#19)
         TEI-->>WF: 384-dim vector per chunk
         WF->>WV: ensure collection Ws_<base32(workspace_id)><br/>+ tenant <base32(user_id)>, then insert objects<br/>{vector + text + metadata} (Vectorizer.none —<br/>vectors always computed client-side)
@@ -252,20 +263,23 @@ everything else.
 1. **Postgres — authorization first.** API-key validation and
    `get_user_workspace_ids(user_id)` decide which workspaces the fan-out may
    touch. Weaviate is never queried for a workspace Postgres didn't authorize.
-2. **TEI — query becomes a vector.** Same model as ingestion, so query↔chunk
-   cosine comparison is meaningful. Keyword mode skips this.
+2. **TEI — query becomes a vector.** Same model as ingestion
+   (`EMBEDDING_MODEL_ID`, default `BAAI/bge-small-en-v1.5`, 384-dim), so
+   query↔chunk cosine comparison is meaningful. Keyword mode skips this.
 3. **Weaviate — the actual search.** `nearVector` / `hybrid` / `bm25` per
    workspace, scoped to collection + tenant. Ranking and scoring is purely
    Weaviate — Postgres plays no part.
-4. **Postgres — context expansion.** With `include_context=true`,
-   `ContextWindowBuilder` fetches the chunks *around* each match
-   (`[idx−k, idx+k]`) from `document_chunks` in one batched range query —
-   trivial in SQL, awkward in a vector store; this is why the dual store
-   exists. The join to `processed_documents.user_id` stops a shared workspace
-   leaking another user's neighbour chunks (#41). The rows' `token_count`
-   powers `total_tokens`, so an agent knows the context-budget cost up front.
+4. **Postgres — context expansion.** With `include_context=true` on a
+   single-workspace-scoped request, `ContextWindowBuilder` fetches the chunks
+   *around* each match (`[idx−k, idx+k]`) from `document_chunks` in one batched
+   range query — trivial in SQL, awkward in a vector store; this is why the dual
+   store exists. The join to `processed_documents.user_id` stops a shared
+   workspace leaking another user's neighbour chunks (#41). The rows'
+   `token_count` powers `total_tokens`, so an agent knows the context-budget
+   cost up front.
 5. **Postgres — after the response.** Eval-capture events are written in
-   background tasks, never on the serving path.
+   background tasks on single-workspace searches only, never on the serving
+   path.
 
 ### Division of labour
 
