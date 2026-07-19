@@ -357,16 +357,18 @@ jobs:
           # SSH may still be down here if the failure happened before it ever
           # came up; check first so this reports cleanly instead of another
           # confusing "Connection refused" (#106). Reuse the same bounded
-          # options for the real dump call too, so a connection that goes
-          # flaky between the probe and the dump can't hang the step.
-          SSH_OPTS=(-i "$HETZNER_SSH_KEY" -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o BatchMode=yes)
+          # options for the real dump call too, plus keepalives so a session
+          # that blackholes post-connect gets torn down instead of hanging —
+          # a hung step here would block the always() Terraform destroy below
+          # and leave a paid VM running.
+          SSH_OPTS=(-i "$HETZNER_SSH_KEY" -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o BatchMode=yes -o ServerAliveInterval=5 -o ServerAliveCountMax=3)
           if ! ssh "${SSH_OPTS[@]}" "root@${SERVER_IPV4}" true 2>/dev/null; then
             echo "SSH to ${SERVER_IPV4} unreachable; skipping compose log dump"
             exit 0
           fi
-          ssh "${SSH_OPTS[@]}" \
+          timeout 60 ssh "${SSH_OPTS[@]}" \
             "root@${SERVER_IPV4}" \
-            'docker compose -f /opt/inherent/docker-compose.release.yml logs --no-color --tail=200'
+            'docker compose -f /opt/inherent/docker-compose.release.yml logs --no-color --tail=200' || true
 
       # Always destroy using remote CI state so CI never leaves a paid VM.
       - name: Terraform destroy
