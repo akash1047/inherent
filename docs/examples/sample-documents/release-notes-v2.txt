@@ -1,0 +1,10 @@
+Inherent Knowledge Base — Release Notes (v2, current)
+
+This document describes the current chunking behavior and supersedes
+release-notes-v1.txt.
+
+Chunking: documents are now split into chunks of 512 tokens with a 50-token
+overlap between consecutive chunks, up from the 256-token, no-overlap
+chunking used in the previous release.
+
+Embeddings: generated per chunk using the configured embedding model.

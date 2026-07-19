@@ -14,6 +14,15 @@
 
 # Inherent
 
+<p align="center">
+  <a href="https://github.com/inherent-prime/inherent/actions/workflows/ci.yml">
+    <img src="https://github.com/inherent-prime/inherent/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI status" />
+  </a>
+  <a href="https://github.com/inherent-prime/inherent/actions/workflows/integration.yml">
+    <img src="https://github.com/inherent-prime/inherent/actions/workflows/integration.yml/badge.svg?branch=main" alt="Integration (Compose e2e + retrieval-eval gate) status" />
+  </a>
+</p>
+
 Build your private company brain.
 
 Inherent is the backend for turning company knowledge into something AI systems can actually query.

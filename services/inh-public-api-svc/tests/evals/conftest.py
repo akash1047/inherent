@@ -66,6 +66,17 @@ def golden_corpus() -> dict:
         - ``relevance``: ``{query_id: {document_id: relevance}}`` grades.
         - ``relevant``: ``{query_id: set(document_id)}`` of positively-judged ids
           (relevance > 0), convenient for binary metrics.
+        - ``category``: ``{query_id: category}`` (defaults to ``"general"`` when
+          a judgment omits the optional ``category`` field). Categories cover
+          the query archetypes production RAG evals should exercise beyond
+          generic doc lookup: ``exact_id`` (identifiers/error codes),
+          ``stale_version`` (superseded vs. current docs), ``paraphrase``
+          (semantically-equivalent, differently-worded query), and
+          ``abstention`` (no relevant document exists in the corpus -- the
+          correct retrieval-layer signal is zero recall/MRR/nDCG, not a
+          fabricated match). Permission/tenancy boundaries are deliberately
+          NOT a category here -- that's owned by the ``security`` marker suite
+          (auth/tenancy isolation), not the ranking-quality corpus.
         - ``sample_dir``: path to the shared sample-document fixtures.
     """
     judgments = _load_qrels()
@@ -73,10 +84,12 @@ def golden_corpus() -> dict:
     queries: dict[str, str] = {}
     relevance: dict[str, dict[str, int]] = {}
     relevant: dict[str, set[str]] = {}
+    category: dict[str, str] = {}
 
     for j in judgments:
         qid = j["query_id"]
         queries.setdefault(qid, j["query"])
+        category.setdefault(qid, j.get("category", "general"))
         rel = int(j["relevance"])
         relevance.setdefault(qid, {})[j["document_id"]] = rel
         if rel > 0:
@@ -87,5 +100,6 @@ def golden_corpus() -> dict:
         "queries": queries,
         "relevance": relevance,
         "relevant": relevant,
+        "category": category,
         "sample_dir": SAMPLE_DIR,
     }

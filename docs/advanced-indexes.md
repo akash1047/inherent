@@ -30,6 +30,11 @@ metrics: recall@k, MRR, nDCG@k). Advanced methods add cost and complexity and ca
 *regress* quality if added blindly, so none of them ships on until it has *proven*
 it helps on that baseline.
 
+As of #139, that baseline is a **hard, ratcheting CI gate**
+(`corpus/retrieval_baseline.json`, checked by `tests/evals/eval_gate.py`), not
+just a documented number — see
+[docs/testing.md § Retrieval-eval gate](testing.md#retrieval-eval-gate-baseline-ratchet-and-trend-history-139).
+
 ## Eval-gate policy
 
 **No advanced method may be enabled by default without BOTH:**

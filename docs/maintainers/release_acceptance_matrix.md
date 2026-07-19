@@ -61,6 +61,13 @@ green `integration.yml` run as the final release gate.
 Locally you can reproduce it with `make dev` (stack up) followed by
 `make test-integration`.
 
+The retrieval-eval suite is a **hard gate**, not reporting-only (#139): it
+fails on any per-mode metric regression vs. the committed
+`corpus/retrieval_baseline.json` beyond `EVAL_GATE_TOLERANCE`. A green run on
+`main` ratchets the baseline up (never down) and appends to
+`corpus/retrieval_history.jsonl`; see
+[docs/testing.md § Retrieval-eval gate](../testing.md#retrieval-eval-gate-baseline-ratchet-and-trend-history-139).
+
 ## README claim → covering tests
 
 | README / product claim                                              | Covering suite(s) |

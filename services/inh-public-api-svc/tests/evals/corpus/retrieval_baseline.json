@@ -1,5 +1,5 @@
 {
-  "_comment": "Retrieval eval baseline (#37). Per-mode mean metrics over the golden corpus, seeded at the loose floor as a documented starting point. This is REPORTING/governance only: the compose retrieval eval prints a baseline-vs-current diff but does NOT hard-fail on regression beyond the existing loose recall@5 assertion. Ratchet these values up toward measured numbers as retrieval stabilizes.",
+  "_comment": "Retrieval eval baseline (#37 -> hard gate, #139). Per-mode mean metrics over the golden corpus. This is now a HARD GATE, not reporting-only: the compose retrieval eval fails the build when any per-mode metric regresses beyond EVAL_GATE_TOLERANCE below these numbers (tests/evals/eval_gate.py), on top of the absolute RETRIEVAL_MIN_RECALL5 floor. A green run on main ratchets these values up to max(current, baseline) per mode/metric (never down) and pushes them back via .github/workflows/integration.yml. Seeded at zeros so the relative gate is a no-op until the first main run measures and ratchets real numbers; the absolute floor guards until then.",
   "semantic": {
     "recall@5": 0.0,
     "mrr": 0.0,
