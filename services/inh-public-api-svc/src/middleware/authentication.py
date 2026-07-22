@@ -11,6 +11,7 @@ from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoin
 from starlette.requests import Request
 from starlette.responses import Response
 
+from src.services import metrics
 from src.utils import get_logger
 
 logger = get_logger(__name__)
@@ -35,8 +36,13 @@ class AuthenticationMiddleware(BaseHTTPMiddleware):
     """
 
     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
-        # Initialize state so downstream middleware always finds the attribute
+        # Initialize state so downstream middleware always finds the attribute.
+        # auth_error distinguishes "backend errored" from "no/invalid key" so
+        # rate limiting (#149) doesn't punish a holder of a valid, high-limit
+        # key as harshly as a truly unauthenticated caller just because the
+        # auth backend had a transient blip.
         request.state.api_key_info = None
+        request.state.auth_error = False
 
         # Skip exempt paths (health, metrics)
         if request.url.path in EXEMPT_PATHS:
@@ -47,14 +53,21 @@ class AuthenticationMiddleware(BaseHTTPMiddleware):
         if not api_key:
             return await call_next(request)
 
-        # Validate key -- catch ALL errors to never break the pipeline
+        # Validate key -- catch ALL errors to never break the pipeline. A failure
+        # here must still be visible (warning + metric), not just a debug log,
+        # since it silently changes which rate-limit bucket the request lands in.
         try:
             auth_service = await get_auth_service()
             key_info = await auth_service.validate_api_key(api_key)
             if key_info and not key_info.is_expired():
                 request.state.api_key_info = key_info
         except Exception:
-            logger.debug("Auth middleware: key validation failed", exc_info=True)
+            logger.warning("Auth middleware: key validation failed", exc_info=True)
+            # Distinct from error_handler.py's "validation_error" (malformed
+            # request body) -- this is the auth backend itself failing, not a
+            # bad key or bad input.
+            metrics.record_auth_failure("auth_backend_error")
+            request.state.auth_error = True
 
         return await call_next(request)
 
