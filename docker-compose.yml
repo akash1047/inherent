@@ -210,6 +210,46 @@ services:
     networks:
       - inherent-oss
 
+  # auto-setup only registers "default" (#148). The ingestion audit worker
+  # (settings.temporal_audit_namespace) dispatches to a separate namespace so
+  # audit-log workflows don't compete with document-ingestion ones; register
+  # it here, once, before the ingestion worker starts.
+  temporal-init:
+    image: temporalio/admin-tools:1.24.2-tctl-1.18.1-cli-1.0.0
+    container_name: inherent-oss-temporal-init
+    entrypoint: []
+    depends_on:
+      temporal:
+        condition: service_healthy
+    environment:
+      TEMPORAL_AUDIT_NAMESPACE: ${TEMPORAL_AUDIT_NAMESPACE:-audit}
+    command:
+      - /bin/sh
+      - -lc
+      - |
+        set -e
+        # --namespace must precede the subcommand -- `namespace describe/register
+        # <name>` silently ignores a trailing positional name and operates on
+        # the default namespace instead, which made this check a false-positive
+        # no-op (#148 follow-up: verified against a live cluster).
+        if DESCRIBE_OUT=$$(tctl --address temporal:7233 --namespace "$$TEMPORAL_AUDIT_NAMESPACE" namespace describe 2>&1); then
+          echo "Temporal namespace '$$TEMPORAL_AUDIT_NAMESPACE' already registered."
+        elif echo "$$DESCRIBE_OUT" | grep -qi "notfound\|not found"; then
+          echo "Registering Temporal namespace '$$TEMPORAL_AUDIT_NAMESPACE'..."
+          tctl --address temporal:7233 --namespace "$$TEMPORAL_AUDIT_NAMESPACE" namespace register --retention 3
+        else
+          # Any other describe failure (network flake, version mismatch) must
+          # NOT be treated as "missing" -- blindly registering on top of a
+          # transient error could itself fail and permanently block ingestion
+          # boot (service_completed_successfully never succeeds).
+          echo "$$DESCRIBE_OUT" >&2
+          echo "Temporal namespace describe failed for a reason other than 'not found' -- refusing to register blindly." >&2
+          exit 1
+        fi
+    restart: "no"
+    networks:
+      - inherent-oss
+
   inh-ingestion-svc:
     build:
       # Build from the repo root so the sibling shared package
@@ -238,6 +278,7 @@ services:
       TEMPORAL_HOST: temporal:7233
       TEMPORAL_NAMESPACE: default
       TEMPORAL_TASK_QUEUE: document-ingestion
+      TEMPORAL_AUDIT_NAMESPACE: ${TEMPORAL_AUDIT_NAMESPACE:-audit}
       INGESTION_API_KEY: ${INGESTION_API_KEY:-dev-ingestion-key}
       API_HOST: 0.0.0.0
       API_PORT: 8000
@@ -260,6 +301,8 @@ services:
         condition: service_healthy
       temporal:
         condition: service_healthy
+      temporal-init:
+        condition: service_completed_successfully
       text-embeddings-inference:
         condition: service_healthy
     healthcheck:

@@ -73,10 +73,9 @@ class RateLimitingMiddleware(BaseHTTPMiddleware):
 
         # Determine the rate-limit bucket. An authenticated request is limited
         # per API key; an unauthenticated / invalid-key request (api_key_info is
-        # None — including when a transient auth-DB error left it unset) must
-        # still be bounded per client IP, or an attacker can brute-force keys and
-        # hammer the DB at unlimited rate and a brief auth outage would disable
-        # limiting globally (#5).
+        # None) must still be bounded per client IP, or an attacker can
+        # brute-force keys and hammer the DB at unlimited rate and a brief auth
+        # outage would disable limiting globally (#5).
         api_key_info = getattr(request.state, "api_key_info", None)
         if api_key_info is not None:
             rate_limit = getattr(api_key_info, "rate_limit", None) or DEFAULT_RATE_LIMIT
@@ -87,7 +86,14 @@ class RateLimitingMiddleware(BaseHTTPMiddleware):
                 request.client.host if request.client else "unknown"
             )
             bucket_key = f"ip:{client_ip}"
-            rate_limit = settings.rate_limit_unauthenticated
+            # A transient auth-backend error (#149) still needs the IP bound —
+            # never disable limiting outright — but a caller who presented a key
+            # that simply couldn't be checked yet shouldn't be squeezed down to
+            # the same tight ceiling as a caller who supplied no key at all.
+            if getattr(request.state, "auth_error", False):
+                rate_limit = DEFAULT_RATE_LIMIT
+            else:
+                rate_limit = settings.rate_limit_unauthenticated
 
         # Check rate limit
         rate_limiter = get_rate_limiter()
@@ -103,6 +109,7 @@ class RateLimitingMiddleware(BaseHTTPMiddleware):
                 bucket_key=bucket_key,
                 limit=rate_limit,
                 path=request.url.path,
+                auth_error=getattr(request.state, "auth_error", False),
             )
             return _create_rate_limit_response(result.info, request.url.path)
 

@@ -34,6 +34,36 @@ All notable changes to Inherent are documented here. The format follows
 
 ### Fixed
 
+- **Rate limiting never applied per-API-key in production (#149).** Starlette's
+  `add_middleware` makes the *last*-added middleware run *first*; `main.py`
+  registered `AuthenticationMiddleware` before `RateLimitingMiddleware`/
+  `AuditLoggingMiddleware`, so the real dispatch order was
+  `RateLimit → Audit → Auth`, the reverse of the file's own comment.
+  `RateLimitingMiddleware` therefore always read `request.state.api_key_info`
+  before auth had set it, bucketing every request — valid key or not — at the
+  30/min unauthenticated-IP tier and causing cascading 429s under load.
+  Reordered registration to match the documented flow; added
+  `tests/integration/test_middleware_order.py` against the assembled app so a
+  future reordering regresses here, not in production traffic. Also hardens
+  the originally-suspected cause: a key-validation backend error is now
+  distinguished (`request.state.auth_error`) from a simple missing/invalid
+  key, logged at `warning` with an `auth_backend_error` metric instead of
+  silently falling to `debug`, and bucketed at the moderate `DEFAULT_RATE_LIMIT`
+  rather than the harshest unauthenticated tier.
+- **Ingestion audit-log workflow retried forever — its Temporal namespace was
+  never registered (#148).** `temporalio/auto-setup` only auto-creates
+  `default`; the ingestion audit worker dispatches to a separate `audit`
+  namespace (`TEMPORAL_AUDIT_NAMESPACE`) that nothing ever created, so every
+  audit-log write failed with `NotFound` and retried in a tight loop for the
+  lifetime of the stack. Added a `temporal-init` one-shot compose service
+  (`docker-compose.yml`, `docker-compose.release.yml`) that registers it via
+  `tctl`, gated on an idempotent `describe` check and wired as a dependency of
+  the ingestion service. `tctl namespace describe/register <name>` silently
+  ignores a trailing positional namespace and operates on `default` instead —
+  the check uses the global `--namespace` flag ahead of the subcommand, and
+  only treats a `describe` failure as "missing" when the error says so,
+  refusing to register blindly (and blocking ingestion boot) on any other
+  failure.
 - **`uv.lock` drift from the unused-deps removal.** Both services' lock files
   still listed `aiobreaker`/`psycopg[binary]` (`inh-public-api-svc`) and
   `packaging` (`inh-ingestion-svc`) as locked dependencies after those were
