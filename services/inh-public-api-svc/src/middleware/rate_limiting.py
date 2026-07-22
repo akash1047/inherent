@@ -91,7 +91,7 @@ class RateLimitingMiddleware(BaseHTTPMiddleware):
             # that simply couldn't be checked yet shouldn't be squeezed down to
             # the same tight ceiling as a caller who supplied no key at all.
             if getattr(request.state, "auth_error", False):
-                rate_limit = DEFAULT_RATE_LIMIT
+                rate_limit = settings.rate_limit_default
             else:
                 rate_limit = settings.rate_limit_unauthenticated
 

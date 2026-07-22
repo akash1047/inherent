@@ -26,16 +26,10 @@ from src.models.api_key import APIKeyInfo
 
 @pytest.fixture
 def client():
-    """TestClient for the real app with DB init stubbed (see test_api_path.py).
-
-    ``raise_server_exceptions=False``: these tests only assert on what the
-    middleware stack did *before* call_next -- the route handler itself still
-    hits a real (offline) Postgres for the actual document listing, which we
-    don't care about here, so let that surface as a 500 instead of propagating.
-    """
+    """TestClient for the real app with DB init stubbed (see test_api_path.py)."""
     app = create_app()
     with patch("src.main.get_database", new_callable=AsyncMock):
-        with TestClient(app, raise_server_exceptions=False) as test_client:
+        with TestClient(app) as test_client:
             yield test_client
 
 
@@ -52,12 +46,17 @@ def _valid_key_info() -> APIKeyInfo:
 def test_valid_key_is_bucketed_by_key_not_by_ip(client: TestClient) -> None:
     """A valid API key must reach RateLimitingMiddleware with api_key_info set,
     proving AuthenticationMiddleware's dispatch runs before RateLimitingMiddleware's
-    in the assembled app -- not just in isolated middleware unit tests."""
+    in the assembled app -- not just in isolated middleware unit tests.
+
+    The limiter is forced to deny (429) so the request never reaches the real
+    route handler -- only the middleware-ordering question is under test here,
+    not the handler's own (DB-backed) behavior.
+    """
     limiter = AsyncMock()
     limiter.check_rate_limit = AsyncMock(
         return_value=RateLimitResult(
-            allowed=True,
-            info=RateLimitInfo(limit=5000, remaining=4999, reset_at=0, window_seconds=60),
+            allowed=False,
+            info=RateLimitInfo(limit=5000, remaining=0, reset_at=0, window_seconds=60),
         )
     )
 
@@ -74,7 +73,7 @@ def test_valid_key_is_bucketed_by_key_not_by_ip(client: TestClient) -> None:
             headers={"X-API-Key": "ink_valid_test_key", "X-Workspace-Id": "ws-mw-order"},
         )
 
-    assert response.status_code != 404  # route exists; DB/permission errors are fine here
+    assert response.status_code == 429
     limiter.check_rate_limit.assert_awaited_once()
     kwargs = limiter.check_rate_limit.await_args.kwargs
     assert kwargs["key"] == "key:key-mw-order"
@@ -87,14 +86,15 @@ def test_no_key_request_is_bucketed_by_ip(client: TestClient) -> None:
     limiter = AsyncMock()
     limiter.check_rate_limit = AsyncMock(
         return_value=RateLimitResult(
-            allowed=True,
-            info=RateLimitInfo(limit=30, remaining=29, reset_at=0, window_seconds=60),
+            allowed=False,
+            info=RateLimitInfo(limit=30, remaining=0, reset_at=0, window_seconds=60),
         )
     )
 
     with patch("src.middleware.rate_limiting.get_rate_limiter", return_value=limiter):
-        client.get("/v1/documents")
+        response = client.get("/v1/documents")
 
+    assert response.status_code == 429
     limiter.check_rate_limit.assert_awaited_once()
     kwargs = limiter.check_rate_limit.await_args.kwargs
     assert kwargs["key"].startswith("ip:")

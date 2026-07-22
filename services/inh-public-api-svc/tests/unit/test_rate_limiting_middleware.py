@@ -14,7 +14,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from starlette.responses import Response
 
-from src.config.constants import DEFAULT_RATE_LIMIT
 from src.core.rate_limiter import RateLimitInfo, RateLimitResult
 from src.middleware.rate_limiting import RateLimitingMiddleware
 
@@ -87,7 +86,7 @@ async def test_unauthenticated_request_gets_429_when_ip_limit_exceeded():
 async def test_auth_error_request_gets_default_limit_not_unauthenticated_limit():
     """A key-validation backend error (#149) must not squeeze the caller down to
     the tight unauthenticated-IP ceiling — it still buckets by IP (never disables
-    limiting outright) but at the more generous DEFAULT_RATE_LIMIT."""
+    limiting outright) but at the more generous, configurable rate_limit_default."""
     mw = RateLimitingMiddleware(app=MagicMock())
     limiter = _limiter(allowed=True)
     call_next = AsyncMock(return_value=Response())
@@ -100,8 +99,9 @@ async def test_auth_error_request_gets_default_limit_not_unauthenticated_limit()
         s.rate_limit_enabled = True
         s.rate_limit_window_seconds = 60
         s.rate_limit_unauthenticated = 30
+        s.rate_limit_default = 100
         await mw.dispatch(_request(host="9.9.9.9", auth_error=True), call_next)
 
     kwargs = limiter.check_rate_limit.await_args.kwargs
     assert kwargs["key"] == "ip:9.9.9.9"
-    assert kwargs["limit"] == DEFAULT_RATE_LIMIT
+    assert kwargs["limit"] == 100
