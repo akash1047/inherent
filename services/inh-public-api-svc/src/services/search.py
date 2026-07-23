@@ -647,9 +647,7 @@ class SearchService:
         return results[: request.limit]
 
     @staticmethod
-    def _diversify_by_document(
-        results: list[SearchResult], limit: int
-    ) -> list[SearchResult]:
+    def _diversify_by_document(results: list[SearchResult], limit: int) -> list[SearchResult]:
         """Round-robin diversify candidates across ``document_id`` (#146).
 
         EXPERIMENTAL, gated by ``enable_diversification`` (default False).

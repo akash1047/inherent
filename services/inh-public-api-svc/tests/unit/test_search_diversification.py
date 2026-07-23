@@ -65,9 +65,9 @@ class TestDiversifyByDocument:
         candidates = doc_a + doc_b + doc_c  # already score-sorted, as Weaviate returns
 
         naive = candidates[:3]
-        assert {r.document_id for r in naive} == {"docA"}, (
-            "contrast baseline: naive truncate should crowd out docB/docC"
-        )
+        assert {r.document_id for r in naive} == {
+            "docA"
+        }, "contrast baseline: naive truncate should crowd out docB/docC"
 
         out = SearchService._diversify_by_document(candidates, limit=3)
 
@@ -152,9 +152,7 @@ class TestFetchLimitComposition:
         request = SearchRequest(query="hello", limit=5, search_mode="keyword")
         assert self._fetch_limit(request) == 25
 
-    def test_diversification_fetch_is_capped_at_100(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_diversification_fetch_is_capped_at_100(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(settings, "enable_diversification", True)
         monkeypatch.setattr(settings, "diversification_over_fetch_multiplier", 5)
         request = SearchRequest(query="hello", limit=100, search_mode="keyword")

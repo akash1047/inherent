@@ -121,6 +121,6 @@ def test_diversification_defaults_off() -> None:
     corpus category) that still fell short of "ship on by default."
     """
     settings = Settings()  # type: ignore[call-arg]
-    assert settings.enable_diversification is False, (
-        "enable_diversification must default to False (off by default, #146)"
-    )
+    assert (
+        settings.enable_diversification is False
+    ), "enable_diversification must default to False (off by default, #146)"

@@ -19,7 +19,7 @@ from pathlib import Path
 
 import pytest
 
-from src.config.settings import get_settings
+from src.config.settings import Settings
 from src.services.quality import DataQualityService
 from src.temporal.activities.chunk import _chunk_by_size, _token_budget_char_cap, estimate_tokens
 from src.temporal.activities.extract import (
@@ -157,7 +157,7 @@ def test_chunking_quality(sample_docs_dir, filename, content_type):
 
 
 @pytest.mark.parametrize("filename,content_type", SAMPLE_CASES, ids=[c[0] for c in SAMPLE_CASES])
-def test_chunk_token_budget(sample_docs_dir, filename, content_type):
+def test_chunk_token_budget(sample_docs_dir, filename, content_type, test_settings: Settings):
     """No chunk exceeds the embedding model's token budget (REQ-EVL-2).
 
     Chunks with the same character cap ``chunk_text``'s inner impl derives
@@ -170,7 +170,7 @@ def test_chunk_token_budget(sample_docs_dir, filename, content_type):
     text = _extract(raw, content_type, filename)
     assert text.strip(), f"No text to chunk for {filename}"
 
-    settings = get_settings()
+    settings = test_settings
     char_cap = _token_budget_char_cap(settings.embedding_max_tokens)
     chunks = _chunk_by_size(text, document_id=filename, max_size=char_cap, overlap=0)
     assert chunks, f"Chunking produced 0 chunks for {filename}"

@@ -60,7 +60,7 @@ All notable changes to Inherent are documented here. The format follows
   eval-gate policy as the #47 advanced methods (documented improvement +
   maintainer approval before defaulting on) because it changes ranking order
   for every multi-chunk query, not just crowded ones — see
-  [ADR 0004](docs/adr/0004-per-document-diversification.md).
+  [ADR 0004](https://github.com/inherent-prime/inherent/blob/main/docs/adr/0004-per-document-diversification.md).
 
 ### Fixed
 
