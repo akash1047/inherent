@@ -17,7 +17,20 @@ pytestmark = pytest.mark.retrieval_eval
 # Known query categories (Oracle-style archetypes, #37 corpus expansion).
 # "abstention" is exempt from the "must have a relevant doc" rule in
 # test_corpus_covers_multiple_queries below -- it deliberately has none.
-KNOWN_CATEGORIES = {"general", "exact_id", "stale_version", "paraphrase", "abstention"}
+# "multi_doc_crowding" (#146): a query with 2+ genuinely relevant documents
+# where one has many more chunks than the other, so a naive score-sorted
+# top-k can crowd the shorter document out entirely -- the scenario per-
+# document diversification (enable_diversification, off by default) exists to
+# fix. See rate-limiting-deep-dive.txt (5 chunks) vs
+# rate-limit-quick-reference.txt (1 chunk), query q14.
+KNOWN_CATEGORIES = {
+    "general",
+    "exact_id",
+    "stale_version",
+    "paraphrase",
+    "abstention",
+    "multi_doc_crowding",
+}
 
 
 def test_corpus_is_well_formed(golden_corpus):

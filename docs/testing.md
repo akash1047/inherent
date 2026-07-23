@@ -157,10 +157,28 @@ that drops more than `EVAL_GATE_TOLERANCE` (default `0.02`) below the committed
 
 On a green gate on `main`, `.github/workflows/integration.yml`'s
 `eval-baseline-ratchet` job ratchets the baseline up to
-`max(current, baseline)` per mode/metric (never down) and appends a line to
+`max(current, baseline)` per mode/metric (never down), appends a line to
 `corpus/retrieval_history.jsonl` — a durable, checked-in trend log of every
-main-branch run's scores, so retrieval quality over time is queryable without
-standing up new infra. On gate failure (push-to-main or nightly), the
+main-branch run's scores — and opens (or updates) a pull request carrying both
+changes, rather than pushing to `main` directly: branch protection rejects
+direct `github-actions[bot]` pushes, so a push-based ratchet silently fails
+every run (this is what left the baseline seeded at zeros for the entire time
+#139 was live — see the history log's first entry for the real numbers it was
+seeded with instead). The job reuses one branch
+(`chore/ratchet-retrieval-baseline`) across runs; it checks for an **open** PR
+specifically (`gh pr list --state open`, not `gh pr view`, which also matches
+an already-merged PR on the same branch and would otherwise skip
+`gh pr create` forever after the first merge) and, if one is open, pulls that
+PR's own baseline/history forward before recomputing rather than resetting to
+`main`'s older copy, so a not-yet-merged rise is never silently dropped. The
+PR is opened with auto-merge requested so a clean ratchet still needs no human
+action, but falls back to a normal maintainer-merged PR if auto-merge isn't
+enabled on the repo — the same fallback applies if the optional
+`RATCHET_PR_TOKEN` repo secret (a PAT or GitHub App token with
+`contents:write`+`pull-requests:write`) isn't configured, since the default
+`GITHUB_TOKEN` is excluded from triggering other workflow runs on the push/PR
+it creates and the PR's required check (`ci.yml`) won't fire on its own
+without it. On gate failure (push-to-main or nightly), the
 `eval-regression-alert` job files or updates an issue labeled
 `retrieval-eval-regression`. This does **not** gate PRs — the full Compose
 stack stays too slow/expensive to run on every PR (see the note at the top of
@@ -168,14 +186,49 @@ stack stays too slow/expensive to run on every PR (see the note at the top of
 this workflow.
 
 The golden corpus (`corpus/qrels.jsonl`) tags each judgment with an optional
-`category`: `general`, `exact_id`, `stale_version`, `paraphrase`, or
-`abstention` (a query with no relevant document — the correct signal is zero
-recall/MRR/nDCG, not a fabricated match). Per-category scores are printed and
-written to the eval report (`_by_category`) for visibility; only the per-mode
-pooled averages are gated, and `abstention` queries are excluded from that
-pool since they can never contribute a positive score by construction.
-Permission/tenancy boundaries are deliberately not a category here — that's
-owned by the `security` marker suite, not this ranking-quality corpus.
+`category`: `general`, `exact_id`, `stale_version`, `paraphrase`, `abstention`
+(a query with no relevant document — the correct signal is zero recall/MRR/
+nDCG, not a fabricated match), or `multi_doc_crowding` (a query with 2+
+genuinely relevant documents where one has many more chunks than the other —
+`q14`, `rate-limiting-deep-dive.txt` (5 chunks) vs.
+`rate-limit-quick-reference.txt` (1 chunk) — exercising the scenario
+per-document diversification, #146, exists to fix: a naive score-sorted
+top-k can crowd the shorter document out entirely). Per-category scores are
+printed and written to the eval report (`_by_category`) for visibility; only
+the per-mode pooled averages are gated, and `abstention` queries are excluded
+from that pool since they can never contribute a positive score by
+construction. Permission/tenancy boundaries are deliberately not a category
+here — that's owned by the `security` marker suite, not this ranking-quality
+corpus.
+
+## Benchmark JSON report artifacts (REQ-EVL-3)
+
+The live Compose benchmarks (`benchmark` + `compose`, both services) each
+write a JSON summary alongside printing to stdout, so a run's numbers survive
+past the CI log — same principle as the retrieval-eval report above, not just
+for retrieval:
+
+- **public-api search benchmarks** (`test_search_latency_throughput.py`) write
+  `search-benchmark-report.json` with `search_latency` (p50/p95/p99/min/max
+  ms) and `search_throughput` (QPS) keys, each carrying the commit SHA the run
+  measured. `tests/benchmark/run_search_benchmark.py::write_benchmark_report`
+  merges rather than overwrites, since both tests share one file within a run;
+  the standalone CLI (`run_search_benchmark.py`) writes the same shape under a
+  `cli_search` key via its own `--report` flag.
+- **ingestion throughput benchmark** (`test_ingestion_throughput.py`) writes
+  `ingestion-benchmark-report.json` with an `ingestion_throughput` key
+  (`docs_per_sec`, `elapsed_s`, `batch_size`, commit SHA), via the sibling
+  `tests/benchmark/benchmark_report.py` helper (duplicated rather than shared
+  across services — separate Python packages, no common dependency between
+  them).
+
+Both are uploaded as CI artifacts (`search-benchmark-report`,
+`ingestion-benchmark-report`) by `integration.yml`'s `compose-integration` job,
+`if: always()` so a benchmark failure still leaves the partial numbers
+retrievable. Override the output path locally with the `BENCHMARK_REPORT` env
+var. These are visibility only — no CI gate reads them back; the loose
+SLO assertions already in the tests are what fails the build on a gross
+regression.
 
 ## Coverage
 

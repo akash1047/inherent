@@ -106,3 +106,21 @@ def test_no_advanced_method_enabled_by_default() -> None:
     settings = Settings()  # type: ignore[call-arg]
     enabled = [flag for flag in ADVANCED_FLAGS if getattr(settings, flag)]
     assert enabled == [], f"advanced methods enabled by default (gate violated): {enabled}"
+
+
+def test_diversification_defaults_off() -> None:
+    """Eval-gate policy (#146): per-document diversification is OFF by default.
+
+    Unlike the three ADVANCED_FLAGS above, diversification IS implemented (see
+    ADR 0004 and SearchService._diversify_by_document) -- it is gated for a
+    different reason: it changes ranking order for every multi-chunk-per-
+    document query, not just crowded ones, so it needs the same documented
+    eval improvement + maintainer approval before defaulting on, same as any
+    #47 method. See docs/adr/0004-per-document-diversification.md for the
+    measured evidence (recall@5 0.5->1.0 on the multi_doc_crowding golden
+    corpus category) that still fell short of "ship on by default."
+    """
+    settings = Settings()  # type: ignore[call-arg]
+    assert settings.enable_diversification is False, (
+        "enable_diversification must default to False (off by default, #146)"
+    )

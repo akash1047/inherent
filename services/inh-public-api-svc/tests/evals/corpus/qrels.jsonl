@@ -18,3 +18,5 @@
 {"query_id": "q12", "query": "in plain terms, how does search blend keyword matches with embedding similarity", "document_id": "sample.md", "chunk_index": 0, "relevance": 3, "category": "paraphrase"}
 {"query_id": "q12", "query": "in plain terms, how does search blend keyword matches with embedding similarity", "document_id": "sample.txt", "chunk_index": 0, "relevance": 2, "category": "paraphrase"}
 {"query_id": "q13", "query": "what is the refund policy for enterprise annual contracts", "document_id": "sample.txt", "chunk_index": 0, "relevance": 0, "category": "abstention"}
+{"query_id": "q14", "query": "how does Inherent enforce per-API-key rate limits", "document_id": "rate-limiting-deep-dive.txt", "chunk_index": 0, "relevance": 3, "category": "multi_doc_crowding"}
+{"query_id": "q14", "query": "how does Inherent enforce per-API-key rate limits", "document_id": "rate-limit-quick-reference.txt", "chunk_index": 0, "relevance": 3, "category": "multi_doc_crowding"}

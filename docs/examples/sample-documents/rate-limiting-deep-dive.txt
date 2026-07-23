@@ -1,0 +1,19 @@
+Inherent Knowledge Base — Rate Limiting Deep Dive
+
+Inherent enforces rate limits on every request to the public REST API to protect shared infrastructure from any single tenant overwhelming the service. Rate limiting is applied per API key, not per workspace and not per IP address, so two API keys issued to the same workspace are tracked independently against their own limits.
+
+The default limit is 100 requests per minute per API key. This default applies to all endpoints under the /v1/ prefix unless a specific route documents a different limit. The limiter uses a sliding window algorithm rather than a fixed window, so a burst of requests near a minute boundary cannot double the effective throughput compared to the steady-state rate.
+
+When an API key exceeds its configured limit, the server responds with HTTP 429 Too Many Requests. The response body follows the standard error envelope and includes a machine-readable code so client SDKs can distinguish rate limiting from other 4xx failures without parsing the message text. The response also carries a Retry-After header expressed in seconds, telling the client how long to wait before the next request is likely to succeed.
+
+Rate limiting is implemented as ASGI middleware in the public API service, registered so it runs after authentication resolves the caller's API key but before the request reaches any route handler. This ordering matters: the limiter needs to know which API key is making the request before it can look up or update that key's counter, and it needs to reject an over-limit request before any handler does real work (a database query, a Weaviate search, a Temporal workflow trigger) that would otherwise be wasted on a request that's about to be rejected anyway.
+
+Rate limit counters are stored in Redis so that limits are enforced correctly across multiple replicas of the public API service, not just within a single process's memory. Each API key's counter lives under a dedicated Redis key with a short TTL matching the sliding window, so a counter for a key that stops sending traffic expires on its own rather than accumulating stale state forever.
+
+Rate limiting can be disabled entirely via the RATE_LIMIT_ENABLED environment variable, which defaults to true in every deployed environment. The only place it is turned off is in the Compose-based integration test stack, where the retrieval and ingestion benchmark suites intentionally issue far more than 100 requests per minute per key and would otherwise be throttled during a benchmark run rather than measuring real throughput.
+
+Administrators can raise or lower the per-key limit for a specific workspace through the admin API without needing a code deploy, which matters for enterprise customers who are provisioned with a higher default throughput than the standard 100 requests per minute. This override is stored alongside the workspace's other metadata and is read by the rate limiting middleware on every request, so a limit change takes effect immediately rather than requiring a restart of the public API service.
+
+Rate limiting responses are logged with the API key's identifier (not the raw key itself, which is never logged) and the current count against the limit, so operators can distinguish a genuine abuse pattern from a legitimate customer whose traffic has organically grown past their provisioned limit and who may need a higher tier.
+
+The rate limiter is intentionally separate from authentication and from authorization: a request can fail authentication (invalid API key), fail authorization (valid key but insufficient permission for the requested resource), or fail rate limiting (valid key, sufficient permission, but too many requests too quickly), and each of these failure modes returns a distinct HTTP status code and error code so client-side error handling can react appropriately to each case.

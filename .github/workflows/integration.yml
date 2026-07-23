@@ -8,6 +8,16 @@ on:
   push:
     branches:
       - main
+    # The ratchet job below (see "Ratchet baseline + append history + open
+    # PR") only ever touches these two files, then auto-merges its own PR --
+    # a push to main. Without this exclusion, that merge re-triggers this
+    # workflow, which appends a new history line (new timestamp, so the
+    # commit is never a no-op) and opens+auto-merges another PR, forever:
+    # an unbounded main<->ratchet loop, each cycle up to the 40-minute
+    # Compose job below (#146 cross-review finding).
+    paths-ignore:
+      - "services/inh-public-api-svc/tests/evals/corpus/retrieval_baseline.json"
+      - "services/inh-public-api-svc/tests/evals/corpus/retrieval_history.jsonl"
   schedule:
     - cron: "0 4 * * *"
   workflow_dispatch:
@@ -102,6 +112,18 @@ jobs:
           INTEGRATION_TIMEOUT: "600"
         run: uv run pytest -m 'compose and not retrieval_eval'
 
+      # Search latency/throughput benchmark summary (REQ-EVL-3, #36): p50/p95/
+      # p99/QPS + git sha, written by test_search_latency_throughput.py's live
+      # tests (tests/benchmark/run_search_benchmark.py::write_benchmark_report)
+      # relative to the step's working-directory above.
+      - name: Upload search benchmark report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: search-benchmark-report
+          path: services/inh-public-api-svc/search-benchmark-report.json
+          if-no-files-found: ignore
+
       - name: Upload retrieval eval report
         if: always()
         uses: actions/upload-artifact@v4
@@ -133,6 +155,17 @@ jobs:
         run: |
           uv sync --frozen --extra dev --group dev
           uv run pytest -m compose
+
+      # Ingestion throughput benchmark summary (REQ-EVL-3, #36): docs/sec +
+      # git sha, written by test_ingestion_throughput.py via
+      # tests/benchmark/benchmark_report.py::write_benchmark_report.
+      - name: Upload ingestion benchmark report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ingestion-benchmark-report
+          path: services/inh-ingestion-svc/ingestion-benchmark-report.json
+          if-no-files-found: ignore
 
       # Re-raise the retrieval-eval gate's outcome now that its report has been
       # uploaded: a regression must still turn the whole job (and main) red. The
@@ -179,21 +212,50 @@ jobs:
   # (never down -- see tests/evals/eval_gate.py) plus appends a trend-history
   # line, so "beats baseline" has both an enforced floor and a visible score
   # over time (#37 -> hard gate + history).
+  #
+  # This job opens a PR rather than pushing straight to main. A direct-push
+  # design was tried first and always failed: branch protection on `main`
+  # rejects `github-actions[bot]` pushes ("Required tests before merge"), so
+  # every ratchet attempt hit "remote rejected" and the baseline silently
+  # stayed at its seeded zeros for as long as the direct-push version was
+  # live -- the exact "gate never actually rises" failure this job exists to
+  # prevent. A PR runs through the same required check (ci.yml, which also
+  # triggers on pull_request) and can be auto-merged once it's green.
+  #
+  # Getting a PR from this job to actually trigger ci.yml needs more than
+  # dropping `[skip ci]`: the default `GITHUB_TOKEN` is explicitly excluded
+  # from firing other workflow runs on the push/PR it creates (loop
+  # prevention), so a PR pushed and opened with `github.token` alone sits
+  # forever with no check to satisfy. `RATCHET_PR_TOKEN` (a PAT or GitHub App
+  # installation token with `contents:write`+`pull-requests:write`, added as a
+  # repo secret) lets ci.yml fire normally; without that secret configured
+  # this still degrades gracefully to a normal maintainer-merged PR -- the
+  # ratchet computation and PR still happen, they just need a manual re-run
+  # or merge to close the loop.
   eval-baseline-ratchet:
     name: Ratchet retrieval-eval baseline
     needs: compose-integration
-    # Guard to the upstream repo only: on a fork this job would otherwise push
-    # a "chore(evals): ratchet retrieval baseline" commit straight back to the
-    # fork's main on every sync, creating a fork-vs-upstream divergence loop
-    # (force-pushing to resync doesn't break it -- it's still a push to main,
-    # so the workflow just fires and commits again).
+    # Guard to the upstream repo only: on a fork this job would otherwise open
+    # a ratchet PR against the fork's main on every sync, creating a
+    # fork-vs-upstream divergence loop.
     if: github.repository == 'inherent-prime/inherent' && github.ref == 'refs/heads/main' && success()
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      pull-requests: write
+    # Serialize overlapping runs (a nightly firing alongside a push-triggered
+    # run) against the single shared ratchet branch instead of racing a
+    # force-push/PR-create against each other.
+    concurrency:
+      group: eval-baseline-ratchet
+      cancel-in-progress: false
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          # Falls back to the default token if the repo secret isn't set --
+          # see the "getting a PR to trigger ci.yml" note above.
+          token: ${{ secrets.RATCHET_PR_TOKEN || github.token }}
 
       - name: Download retrieval eval report
         uses: actions/download-artifact@v4
@@ -205,16 +267,20 @@ jobs:
         with:
           enable-cache: true
 
-      # Ratchet + append-history + push, retried against the latest main each
-      # attempt so a concurrent push cannot make us lose a ratchet or a history
-      # line. Each attempt hard-resets to origin/main, then recomputes: ratchet
-      # is max()-based (order-independent, so racing runs converge on the same
-      # floor) and history is append-only, so recomputing after a reset never
-      # duplicates a line or lowers the baseline. If every attempt is rejected
-      # the step FAILS LOUDLY -- a silently-swallowed push is what let the
-      # baseline stay at its seeded zeros forever, leaving the relative gate
-      # inert (the whole point of this job).
-      - name: Ratchet baseline + append history + push
+      # Ratchet + append-history on a dedicated branch, then push and open (or
+      # update) a PR against main instead of pushing to main directly. The
+      # branch is reused across runs rather than one-per-run, so an unmerged
+      # ratchet PR just gets updated in place instead of piling up duplicate
+      # PRs. If that PR is still open, its baseline/history are pulled
+      # forward before recomputing (instead of resetting to main's stale
+      # copy), so a not-yet-merged rise is never lost -- ratchet is
+      # max()-based and history is append-only across whichever of
+      # main/open-branch is currently ahead. No `[skip ci]` on the commit:
+      # the PR must trigger ci.yml so the required status check has
+      # something to pass before merge (see RATCHET_PR_TOKEN note above).
+      - name: Ratchet baseline + append history + open PR
+        env:
+          GH_TOKEN: ${{ secrets.RATCHET_PR_TOKEN || github.token }}
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
@@ -224,32 +290,97 @@ jobs:
           baseline="$api/tests/evals/corpus/retrieval_baseline.json"
           history="$api/tests/evals/corpus/retrieval_history.jsonl"
           report="$GITHUB_WORKSPACE/eval-report.json"
+          branch="chore/ratchet-retrieval-baseline"
 
-          for attempt in 1 2 3 4 5; do
-            git fetch origin main
-            git reset --hard origin/main
+          git fetch origin main
 
-            # Recompute against whatever baseline main currently has.
-            uv run --no-project python "$api/tests/evals/eval_gate.py" ratchet \
-              --report "$report" \
-              --baseline "$baseline" \
-              --out "$baseline"
-            jq -c --arg sha "$GITHUB_SHA" --arg date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-              '{sha: $sha, date: $date, metrics: .}' "$report" >> "$history"
+          # An *open* PR only -- `gh pr view`/`gh pr list` without --state
+          # open also match a PR that already merged (the branch survives a
+          # squash-merge unless auto-delete is on), which would silently skip
+          # `gh pr create` on every run after the first merge and strand
+          # future ratchets with no open PR to land through.
+          pr_number=$(gh pr list --head "$branch" --base main --state open \
+            --json number -q '.[0].number // empty')
 
-            git add "$baseline" "$history"
-            if git diff --cached --quiet; then
-              echo "no baseline/history change"; exit 0
+          branch_exists_remote=false
+          if git fetch origin "$branch"; then
+            branch_exists_remote=true
+          elif [ -n "$pr_number" ]; then
+            # An open PR means the branch DOES exist remotely -- a failed
+            # fetch here is transient (network blip), not "branch doesn't
+            # exist yet". Silently falling through (as a bare `2>/dev/null
+            # || true` would) leaves branch_exists_remote=false, so the
+            # pull-forward block below gets skipped -- the job would then
+            # rebuild from main's older copy, ratchet against it, and
+            # `git push --force-with-lease` with NO local remote-tracking
+            # ref for $branch at all. Verified empirically:
+            # --force-with-lease with no local ref for the target simply
+            # force-pushes (no error), so this would silently clobber the
+            # open PR's higher not-yet-merged baseline/history with a lower
+            # one and no signal that anything went wrong. Hard-fail instead
+            # and let the next scheduled/triggered run retry cleanly.
+            echo "::error::git fetch of $branch failed while PR #$pr_number is open -- refusing to rebuild from main only, which could silently overwrite a higher not-yet-merged baseline. Retrying on the next run."
+            exit 1
+          fi
+
+          git checkout -B "$branch" origin/main
+
+          if [ -n "$pr_number" ] && [ "$branch_exists_remote" = true ]; then
+            # Pull forward the still-open PR's own baseline/history instead
+            # of resetting to main's (necessarily older) copy, so its
+            # not-yet-merged progress isn't discarded by this run. Checked
+            # with `git cat-file -e` FIRST rather than piping `git show`
+            # straight into `> "$file"`: a shell redirect truncates its
+            # target before the command on its right even runs, so a bare
+            # `git show ... > "$file" || true` empties the file on ANY
+            # failure (a renamed path, a corrupt ref, an edited branch) --
+            # load_metrics() then treats that empty file as `{}`, and
+            # ratchet_baseline(current, {}) silently resets the baseline to
+            # just this run's numbers instead of the true accumulated floor.
+            # Only overwrite the checked-out (main) copy when the blob is
+            # confirmed to exist, so a lookup failure leaves it untouched.
+            if git cat-file -e "origin/$branch:$baseline" 2>/dev/null; then
+              git show "origin/$branch:$baseline" > "$baseline"
             fi
-            git commit -m "chore(evals): ratchet retrieval baseline [skip ci]"
-            if git push origin HEAD:main; then
-              echo "pushed ratcheted baseline (attempt $attempt)"; exit 0
+            if git cat-file -e "origin/$branch:$history" 2>/dev/null; then
+              git show "origin/$branch:$history" > "$history"
             fi
-            echo "push rejected on attempt $attempt (concurrent update?); retrying"
-          done
+          fi
 
-          echo "::error::could not push the ratcheted baseline after 5 attempts. If branch protection blocks github-actions[bot], the baseline never rises and the relative gate stays inert -- give this job a PAT/GitHub App token with push access, or add a bypass for the bot."
-          exit 1
+          uv run --no-project python "$api/tests/evals/eval_gate.py" ratchet \
+            --report "$report" \
+            --baseline "$baseline" \
+            --out "$baseline"
+          jq -c --arg sha "$GITHUB_SHA" --arg date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{sha: $sha, date: $date, metrics: .}' "$report" >> "$history"
+
+          git add "$baseline" "$history"
+          if git diff --cached --quiet; then
+            echo "no baseline/history change"; exit 0
+          fi
+          git commit -m "chore(evals): ratchet retrieval baseline"
+
+          # --force-with-lease compares against the remote-tracking ref we
+          # just fetched above -- without that fetch there's no ref to lease
+          # against and the push is rejected as "stale info" on any run after
+          # the first (the branch already exists remotely by then).
+          git push --force-with-lease origin "$branch"
+
+          if [ -z "$pr_number" ]; then
+            gh pr create --base main --head "$branch" \
+              --title "chore(evals): ratchet retrieval baseline" \
+              --body "Automated ratchet: baseline never decreases (max(current, baseline) per mode/metric), measured on \`$GITHUB_SHA\`. Opened as a PR because branch protection blocks direct github-actions[bot] pushes to main -- merge (or enable repo auto-merge) once the required check passes."
+            pr_number=$(gh pr list --head "$branch" --base main --state open \
+              --json number -q '.[0].number // empty')
+          else
+            echo "ratchet PR #$pr_number already open for $branch; pushed updated commit"
+          fi
+
+          if [ -n "$pr_number" ]; then
+            gh pr merge "$pr_number" --auto --squash || echo "::warning::could not enable auto-merge for PR #$pr_number -- merge it manually, or enable 'Allow auto-merge' on the repo so future ratchets need no action"
+          else
+            echo "::warning::ratchet PR was not found after create -- check for a race or gh API failure"
+          fi
 
   # Post-merge regression only (per policy: this does not gate PRs, since the
   # full stack is too slow/expensive to run on every PR). When the gate above

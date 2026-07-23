@@ -229,6 +229,41 @@ class Settings(BaseSettings):
         ),
     )
 
+    # Per-document diversification (#146) — EXPERIMENTAL, OFF BY DEFAULT.
+    #
+    # Unlike the #47 scaffolding above, this method IS implemented (it's a
+    # deterministic round-robin over already-fetched candidates, not a new
+    # model or index); it stays gated behind the same eval-gate policy
+    # (no default-on without a documented eval improvement vs the hybrid
+    # baseline + maintainer approval) because it changes ranking order, which
+    # the compose retrieval-eval gate needs to measure before this can default
+    # on. See docs/advanced-indexes.md and ADR 0004.
+    enable_diversification: bool = Field(
+        default=False,
+        description=(
+            "EXPERIMENTAL (#146), off by default. Opt-in per-document result "
+            "diversification: round-robins candidates across document_id before "
+            "truncating to the page size, so one highly-relevant document can't "
+            "crowd out every other result. Requires a documented eval improvement "
+            "vs the hybrid baseline + maintainer approval before it may default on."
+        ),
+    )
+    diversification_over_fetch_multiplier: int = Field(
+        default=5,
+        ge=1,
+        description=(
+            "When enable_diversification is on, fetch up to "
+            "min(100, limit * this) candidates from Weaviate before "
+            "diversifying and truncating back to limit, so there are enough "
+            "distinct documents in the pool to diversify across. Ignored "
+            "when enable_diversification is off. Must be >= 1 -- a value of "
+            "0 makes min(100, limit * 0) == 0, so the max() against the "
+            "base fetch_limit in _build_graphql never widens it, silently "
+            "defeating diversification's over-fetch even while the flag "
+            "reads as on."
+        ),
+    )
+
     # Evals v1 — traffic-mined retrieval evals (design spec: evals-v1).
     # Capture is ON by default (opt-out model): every search is recorded to
     # eval_query_events by a fire-and-forget background task. Raw events are

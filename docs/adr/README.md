@@ -9,6 +9,7 @@ focused.
 | [0001](0001-agent-memory-substrate.md) | Inherent as an Agent Memory Substrate | Accepted |
 | [0002](0002-weaviate-multi-tenancy-scale.md) | Weaviate Multi-Tenancy and Scale Strategy | Accepted |
 | [0003](0003-traffic-mined-retrieval-evals.md) | Traffic-Mined Retrieval Evals | Accepted |
+| [0004](0004-per-document-diversification.md) | Per-Document Result Diversification | Accepted (gated, off by default) |
 
 For the milestone-by-milestone delivery plan derived from this boundary, see the
 [org-readiness requirements](../maintainers/org-readiness-requirements.md).

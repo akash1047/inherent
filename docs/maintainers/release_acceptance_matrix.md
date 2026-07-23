@@ -67,6 +67,12 @@ fails on any per-mode metric regression vs. the committed
 `main` ratchets the baseline up (never down) and appends to
 `corpus/retrieval_history.jsonl`; see
 [docs/testing.md § Retrieval-eval gate](../testing.md#retrieval-eval-gate-baseline-ratchet-and-trend-history-139).
+The golden corpus permanently includes a `multi_doc_crowding` category (#146)
+so future chunking/scoring/diversification changes are measured against it.
+
+The same Compose runs also upload `search-benchmark-report.json` /
+`ingestion-benchmark-report.json` (REQ-EVL-3) — visibility only, not a gate;
+see [docs/testing.md § Benchmark JSON report artifacts](../testing.md#benchmark-json-report-artifacts-req-evl-3).
 
 ## README claim → covering tests
 
