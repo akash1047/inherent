@@ -19,8 +19,9 @@ from pathlib import Path
 
 import pytest
 
+from src.config.settings import Settings
 from src.services.quality import DataQualityService
-from src.temporal.activities.chunk import _chunk_by_size
+from src.temporal.activities.chunk import _chunk_by_size, _token_budget_char_cap, estimate_tokens
 from src.temporal.activities.extract import (
     _extract_docx_text,
     _extract_html_text,
@@ -89,6 +90,19 @@ def test_extraction_quality(sample_docs_dir, filename, content_type):
         f"{[r.message for r in results if not r.passed and r.severity == 'critical']}"
     )
 
+    # Eval-only hard fail on noisy extraction (REQ-EVL-2): production treats a
+    # high whitespace ratio ("text_whitespace_ratio") as a non-blocking warning
+    # -- a real document with unusual formatting shouldn't get rejected in
+    # production. But a bundled golden fixture producing noisy output is a
+    # regression in the extractor itself, not a property of unpredictable
+    # input, so the eval holds it to a stricter bar than production severity
+    # without changing DataQualityService's own "warning" classification.
+    noisy = [r for r in results if not r.passed and r.check_name == "text_whitespace_ratio"]
+    assert not noisy, (
+        f"Noisy extraction output for {filename} (eval-only hard fail, "
+        f"production severity unchanged): {[r.message for r in noisy]}"
+    )
+
     # Simple fidelity metric: ratio of extracted text length to raw input size.
     # For text formats this is ~1.0; for PDF/DOCX it reflects how much readable
     # content survived the container overhead. We just require *some* signal.
@@ -139,4 +153,39 @@ def test_chunking_quality(sample_docs_dir, filename, content_type):
     print(
         f"[chunk] {filename}: text={len(text)}chars chunks={len(chunks)} "
         f"coverage={coverage:.4f}"
+    )
+
+
+@pytest.mark.parametrize("filename,content_type", SAMPLE_CASES, ids=[c[0] for c in SAMPLE_CASES])
+def test_chunk_token_budget(sample_docs_dir, filename, content_type, test_settings: Settings):
+    """No chunk exceeds the embedding model's token budget (REQ-EVL-2).
+
+    Chunks with the same character cap ``chunk_text``'s inner impl derives
+    from ``settings.embedding_max_tokens`` via ``_token_budget_char_cap``, so
+    this exercises the actual budget the pipeline enforces rather than an
+    arbitrary size -- a regression here means a real chunk could overrun the
+    embedding model's token limit and get silently truncated by TEI.
+    """
+    raw = _read_fixture(sample_docs_dir, filename)
+    text = _extract(raw, content_type, filename)
+    assert text.strip(), f"No text to chunk for {filename}"
+
+    settings = test_settings
+    char_cap = _token_budget_char_cap(settings.embedding_max_tokens)
+    chunks = _chunk_by_size(text, document_id=filename, max_size=char_cap, overlap=0)
+    assert chunks, f"Chunking produced 0 chunks for {filename}"
+
+    over_budget = [
+        (c.chunk_index, estimate_tokens(c.content))
+        for c in chunks
+        if estimate_tokens(c.content) > settings.embedding_max_tokens
+    ]
+    assert not over_budget, (
+        f"{len(over_budget)} chunk(s) exceed the {settings.embedding_max_tokens}-token "
+        f"embedding budget for {filename}: {over_budget}"
+    )
+    print(
+        f"[token-budget] {filename}: {len(chunks)} chunks, "
+        f"max_tokens={max(estimate_tokens(c.content) for c in chunks)} "
+        f"budget={settings.embedding_max_tokens}"
     )

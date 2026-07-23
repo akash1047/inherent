@@ -639,8 +639,54 @@ class SearchService:
                 )
             )
         # Truncate back to the requested page size after min_score filtering
-        # (the query may have over-fetched to avoid under-filling) (#31).
+        # (the query may have over-fetched to avoid under-filling) (#31), or
+        # diversify-then-truncate when enable_diversification is on (#146,
+        # EXPERIMENTAL, off by default -- see settings.py).
+        if settings.enable_diversification:
+            return self._diversify_by_document(results, request.limit)
         return results[: request.limit]
+
+    @staticmethod
+    def _diversify_by_document(results: list[SearchResult], limit: int) -> list[SearchResult]:
+        """Round-robin diversify candidates across ``document_id`` (#146).
+
+        EXPERIMENTAL, gated by ``enable_diversification`` (default False).
+        Widening the fetch (see the diversification branch in
+        ``_build_graphql``) surfaces more per-document candidates than the
+        page size; without this step, a naive score-sorted truncate to
+        ``limit`` lets a single highly-relevant document crowd out every
+        other result in the page. This pops one result per document_id, in
+        document order (each document's own best score, since ``results``
+        arrives score-sorted from Weaviate) and in within-document score
+        order, repeating rounds until ``limit`` is reached or every
+        candidate is exhausted -- so the page still favors the
+        highest-scoring items available but no longer skews toward one
+        document at every other document's expense.
+        """
+        if limit <= 0 or not results:
+            return []
+        if len(results) <= limit:
+            # Nothing to truncate, so nothing to crowd out -- preserve
+            # Weaviate's score order rather than round-robin-reordering a
+            # page that was never going to drop any result (#146 cross-review).
+            return results
+
+        buckets: dict[str, list[SearchResult]] = {}
+        doc_order: list[str] = []
+        for r in results:
+            if r.document_id not in buckets:
+                buckets[r.document_id] = []
+                doc_order.append(r.document_id)
+            buckets[r.document_id].append(r)
+
+        diversified: list[SearchResult] = []
+        while len(diversified) < limit and any(buckets[doc_id] for doc_id in doc_order):
+            for doc_id in doc_order:
+                if len(diversified) >= limit:
+                    break
+                if buckets[doc_id]:
+                    diversified.append(buckets[doc_id].pop(0))
+        return diversified
 
     def _build_graphql(
         self,
@@ -661,6 +707,16 @@ class SearchService:
         # page could come back short even when more above-threshold matches
         # exist. Results are truncated back to request.limit after filtering (#31).
         fetch_limit = min(100, request.limit * 3) if request.min_score > 0 else request.limit
+        # Diversification (#146, EXPERIMENTAL, off by default) needs a wider
+        # candidate pool to diversify across -- fetching exactly `limit` rows
+        # leaves nothing to round-robin against once the top document's
+        # chunks fill the page. Takes the max with the min_score branch above
+        # rather than replacing it, since both may be active together.
+        if settings.enable_diversification:
+            fetch_limit = max(
+                fetch_limit,
+                min(100, request.limit * settings.diversification_over_fetch_multiplier),
+            )
         where_clause = ""
         if request.document_ids:
             where_filter: dict[str, Any] = {

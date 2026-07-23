@@ -32,7 +32,72 @@ All notable changes to Inherent are documented here. The format follows
   check builds with `--strict` on every PR. Release tagging + docs-currency
   rules added to `CLAUDE.md` and `docs/maintainers/releasing.md`. (#115)
 
+- **Ingestion eval hardening (REQ-EVL-2).** `test_chunk_token_budget` asserts
+  no chunk from any golden fixture exceeds the embedding model's token budget
+  (using the existing `estimate_tokens()`/`_token_budget_char_cap()` math
+  against the real sample documents, not just unit-tested in isolation).
+  `text_whitespace_ratio` (a production `DataQualityService` *warning*) is now
+  an eval-only *hard fail* for the bundled fixtures — a golden document
+  producing noisy extraction is an extractor regression, not unpredictable
+  real-world input, without changing production severity for real documents.
+
+- **Benchmark JSON report artifacts (REQ-EVL-3).** Both services' live Compose
+  benchmarks now persist a JSON summary (p50/p95/p99/QPS for search,
+  docs/sec for ingestion, plus commit SHA) instead of only printing to stdout
+  — `search-benchmark-report.json` / `ingestion-benchmark-report.json`,
+  uploaded as CI artifacts by `integration.yml` alongside the existing
+  retrieval-eval report. Visibility only; the existing loose SLO assertions
+  are still what fails a build.
+
+- **Per-document result diversification (#146, opt-in).** New
+  `enable_diversification` flag (default `False`) round-robins search
+  results across `document_id` before truncating to the page size, so one
+  long, many-chunk document can no longer silently crowd every other
+  relevant document out of the result page — measured on a new golden-corpus
+  category (`multi_doc_crowding`, `q14`): recall@5 0.5 → 1.0, nDCG@5
+  ~0.61 → ~0.88-0.92 across all three search modes, with every pooled
+  per-mode metric flat or improved and none regressed. Gated behind the same
+  eval-gate policy as the #47 advanced methods (documented improvement +
+  maintainer approval before defaulting on) because it changes ranking order
+  for every multi-chunk query, not just crowded ones — see
+  [ADR 0004](https://github.com/inherent-prime/inherent/blob/main/docs/adr/0004-per-document-diversification.md).
+
 ### Fixed
+
+- **Retrieval-eval baseline ratchet silently never ran (#139 follow-up).**
+  `eval-baseline-ratchet` pushed its ratchet commit straight to `main`, but
+  branch protection rejects direct `github-actions[bot]` pushes — every
+  attempt failed with `remote rejected (protected branch hook declined)`, so
+  the committed baseline stayed at its seeded zeros on every green run since
+  #139 shipped, leaving the relative gate a no-op (only the absolute
+  `RETRIEVAL_MIN_RECALL5` floor was ever live). The job now ratchets on a
+  dedicated branch and opens (or updates) a PR instead of pushing to `main`,
+  with auto-merge requested so a clean ratchet still needs no human action
+  (`.github/workflows/integration.yml`). The PR-based fix went through two
+  more rounds of cross-review before landing: the open-PR check
+  (`gh pr view`) also matched an already-merged PR on the same reused branch,
+  which would have silently skipped `gh pr create` forever after the first
+  merge (fixed via `gh pr list --state open`); the branch's own
+  baseline/history are now pulled forward before recomputing when a prior
+  ratchet PR is still open, instead of resetting to `main`'s older copy,
+  so a not-yet-merged rise is never dropped; and `--force-with-lease` now has
+  the remote branch actually fetched first, since leasing against a ref that
+  was never fetched was rejected as stale on any run after the first. The
+  default `GITHUB_TOKEN` also doesn't trigger `ci.yml` on the PR it opens
+  (GitHub excludes actions performed with it from firing other workflow
+  runs), so the job now prefers an optional `RATCHET_PR_TOKEN` repo secret
+  and falls back to a normal maintainer-merged PR if that secret isn't set.
+  Seeded the first `corpus/retrieval_history.jsonl` line from a real
+  measured run on `main` (commit `201363a`) instead of zeros, so the
+  relative gate is live immediately; `corpus/retrieval_baseline.json` was
+  seeded from that same run and then re-seeded again below once the golden
+  corpus grew (see the diversification entry) — the committed baseline
+  reflects the later measurement, not `201363a`, and the `_comment` field
+  states which commit it came from. Also corrected
+  `docs/advanced-indexes.md`'s placeholder eval targets from `@10` to `@5`
+  — the compose gate only ever computes `recall@5`/`nDCG@5`, so a future
+  advanced method cleared against `@10` numbers would not be measurable
+  against the gate that exists.
 
 - **Rate limiting never applied per-API-key in production (#149).** Starlette's
   `add_middleware` makes the *last*-added middleware run *first*; `main.py`

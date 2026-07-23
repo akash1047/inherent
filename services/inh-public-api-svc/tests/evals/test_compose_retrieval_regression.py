@@ -144,15 +144,49 @@ def test_ranking_regression_against_golden_corpus(client, golden_corpus):
             )
         assert up.status_code == 201, f"upload {fn} failed: {up.status_code} {up.text}"
 
-    # 2. Wait until the corpus is searchable (a known query returns results).
-    probe = next(iter(queries.values()))
+    # 2. Wait until the corpus is searchable. Checking only ONE probe query
+    # (the historical behavior) is a race: that single probe's own document
+    # can finish its extract->chunk->embed->index pipeline well before the
+    # rest of the corpus does, especially on a slow/CPU-only embedding
+    # runner, so scoring below can start while most documents are still
+    # mid-pipeline -- every query against a not-yet-indexed document then
+    # legitimately scores zero, not because ranking is bad but because
+    # nothing was there yet to rank. This produced a spuriously low
+    # measurement in the past (corpus/retrieval_history.jsonl's first entry,
+    # sha 201363a, pooled recall@5 ~0.21 across every mode -- a uniformity
+    # consistent with only a handful of documents being ready when scoring
+    # started, not a real ranking-quality signal) and was directly observed
+    # for a newly-added query during #146 development (see ADR 0004): the
+    # first eval run after adding two new fixtures scored 0/0/0 on that
+    # query, and an immediate re-run (once processing caught up) scored a
+    # perfect 1.0/1.0/1.0 with no code change in between. Every query must
+    # independently surface its own judged-relevant document (or, for
+    # abstention queries with no relevant document by construction, any
+    # non-empty result) before scoring starts.
+    def _query_ready(query: str, relevant_ids: set[str]) -> bool:
+        ranked = _search(client, query, "semantic", limit=20)
+        if not relevant_ids:
+            return bool(ranked)  # abstention: any result means the index is live
+        # ALL judged-relevant docs, not just one -- a multi-relevant query
+        # (e.g. multi_doc_crowding's q14, judged against two documents) is
+        # otherwise marked ready the moment the first of its relevant docs
+        # indexes, while the second is still mid-pipeline, reintroducing the
+        # exact race this function exists to close (#146 cross-review).
+        return relevant_ids.issubset(set(ranked))
+
     deadline = time.monotonic() + TIMEOUT
-    while time.monotonic() < deadline:
-        if _search(client, probe, "semantic"):
-            break
-        time.sleep(3)
-    else:
-        pytest.fail(f"corpus not searchable within {TIMEOUT}s")
+    unready = set(queries)
+    while unready and time.monotonic() < deadline:
+        for qid in list(unready):
+            if _query_ready(queries[qid], relevant.get(qid, set())):
+                unready.discard(qid)
+        if unready:
+            time.sleep(3)
+    if unready:
+        pytest.fail(
+            f"corpus not fully searchable within {TIMEOUT}s -- still not ready: "
+            f"{sorted(unready)}"
+        )
 
     # 3. Score each query per mode; report and assert a loose baseline. Also
     # break scores down per query category (#37 corpus expansion) -- reporting

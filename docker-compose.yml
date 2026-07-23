@@ -350,6 +350,12 @@ services:
       # exercise the ingestion→search path unthrottled. Rate-limit behavior has
       # its own offline coverage (tests/integration/test_rate_limiting.py).
       RATE_LIMIT_ENABLED: ${RATE_LIMIT_ENABLED:-true}
+      # EXPERIMENTAL (#146), off by default -- see settings.py and
+      # docs/advanced-indexes.md. Exposed so local Compose runs can measure
+      # it against the golden corpus (tests/evals/) without editing this
+      # file: `ENABLE_DIVERSIFICATION=true docker compose up -d --force-recreate
+      # inh-public-api-svc`.
+      ENABLE_DIVERSIFICATION: ${ENABLE_DIVERSIFICATION:-false}
       LOG_LEVEL: INFO
     depends_on:
       postgres-init:

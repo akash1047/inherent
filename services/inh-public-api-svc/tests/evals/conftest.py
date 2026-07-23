@@ -71,12 +71,16 @@ def golden_corpus() -> dict:
           the query archetypes production RAG evals should exercise beyond
           generic doc lookup: ``exact_id`` (identifiers/error codes),
           ``stale_version`` (superseded vs. current docs), ``paraphrase``
-          (semantically-equivalent, differently-worded query), and
-          ``abstention`` (no relevant document exists in the corpus -- the
-          correct retrieval-layer signal is zero recall/MRR/nDCG, not a
-          fabricated match). Permission/tenancy boundaries are deliberately
-          NOT a category here -- that's owned by the ``security`` marker suite
-          (auth/tenancy isolation), not the ranking-quality corpus.
+          (semantically-equivalent, differently-worded query), ``abstention``
+          (no relevant document exists in the corpus -- the correct
+          retrieval-layer signal is zero recall/MRR/nDCG, not a fabricated
+          match), and ``multi_doc_crowding`` (2+ genuinely relevant documents
+          where one has many more chunks than the other, so a naive
+          score-sorted top-k can crowd the shorter document out entirely --
+          the scenario per-document diversification, #146, exists to fix).
+          Permission/tenancy boundaries are deliberately NOT a category here
+          -- that's owned by the ``security`` marker suite (auth/tenancy
+          isolation), not the ranking-quality corpus.
         - ``sample_dir``: path to the shared sample-document fixtures.
     """
     judgments = _load_qrels()

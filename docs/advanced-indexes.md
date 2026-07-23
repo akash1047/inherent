@@ -55,13 +55,18 @@ defeated.
 
 These are **placeholder** acceptance thresholds to be finalized with real
 measurements; each is "must not regress, and must clear the bar below" vs the
-hybrid baseline on the M4 corpus:
+hybrid baseline on the M4 corpus. Stated at `@5` because that is the cutoff
+the compose retrieval-eval gate actually computes today
+(`test_compose_retrieval_regression.py`'s `recall_at_k`/`ndcg_at_k` calls pass
+`k=5`, matching `corpus/retrieval_baseline.json`'s `recall@5`/`ndcg@5` keys) —
+a method cleared against `@10` numbers would not be measurable against the
+gate that exists:
 
 | Method | Placeholder target (vs hybrid baseline #45) |
 | --- | --- |
-| Cross-encoder rerank | nDCG@10 improvement >= +0.03 (no recall@10 regression) |
-| GraphRAG index | recall@10 improvement >= +0.05 (no nDCG@10 regression) |
-| Hierarchy index | recall@10 improvement >= +0.05 on long-document queries (no nDCG@10 regression) |
+| Cross-encoder rerank | nDCG@5 improvement >= +0.03 (no recall@5 regression) |
+| GraphRAG index | recall@5 improvement >= +0.05 (no nDCG@5 regression) |
+| Hierarchy index | recall@5 improvement >= +0.05 on long-document queries (no nDCG@5 regression) |
 
 ## How to enable in dev (experimentation only)
 
@@ -85,3 +90,24 @@ clears the eval gate above.
   `services/inh-public-api-svc/src/services/search.py`, called after results are
   assembled in `SearchService.search()`.
 - Gate test: `services/inh-public-api-svc/tests/evals/test_advanced_index_gate.py`
+
+## Per-document diversification (#146) — implemented, still gated
+
+Unlike the three scaffolding-only methods above, per-document diversification
+(`enable_diversification`, `SearchService._diversify_by_document`) **is fully
+implemented** — no new model or index, just a wider Weaviate fetch and a
+round-robin over already-scored candidates before truncating to the page
+size. It stays gated behind the same eval-gate policy (documented eval
+improvement + maintainer approval before defaulting on) for a different
+reason than the #47 methods: it changes ranking order for every
+multi-chunk-per-document query, not just crowded ones, so a caller relying on
+today's exact ranking for an already-well-served query could see it shift
+even though that query's own relevance hasn't changed. See
+[ADR 0004](adr/0004-per-document-diversification.md) for the measured
+evidence (recall@5 0.5 → 1.0 on the golden corpus's `multi_doc_crowding`
+category, no regression on any other category/mode) and why it still fell
+short of "ship on by default." Its own tunable,
+`diversification_over_fetch_multiplier` (default `5`), controls how many
+extra candidates are fetched per request when the flag is on; ignored when
+it's off. Enable in dev with `export ENABLE_DIVERSIFICATION=true` (or the
+Compose override documented inline in `docker-compose.yml`).
