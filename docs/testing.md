@@ -159,7 +159,9 @@ On a green gate on `main`, `.github/workflows/integration.yml`'s
 `eval-baseline-ratchet` job ratchets the baseline up to
 `max(current, baseline)` per mode/metric (never down), appends a line to
 `corpus/retrieval_history.jsonl` — a durable, checked-in trend log of every
-main-branch run's scores — and opens (or updates) a pull request carrying both
+main-branch run's scores — regenerates the baseline table published in
+`README.md` (see [below](#publishing-the-baseline-to-readmemd)), and opens (or
+updates) a pull request carrying all three
 changes, rather than pushing to `main` directly: branch protection rejects
 direct `github-actions[bot]` pushes, so a push-based ratchet silently fails
 every run (this is what left the baseline seeded at zeros for the entire time
@@ -200,6 +202,43 @@ from that pool since they can never contribute a positive score by
 construction. Permission/tenancy boundaries are deliberately not a category
 here — that's owned by the `security` marker suite, not this ranking-quality
 corpus.
+
+### Publishing the baseline to README.md
+
+`tests/evals/render_baseline_table.py` renders `corpus/retrieval_baseline.json`
+into the marker-delimited block in `README.md`:
+
+```bash
+# from services/inh-public-api-svc
+uv run python -m tests.evals.render_baseline_table \
+  --baseline tests/evals/corpus/retrieval_baseline.json \
+  --readme ../../README.md
+```
+
+Invoke it as `python -m` from the service directory, not as a bare script path
+from the repo root: it imports `load_metrics` from `eval_gate` rather than
+keeping a second copy of the doc-key-dropping parse, and only `-m` puts the
+`tests` package on `sys.path`.
+
+It rewrites only the text between `<!-- retrieval-baseline:start -->` and
+`<!-- retrieval-baseline:end -->`, and fails (exit 1) if that marker pair is
+missing rather than silently leaving the README stale. Output is a pure
+function of the baseline, so re-running against an unchanged baseline is a
+no-op — the `eval-baseline-ratchet` job relies on that to keep `README.md` out
+of its commit unless the numbers actually moved.
+
+It renders the **baseline**, not `retrieval_history.jsonl`, deliberately: a
+history line is appended on every main-branch run (each with a fresh
+timestamp, so never a no-op), so rendering history would rewrite `README.md`
+on every run. The baseline moves only on a real improvement. The baseline is
+also a per-metric `max()` across runs, so the block reports it as a floor and
+carries no single commit SHA — stamping one would misattribute values that
+came from different commits.
+
+Because the ratchet job now commits `README.md`, `README.md` is in the
+workflow's `paths-ignore`; without that, merging a ratchet PR would re-trigger
+`integration.yml` and recreate the unbounded ratchet loop that the
+`retrieval_baseline.json`/`retrieval_history.jsonl` exclusions already prevent.
 
 ## Benchmark JSON report artifacts (REQ-EVL-3)
 

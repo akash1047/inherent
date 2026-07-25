@@ -1,23 +1,41 @@
-name: Integration
+name: Integration & Eval-Gate Ratchet
 
-# Compose-backed ingestion-to-search integration test (#15).
-# This is a slow job (it builds and boots the full local stack incl. the
-# embedding service), so it does NOT run on every PR and does NOT gate merge.
-# It runs on pushes to main, nightly, and on demand.
+# This workflow runs three jobs, and only the first is a "test" in the usual
+# sense -- the other two mutate repo state as a side effect (#156):
+#   1. compose-integration   - Compose-backed ingestion-to-search integration
+#                               test (#15): boots the full local stack incl.
+#                               the embedding service, runs the retrieval-eval
+#                               hard gate, and uploads latency/throughput and
+#                               ingestion benchmark reports.
+#   2. eval-baseline-ratchet - MUTATES THE REPO: opens/updates a PR against
+#                               main that ratchets the retrieval-eval baseline
+#                               forward, and enables auto-merge on it (#146).
+#   3. eval-regression-alert - files or updates a GitHub issue when the
+#                               retrieval-eval gate regresses.
+# Job 1 is slow (it builds and boots the full local stack), so this workflow
+# does NOT run on every PR and does NOT gate merge. It runs on pushes to
+# main, nightly, and on demand.
 on:
   push:
     branches:
       - main
     # The ratchet job below (see "Ratchet baseline + append history + open
-    # PR") only ever touches these two files, then auto-merges its own PR --
+    # PR") only ever touches these three files, then auto-merges its own PR --
     # a push to main. Without this exclusion, that merge re-triggers this
     # workflow, which appends a new history line (new timestamp, so the
     # commit is never a no-op) and opens+auto-merges another PR, forever:
     # an unbounded main<->ratchet loop, each cycle up to the 40-minute
     # Compose job below (#146 cross-review finding).
+    #
+    # README.md is on this list because the ratchet job also regenerates the
+    # published baseline table in it (#158). Excluding it costs nothing else:
+    # a README-only edit has no bearing on a Compose e2e run, and a README
+    # edit bundled with a service change still triggers the workflow (paths-
+    # ignore skips a run only when EVERY changed file matches).
     paths-ignore:
       - "services/inh-public-api-svc/tests/evals/corpus/retrieval_baseline.json"
       - "services/inh-public-api-svc/tests/evals/corpus/retrieval_history.jsonl"
+      - "README.md"
   schedule:
     - cron: "0 4 * * *"
   workflow_dispatch:
@@ -354,7 +372,28 @@ jobs:
           jq -c --arg sha "$GITHUB_SHA" --arg date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             '{sha: $sha, date: $date, metrics: .}' "$report" >> "$history"
 
-          git add "$baseline" "$history"
+          # Republish the baseline table in README.md from the just-ratcheted
+          # baseline (#158), so the advertised numbers can never drift from the
+          # enforced floor. Rendering is a pure function of $baseline, so this
+          # is a no-op whenever the ratchet didn't move a metric -- README.md
+          # then stays out of the commit below via `git diff --cached --quiet`,
+          # and README-only churn never reaches main. Not `|| true`: a failure
+          # here (missing markers, unreadable README) means the published
+          # numbers would silently freeze while CI stayed green, which is the
+          # same class of inert-gate bug this job exists to prevent.
+          #
+          # Run as `python -m` from inside $api, not as a bare script path from
+          # the repo root: the renderer imports load_metrics from eval_gate (to
+          # avoid a second copy of the doc-key-dropping parse), and only `-m`
+          # with $api as cwd puts the `tests` package on sys.path under
+          # `--no-project`. A bare `python $api/tests/evals/render_baseline_table.py`
+          # sets sys.path[0] to the script's own directory and dies on
+          # ModuleNotFoundError: No module named 'tests'.
+          ( cd "$api" && uv run --no-project python -m tests.evals.render_baseline_table \
+              --baseline tests/evals/corpus/retrieval_baseline.json \
+              --readme "$GITHUB_WORKSPACE/README.md" )
+
+          git add "$baseline" "$history" README.md
           if git diff --cached --quiet; then
             echo "no baseline/history change"; exit 0
           fi
