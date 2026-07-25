@@ -1,9 +1,20 @@
-name: Integration
+name: Integration & Eval-Gate Ratchet
 
-# Compose-backed ingestion-to-search integration test (#15).
-# This is a slow job (it builds and boots the full local stack incl. the
-# embedding service), so it does NOT run on every PR and does NOT gate merge.
-# It runs on pushes to main, nightly, and on demand.
+# This workflow runs three jobs, and only the first is a "test" in the usual
+# sense -- the other two mutate repo state as a side effect (#156):
+#   1. compose-integration   - Compose-backed ingestion-to-search integration
+#                               test (#15): boots the full local stack incl.
+#                               the embedding service, runs the retrieval-eval
+#                               hard gate, and uploads latency/throughput and
+#                               ingestion benchmark reports.
+#   2. eval-baseline-ratchet - MUTATES THE REPO: opens/updates a PR against
+#                               main that ratchets the retrieval-eval baseline
+#                               forward, and enables auto-merge on it (#146).
+#   3. eval-regression-alert - files or updates a GitHub issue when the
+#                               retrieval-eval gate regresses.
+# Job 1 is slow (it builds and boots the full local stack), so this workflow
+# does NOT run on every PR and does NOT gate merge. It runs on pushes to
+# main, nightly, and on demand.
 on:
   push:
     branches:
