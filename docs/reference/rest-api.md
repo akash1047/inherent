@@ -33,6 +33,10 @@ Select a workspace with the `X-Workspace-Id` header.
   the user owns zero or several).
 - Cross-workspace documents read as `404`, not `403`.
 
+The workspace is the only access-control boundary — there is no document-level
+ACL or clearance parameter. See the
+[access-control model](../access-control.md).
+
 ## Endpoints
 
 ### Health & observability (no auth)
@@ -60,6 +64,10 @@ Select a workspace with the `X-Workspace-Id` header.
 | DELETE | `/v1/documents/{id}` | `write` | Delete document + vectors + chunks + stored bytes. `204`; `404` if already gone; `503` on vector-store outage (document left intact, retry safe) |
 | GET | `/v1/documents/{id}/lineage` | `read` | Provenance + freshness: `source_uri`, `content_hash`, `ingested_at`, `is_stale`. Optional `chunk_id` query param |
 | POST | `/v1/documents/{id}/refresh` | `write` + `read` | Re-ingest an uploaded document to clear staleness. `404` if missing; `503` on DB/MQ failure. On MQ failure a retried compensation marks the document `failed`; if retries exhaust it can remain `pending` (CRITICAL log + `document_compensation_exhausted_total` metric) — check document status before retrying |
+
+Re-uploading the same filename into the same workspace reuses the existing
+`document_id` and reindexes in place, removing the superseded chunks from
+retrieval — see [Keeping content current](../keeping-content-current.md).
 
 ### Chunks
 

@@ -12,6 +12,8 @@ then open the smallest relevant document.
 | Provision a throwaway Hetzner VM from a laptop (Object Storage state) | [getting-started/local-vm-test.md](getting-started/local-vm-test.md) |
 | Provision a Hetzner VM with Terraform (production path) | [getting-started/production.md](getting-started/production.md) |
 | Harden the demo stack before exposing it to real users/data | [deploy/production.md](deploy/production.md) |
+| Separate content by clearance, tenant, or need-to-know | [access-control.md](access-control.md) |
+| Replace a document that changed, or run a clean retrieval eval | [keeping-content-current.md](keeping-content-current.md) |
 | Copy request examples for every public endpoint | [examples/README.md](examples/README.md) |
 | Look up every REST endpoint, permission, and shape | [reference/rest-api.md](reference/rest-api.md) |
 | Look up every MCP tool, schema, and REST twin | [reference/mcp-tools.md](reference/mcp-tools.md) |
@@ -42,6 +44,8 @@ For most coding or documentation tasks, read in this order:
 docs/
   README.md                    agent-first discovery hub
   index.md                     docs-site landing page (published)
+  access-control.md            workspace security boundary and per-tier pattern
+  keeping-content-current.md   reindex vs. new document, refresh, eval hygiene
   reference/
     rest-api.md                REST endpoint reference
     mcp-tools.md               MCP tool reference

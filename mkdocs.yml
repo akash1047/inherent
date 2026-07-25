@@ -69,6 +69,8 @@ nav:
       - Production (Hetzner + Terraform): getting-started/production.md
       - Laptop VM test: getting-started/local-vm-test.md
   - Guides:
+      - Access-control model: access-control.md
+      - Keeping content current: keeping-content-current.md
       - Production hardening: deploy/production.md
       - Testing: testing.md
       - Advanced indexes: advanced-indexes.md
