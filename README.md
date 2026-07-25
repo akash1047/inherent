@@ -67,6 +67,31 @@ It gives you:
 - Traffic-mined retrieval evals — turn real search traffic and agent feedback into a labeled eval set, then score recall/MRR/nDCG across keyword, semantic, and hybrid modes on your own corpus, no golden-set authoring required
 - Local-first developer setup with Docker Compose
 
+### Retrieval Quality Baseline
+
+Retrieval quality is a CI contract, not a claim. The numbers below are the
+committed baseline in
+[`retrieval_baseline.json`](services/inh-public-api-svc/tests/evals/corpus/retrieval_baseline.json),
+measured against the golden corpus on the full Compose stack. They are an
+enforced **floor**: any per-mode metric regressing more than `0.02` below them
+fails the build, and a green run on `main` ratchets them up (never down), so
+each value is the best score that mode has sustained.
+
+<!-- retrieval-baseline:start -->
+<!-- Generated from services/inh-public-api-svc/tests/evals/corpus/retrieval_baseline.json by tests/evals/render_baseline_table.py — do not edit by hand. The eval-baseline-ratchet job regenerates it whenever the baseline moves. -->
+
+| Mode | Recall@5 | MRR | nDCG@5 |
+| --- | --- | --- | --- |
+| Hybrid | 0.846 | 0.795 | 0.720 |
+| Keyword | 0.808 | 0.821 | 0.714 |
+| Semantic | 0.846 | 0.695 | 0.681 |
+<!-- retrieval-baseline:end -->
+
+Run-over-run scores are appended to
+[`retrieval_history.jsonl`](services/inh-public-api-svc/tests/evals/corpus/retrieval_history.jsonl).
+See [docs/testing.md](docs/testing.md#retrieval-eval-gate-baseline-ratchet-and-trend-history-139)
+for the gate, the absolute-floor backstop, and how to run the evals locally.
+
 ## What's In The Repo
 
 - an ingestion service that processes and indexes documents
