@@ -20,6 +20,8 @@ retrieval with citations, permissions, and freshness signals.
 | Start the system locally and run the first upload/search flow | [Local quickstart](getting-started/local.md) |
 | Deploy to a Hetzner VM with Terraform | [Production](getting-started/production.md) |
 | Harden the stack before real users/data | [Production hardening](deploy/production.md) |
+| Separate content by clearance, tenant, or need-to-know | [Access-control model](access-control.md) |
+| Replace a document that changed, or run a clean retrieval eval | [Keeping content current](keeping-content-current.md) |
 | Call the API — every endpoint, with curl examples | [API examples](examples/README.md) · [REST API reference](reference/rest-api.md) |
 | Wire an agent over MCP | [MCP tools reference](reference/mcp-tools.md) |
 | Configure the services | [Configuration reference](reference/configuration.md) |

@@ -190,5 +190,7 @@ file.
 - [Getting Started Locally](../getting-started/local.md) — the demo stack this
   page hardens
 - [Request Examples](../examples/README.md) — endpoint-by-endpoint API reference
+- [Access-control model](../access-control.md) — the workspace security
+  boundary and the one-workspace-per-clearance-tier pattern
 - [ADR 0002 — Weaviate multi-tenancy](../adr/0002-weaviate-multi-tenancy-scale.md)
   — how workspace isolation is enforced
