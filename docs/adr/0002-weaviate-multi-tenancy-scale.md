@@ -1,6 +1,6 @@
 # ADR 0002 — Weaviate Multi-Tenancy and Scale Strategy
 
-- **Status:** Accepted (initial draft)
+- **Status:** Accepted (amended 2026-07-04 — see [Amendment](#amendment-2026-07-04-injective-base32-naming-1))
 - **Date:** 2026-06-20
 - **Deciders:** maintainers
 - **Closes:** #12
@@ -37,6 +37,12 @@ Sanitization strips every non-alphanumeric character from the raw identifier
 prefix. This keeps names valid as Weaviate class/tenant identifiers regardless
 of the formatting of upstream IDs (UUIDs, slugs, emails, etc.).
 
+> **Superseded 2026-07-04.** The strip-based scheme above is no longer what
+> the code does — it was a lossy, non-injective encoding and shipped a
+> cross-tenant leak. See [Amendment](#amendment-2026-07-04-injective-base32-naming-1)
+> for the current implementation. The rest of this Decision section is kept
+> as the historical record of what was originally accepted.
+
 This gives hard isolation at two levels: workspaces never share a collection,
 and Weaviate's native multi-tenancy isolates users within a collection.
 
@@ -59,6 +65,11 @@ either service's sanitization changes (e.g. someone preserves underscores or
 lowercases differently), its golden test fails in CI before the divergence can
 ship and break cross-service retrieval.
 
+> **Superseded 2026-07-04.** The golden outputs above (`Workspace_wslocal001`,
+> `User_localdevuser`) and the "two duplicated implementations" premise are
+> historical. See [Amendment](#amendment-2026-07-04-injective-base32-naming-1)
+> for the current golden values and the single shared implementation.
+
 ## Known and assumed scale limits
 
 The current model is deliberately simple and is correct for the present scale,
@@ -75,8 +86,10 @@ but it has assumed ceilings worth recording:
 - **No sharding by tier or region.** All workspaces live in one Weaviate
   cluster; there is no placement strategy separating large/noisy tenants from
   small ones, nor any per-tier resource isolation.
-- **Naming is single-sourced only by tests, not by code.** The contract is
-  enforced, but the two implementations must still be edited in lockstep.
+- ~~**Naming is single-sourced only by tests, not by code.** The contract is
+  enforced, but the two implementations must still be edited in lockstep.~~
+  **Resolved 2026-07-04** — see [Amendment](#amendment-2026-07-04-injective-base32-naming-1);
+  naming now has one code implementation, not two kept in sync by tests.
 
 These limits are acceptable today (early scale, local-first / single-cluster
 deployments) and are documented here so the trigger points for the next phase
@@ -86,11 +99,14 @@ are explicit rather than discovered in an incident.
 
 When the limits above start to bind, the planned evolution is:
 
-1. **Extract a `shared-contracts` package.** Move the workspace/user naming
+1. ~~**Extract a `shared-contracts` package.** Move the workspace/user naming
    functions (and related schema constants) into a single package imported by
    both services, replacing duplicated-code-plus-golden-tests with a single
    source of truth. The golden vectors above become that package's own test
-   suite so the contract survives the refactor.
+   suite so the contract survives the refactor.~~ **Done 2026-07-04** — the
+   `inh-contracts` package (`services/inh-contracts/src/inh_contracts/naming.py`)
+   now owns both naming functions; see
+   [Amendment](#amendment-2026-07-04-injective-base32-naming-1).
 2. **Collection sharding by tier.** Introduce placement so workspaces map onto
    multiple Weaviate clusters/shards by tier (e.g. free vs. paid, or by region
    for data-residency), keeping per-cluster collection counts bounded and
@@ -100,10 +116,110 @@ When the limits above start to bind, the planned evolution is:
    collection-count overhead dominates, guided by retrieval and indexing evals
    rather than speculation.
 
+## Amendment 2026-07-04 — injective base32 naming (#1)
+
+**Status of this amendment: Accepted.** Landed in commit `484480d` (PR #86),
+released in `v0.5.0` (2026-07-13); tracked as CHANGELOG `⚠️ BREAKING (data)`.
+
+### What was wrong with the original decision
+
+The strip-everything-non-alphanumeric scheme this ADR originally accepted is
+**not injective**: distinct raw ids that differ only in punctuation collapse
+onto the same sanitized string, so they collapse onto the same Weaviate
+collection/tenant name. Real workspace and user ids are slugs with separators
+(`ws_local_001`, `local-dev-user`), so this was reachable, not theoretical —
+`ws-123`, `ws_123`, and `ws123` all sanitize to `ws123` and would have
+shared one Weaviate collection. That is a cross-tenant data leak: one tenant's
+vectors become readable (and, on write, overwritable) by another. Filed and
+fixed as **#1**.
+
+### Current implementation
+
+Both services now import the naming functions from the shared `inh-contracts`
+package instead of each carrying its own copy — the "extract a shared package"
+item from the Future scaling path above, done ahead of the scale trigger that
+motivated it, because the security fix needed one place to fix it, not two.
+
+`services/inh-contracts/src/inh_contracts/naming.py`:
+
+```python
+def _encode_id(raw_id: str) -> str:
+    """Injectively encode a raw id into Weaviate's allowed name charset.
+
+    base32 (RFC4648) emits only ``A-Z`` and ``2-7`` — valid in both collection
+    and tenant names — and is a reversible bijection, so distinct ids can never
+    produce the same name. Trailing ``=`` padding (not allowed in names) is
+    stripped; because it is purely positional it does not affect injectivity.
+    """
+    return base64.b32encode(raw_id.encode("utf-8")).decode("ascii").rstrip("=")
+
+
+def get_workspace_collection_name(workspace_id: str) -> str:
+    return f"{WORKSPACE_COLLECTION_PREFIX}{_encode_id(workspace_id)}"
+
+
+def get_user_tenant_name(user_id: str) -> str:
+    return f"{USER_TENANT_PREFIX}{_encode_id(user_id)}"
+```
+
+`inh-ingestion-svc/src/services/weaviate.py` and
+`inh-public-api-svc/src/services/search.py` both import
+`get_workspace_collection_name` / `get_user_tenant_name` from
+`inh_contracts.naming` and re-export them under their existing names for
+backward compatibility with existing call sites — there is exactly one
+implementation, not two kept in lockstep by tests.
+
+Base32 (not base64 or hex) was chosen because its output alphabet (`A-Z2-7`)
+is a subset of what both a Weaviate *collection* name (must start with an
+uppercase letter, then alphanumeric/underscore) and a Weaviate *tenant* name
+allow — no further escaping is needed after prefixing.
+
+### Current golden values (supersede the table above)
+
+| Raw input        | Function                    | Expected output (golden)             |
+|-------------------|------------------------------|---------------------------------------|
+| `ws_local_001`    | `get_workspace_collection_name` | `Workspace_O5ZV63DPMNQWYXZQGAYQ`   |
+| `ws-123`          | `get_workspace_collection_name` | `Workspace_O5ZS2MJSGM`             |
+| `local-dev-user`  | `get_user_tenant_name`          | `User_NRXWGYLMFVSGK5RNOVZWK4Q`     |
+| `user_001`        | `get_user_tenant_name`          | `User_OVZWK4S7GAYDC`               |
+
+Verified against the live code in this repo (`services/inh-contracts` test
+suite, 19 passed; `inh-ingestion-svc` naming-contract suite, 4 passed).
+
+The golden contract now has three layers instead of two duplicated copies:
+
+- `services/inh-contracts/tests/test_naming.py` — the package's own suite;
+  the golden values above, plus injectivity tests that assert the ids that
+  used to collide under the old strip scheme (`ws-123` / `ws_123` / `ws123` /
+  `w-s123` / `ws.123`) now produce distinct names.
+- `services/inh-ingestion-svc/tests/test_naming_contract.py` — pins the same
+  golden values from the ingestion side (belt-and-suspenders against the
+  shared package regressing).
+- `services/inh-public-api-svc/tests/unit/test_search_service.py` — asserts
+  behavior (prefixing, no collisions, charset validity) by calling the same
+  shared function rather than hardcoding a second copy of the golden values,
+  so there is nothing left to drift.
+
+### Migration
+
+**Breaking for existing deployments.** Because the encoding changed, every
+existing Weaviate collection/tenant name computed under the old scheme is
+wrong under the new one. Existing collections must be dropped and re-ingested
+— see the `v0.5.0` CHANGELOG entry. PostgreSQL data (which does not derive
+Weaviate names) is unaffected.
+
 ## Consequences
 
 - Strong, easy-to-reason-about isolation now, with no premature complexity.
-- Cross-service correctness is protected by golden naming contract tests in both
-  services; CI catches drift before it reaches production.
-- The scaling path is staged: shared contracts first (low risk, removes the
-  duplication hazard), then sharding only when scale data justifies it.
+- Naming correctness no longer depends on two implementations staying in sync
+  by convention — there is one function, imported by both services (Amendment,
+  2026-07-04). The original "duplicated logic guarded by golden tests" design
+  this ADR accepted only ever protected against the two copies *diverging
+  from each other*; it could not catch — and did not catch — both copies
+  sharing the same non-injective encoding. #1 was a flaw in the shared logic,
+  not a drift between copies.
+- Cross-service correctness is still protected by golden naming contract
+  tests, now anchored to the shared package rather than to two independently
+  maintained copies; CI catches drift before it reaches production.
+- The scaling path is staged: shared contracts landed early (as a security
+  fix, not scale motivated), sharding remains future work, gated on scale data.
