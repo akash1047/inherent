@@ -1469,7 +1469,7 @@
               }
             },
             "url": {
-              "raw": "{{ingest_base}}/chunks/{{document_id}}/0",
+              "raw": "{{ingest_base}}/chunks/{{document_id}}/0?workspace_id={{workspace_id}}",
               "host": [
                 "{{ingest_base}}"
               ],
@@ -1477,9 +1477,15 @@
                 "chunks",
                 "{{document_id}}",
                 "0"
+              ],
+              "query": [
+                {
+                  "key": "workspace_id",
+                  "value": "{{workspace_id}}"
+                }
               ]
             },
-            "description": "Edit chunk #0 of a document via a Temporal workflow (updates PostgreSQL + re-embeds in Weaviate). Replace the trailing `0` with the target chunk index. Returns 409 if an edit is already in progress, 500 if the edit fails."
+            "description": "Edit chunk #0 of a document via a Temporal workflow (updates PostgreSQL + re-embeds in Weaviate). Replace the trailing `0` with the target chunk index. `workspace_id` is required and must own `document_id` (#134); returns 404 on a workspace mismatch or unknown document, 409 if an edit is already in progress, 500 if the edit fails."
           },
           "response": [
             {
@@ -1502,7 +1508,7 @@
                   }
                 },
                 "url": {
-                  "raw": "{{ingest_base}}/chunks/{{document_id}}/0",
+                  "raw": "{{ingest_base}}/chunks/{{document_id}}/0?workspace_id={{workspace_id}}",
                   "host": [
                     "{{ingest_base}}"
                   ],
@@ -1510,6 +1516,12 @@
                     "chunks",
                     "{{document_id}}",
                     "0"
+                  ],
+                  "query": [
+                    {
+                      "key": "workspace_id",
+                      "value": "{{workspace_id}}"
+                    }
                   ]
                 }
               },

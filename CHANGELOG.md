@@ -149,6 +149,24 @@ All notable changes to Inherent are documented here. The format follows
   the stale packages kept installing silently. Regenerated both lock files —
   no behavior change, but the image install surface actually shrinks now as
   intended.
+- **Chunk-edit Weaviate vector left stale after an edit (#137).**
+  `WeaviateService.update_chunk` updated the `content` property but never
+  passed a new `vector=`; chunk collections have no server-side vectorizer,
+  so the old embedding stayed attached to the new text and semantic search
+  kept matching stale content after a `PATCH /chunks/{document_id}/{chunk_index}`
+  edit. Re-embeds the new content and writes the fresh vector on update.
+
+### Security
+
+- **`edit_chunk` wrote to Weaviate with no workspace scoping (#134).**
+  `PATCH /chunks/{document_id}/{chunk_index}` (inh-ingestion-svc) was gated
+  only by `verify_api_key`, with `workspace_id`/`user_id` left unset on
+  `ChunkEditInput` — the downstream Weaviate write derived its
+  collection/tenant from empty strings, bypassing the ownership check every
+  public-API read path enforces via `resolve_workspace_read`. The endpoint
+  now resolves `document_id` against PostgreSQL, 404s on a workspace
+  mismatch, and forwards only the resolved `workspace_id`/`user_id` into
+  `ChunkEditInput` so the vector write is always correctly tenant-scoped.
 
 ### Removed
 

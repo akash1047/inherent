@@ -568,10 +568,19 @@ class WeaviateService:
         workspace_id: str,
         user_id: str,
     ) -> None:
-        """Update a single chunk's content in Weaviate (re-embeds automatically).
+        """Update a single chunk's content AND embedding in Weaviate (#137).
 
         Uses the same deterministic UUID as store_chunks_with_tenant so we
         can update in place.
+
+        Chunk vectors are supplied explicitly at store time -- this
+        collection has no server-side vectorizer (Configure.Vectorizer.none()
+        in _get_chunk_properties()/ensure_workspace_collection), so Weaviate
+        never re-embeds on its own. A ``data.update`` that only sets the
+        ``content`` property therefore leaves the OLD vector attached to the
+        NEW text: semantic search keeps matching on stale content while
+        get_document/list_chunks (which read PG) already show the edit. We
+        re-embed here so the stored vector and the stored text never diverge.
         """
         if not self.client:
             raise RuntimeError("Weaviate not connected")
@@ -584,12 +593,21 @@ class WeaviateService:
             f"{workspace_id}:{user_id}:{document_id}:{chunk_index}",
         )
 
+        # Re-embed the new content. embed_text does blocking HTTP to the TEI
+        # sidecar, so offload it to a thread -- same reasoning as the batch
+        # embed in store_chunks_with_tenant (#19): otherwise this stalls the
+        # event loop for the whole embedding round-trip.
+        from src.services.embedder import embed_text
+
+        vector = await asyncio.to_thread(embed_text, content)
+
         collection = self.client.collections.get(collection_name)
         tenant_collection = collection.with_tenant(tenant_name)
 
         tenant_collection.data.update(
             uuid=chunk_uuid,
             properties={"content": content},
+            vector=vector,
         )
 
         logger.info(

@@ -664,10 +664,12 @@ Returns **404** if no workflow exists for the document (or it is no longer query
 ## 9. Edit a Chunk
 
 Replace the content of a single chunk. Runs a Temporal workflow that updates PostgreSQL and
-re-embeds the chunk in Weaviate. The path index is the chunk's `chunk_index` (0-based).
+re-embeds the chunk in Weaviate. The path index is the chunk's `chunk_index` (0-based). The
+`workspace_id` query param is **required** and must be the workspace that actually owns
+`document_id` (#134) — the vector write is tenant-scoped to it.
 
 ```bash
-curl -s -X PATCH "$INGEST_BASE/chunks/$DOC_ID/0" \
+curl -s -X PATCH "$INGEST_BASE/chunks/$DOC_ID/0?workspace_id=$WORKSPACE_ID" \
   -H "X-API-Key: $INGEST_KEY" \
   -H "Content-Type: application/json" \
   -d '{ "content": "Updated chunk text goes here." }' \
@@ -684,7 +686,9 @@ curl -s -X PATCH "$INGEST_BASE/chunks/$DOC_ID/0" \
 }
 ```
 
-Returns **409** if an edit is already in progress for that chunk, **500** if the edit fails.
+Returns **404** if `document_id` isn't found in `workspace_id` (also returned when the document
+exists but belongs to a different workspace — no cross-tenant existence leak), **409** if an edit
+is already in progress for that chunk, **500** if the edit fails.
 
 ---
 

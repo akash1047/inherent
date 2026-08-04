@@ -358,21 +358,54 @@ def create_app(settings: Settings) -> FastAPI:
     @chunks_router.patch(
         "/{document_id}/{chunk_index}",
         response_model=ChunkEditResponse,
+        responses={404: {"description": "Document not found in the given workspace"}},
     )
     async def edit_chunk(
         document_id: str,
         chunk_index: int,
         body: ChunkEditRequest,
         request: Request,
+        workspace_id: str = Query(..., description="Workspace that must own document_id"),
     ):
-        """Edit a chunk via Temporal workflow (updates PG + re-embeds in Weaviate)."""
+        """Edit a chunk via Temporal workflow (updates PG + re-embeds in Weaviate).
+
+        Security (#134): verify_api_key alone only proves the caller holds a
+        valid service key -- it says nothing about which workspace the caller
+        is allowed to touch. Before this fix the endpoint did the write
+        regardless, so a caller that knew (or guessed) a foreign document_id
+        could re-embed its chunk into Weaviate with no tenant scope
+        (workspace_id/user_id left unset on ChunkEditInput -> collection/
+        tenant name derived from "").
+        We now resolve document_id against PostgreSQL -- the same
+        "workspace_id must match or 404" ownership check the public-API read
+        paths enforce via resolve_workspace_read -- and only pass the
+        *resolved* workspace_id/user_id (never caller-supplied) into
+        ChunkEditInput, so the downstream Weaviate write always lands in the
+        document's actual tenant.
+        """
+        from src.temporal import shared_services
+
         client: Client = request.app.state.temporal_client
         settings: Settings = request.app.state.settings
+
+        db_svc = shared_services.get_db_service()
+        document = await db_svc.get_document_status(document_id)
+
+        # Same response for "no such document" and "exists in a workspace you
+        # don't own" -- a distinguishable error would leak cross-tenant
+        # existence of the document_id.
+        if document is None or document.get("workspace_id") != workspace_id:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Document {document_id} not found in workspace {workspace_id}.",
+            )
 
         workflow_input = ChunkEditInput(
             document_id=document_id,
             chunk_index=chunk_index,
             content=body.content,
+            workspace_id=document["workspace_id"],
+            user_id=document["user_id"],
         )
 
         workflow_id = f"chunk-edit-{document_id}-{chunk_index}"
