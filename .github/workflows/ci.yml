@@ -38,6 +38,19 @@ jobs:
             security: uv run bandit -c pyproject.toml -r src
             test: uv run pytest
             cov_fail_under: 45
+          # inh-contracts previously ran in NO automation (#132 item 4): a
+          # change to a shared constant like DEFAULT_S3_REGION or the
+          # Weaviate-naming derivation was caught by nothing, only a
+          # one-sided drift downstream. No Postgres dependency; runs in <1s.
+          - service: inh-contracts
+            path: services/inh-contracts
+            python-version: "3.11"
+            lint: uv run ruff check src tests
+            format: uv run black --check src tests
+            typecheck: ""
+            security: ""
+            test: uv run pytest
+            cov_fail_under: 95
 
     services:
       postgres:

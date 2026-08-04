@@ -4,7 +4,7 @@ from functools import lru_cache
 from typing import Literal
 
 from inh_contracts.defaults import DEFAULT_S3_REGION
-from pydantic import Field
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -110,11 +110,22 @@ class Settings(BaseSettings):
     aws_access_key_id: str = Field(default="", description="S3 access key ID")
     aws_secret_access_key: str = Field(default="", description="S3 secret access key")
     aws_s3_bucket: str = Field(default="inherent-documents", description="S3 bucket for documents")
-    # Default sourced from inh_contracts.defaults (#132) -- ingestion-svc's
-    # s3_region field must default to the SAME constant, or a deployment
-    # that only sets the region env var for one service silently leaves the
-    # other targeting a different region/bucket for uploads vs reads.
-    aws_s3_region: str = Field(default=DEFAULT_S3_REGION, description="S3 region")
+    # Default: see inh_contracts.defaults.DEFAULT_S3_REGION (#132) -- the single
+    # source of truth shared with ingestion-svc's s3_region field.
+    #
+    # Alias: ingestion-svc reads AWS_REGION (#132 blocker 1). Without accepting
+    # it here too, an operator who follows docs/deploy/production.md step 3
+    # ("set AWS_REGION=<your-region>") configures ingestion but leaves this
+    # service on DEFAULT_S3_REGION -- the exact drift #132 exists to prevent,
+    # now reintroduced one layer up (env var NAME instead of default VALUE).
+    # AWS_S3_REGION is tried first so it still overrides a stray AWS_REGION
+    # when an operator deliberately wants this service on a different region.
+    aws_s3_region: str = Field(
+        default=DEFAULT_S3_REGION,
+        validation_alias=AliasChoices("AWS_S3_REGION", "AWS_REGION"),
+        description="S3 region. AWS_S3_REGION wins if set; otherwise falls back "
+        "to AWS_REGION (the var ingestion-svc reads) so one var configures both.",
+    )
 
     # MQ (Redis / Valkey)
     mq_redis_url: str = Field(

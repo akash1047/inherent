@@ -38,10 +38,9 @@ class Settings(BaseSettings):
     # S3-compatible storage (Hetzner Object Storage, AWS S3, MinIO, etc.)
     s3_access_key_id: str | None = Field(None, alias="AWS_ACCESS_KEY_ID")
     s3_secret_access_key: str | None = Field(None, alias="AWS_SECRET_ACCESS_KEY")
-    # Default sourced from inh_contracts.defaults (#132) -- public-api-svc's
-    # aws_s3_region field must default to the SAME constant, or a deployment
-    # that only sets the region env var for one service silently leaves the
-    # other targeting a different region/bucket for uploads vs reads.
+    # Default: see inh_contracts.defaults.DEFAULT_S3_REGION (#132) -- the single
+    # source of truth shared with public-api-svc's aws_s3_region field, which
+    # also accepts this same AWS_REGION var (see its AliasChoices, #132 blocker 1).
     s3_region: str = Field(DEFAULT_S3_REGION, alias="AWS_REGION")
     s3_endpoint: str | None = Field(None, alias="AWS_S3_ENDPOINT")
 
