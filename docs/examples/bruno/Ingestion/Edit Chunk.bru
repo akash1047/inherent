@@ -29,6 +29,8 @@ tests {
 docs {
   Edit chunk #0 via a Temporal workflow (updates PostgreSQL + re-embeds in Weaviate). Replace the
   trailing `0` with the target chunk index. `workspace_id` query param is required and must own
-  `document_id` (#134). 404 if the document isn't found in that workspace, 409 if an edit is
-  already in progress, 500 if it fails.
+  `document_id` (#134). 404 if the document isn't found in that workspace or `chunk_index` is out
+  of range, 409 if an edit is already in progress. 500 means PostgreSQL updated but the Weaviate
+  re-embed did not (even after retries) -- the new content is durable but search may return stale
+  results for this chunk until a retry succeeds; also recorded as a GET /lineage ingestion event.
 }

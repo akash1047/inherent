@@ -344,6 +344,16 @@ class ChunkEditResult:
     error: str | None = None
 
 
+# Single source of truth for the record_chunk_edit_weaviate_failure retry
+# budget, shared by the workflow (which sets this as the activity's
+# RetryPolicy.maximum_attempts) and the activity itself (which checks
+# activity.info().attempt against it to know whether THIS attempt is the
+# last one, so it logs CRITICAL + bumps a counter only once, on true
+# exhaustion, rather than on every retried attempt). Keeping this in one
+# place avoids the two call sites silently drifting out of sync.
+CHUNK_EDIT_COMPENSATION_MAX_ATTEMPTS = 2
+
+
 @dataclass
 class ChunkEditWeaviateFailureInput:
     """Input for the record_chunk_edit_weaviate_failure activity (#137).

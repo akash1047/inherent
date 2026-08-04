@@ -154,14 +154,18 @@ All notable changes to Inherent are documented here. The format follows
   passed a new `vector=`; chunk collections have no server-side vectorizer,
   so the old embedding stayed attached to the new text and semantic search
   kept matching stale content after a `PATCH /chunks/{document_id}/{chunk_index}`
-  edit. Re-embeds the new content, writes the fresh vector, and advances
-  `content_hash`/`ingested_at` alongside `content` (the same fields
-  `update_chunk_postgresql` already keeps current — #9 — now kept current on
-  the Weaviate side too). The Temporal activity also now re-raises on
-  failure instead of swallowing it into a false success: a permanent
-  Weaviate failure surfaces as a 5xx to the caller and is recorded as a
-  compensating `ingestion_events` row instead of silently leaving
-  PostgreSQL and the vector store diverged with no signal. (#137)
+  edit. Re-embeds the new content and writes the fresh vector; `content_hash`
+  now advances alongside `content` in both stores (`update_chunk_postgresql`
+  already did this — #9; Weaviate did not) and `ingested_at` now advances in
+  both stores too (neither did before this fix — a just-edited chunk
+  otherwise reports `is_stale=false` from the search path (Weaviate-backed)
+  and `is_stale=true` from the chunk/lineage path (PG-backed) at once). The
+  Weaviate-update Temporal activity also now re-raises on failure instead of
+  swallowing it into a false success: a permanent Weaviate failure surfaces
+  as a 5xx to the caller and is recorded as a compensating `ingestion_events`
+  row (itself retried, with CRITICAL-log + metric on exhaustion) instead of
+  silently leaving PostgreSQL and the vector store diverged with no signal
+  and no record. (#137)
 
 ### Security
 

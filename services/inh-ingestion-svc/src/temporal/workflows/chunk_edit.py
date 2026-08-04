@@ -9,7 +9,12 @@ from temporalio import workflow
 from temporalio.common import RetryPolicy
 
 with workflow.unsafe.imports_passed_through():
-    from src.temporal.models import ChunkEditInput, ChunkEditResult, ChunkEditWeaviateFailureInput
+    from src.temporal.models import (
+        CHUNK_EDIT_COMPENSATION_MAX_ATTEMPTS,
+        ChunkEditInput,
+        ChunkEditResult,
+        ChunkEditWeaviateFailureInput,
+    )
 
 
 @workflow.defn
@@ -55,20 +60,34 @@ class ChunkEditWorkflow:
                 ),
             )
         except Exception as e:
+            # workflow.execute_activity wraps the activity's real exception
+            # in an ActivityError whose own message is always the generic,
+            # hardcoded "Activity task failed" -- the SDK puts the actual
+            # cause (e.g. the ConnectionError update_chunk_weaviate raised)
+            # on `.cause`. Interpolating `e` directly (as this line
+            # originally did) throws away all diagnostic content: the 5xx
+            # body and the compensating ingestion_events row below would
+            # both read "...failed after retries: Activity task failed" for
+            # every failure, indistinguishable from each other.
+            cause_message = str(getattr(e, "cause", None) or e)
             error_message = (
                 f"PostgreSQL updated but the Weaviate re-embed failed after "
-                f"retries: {e}. Search results for this chunk may return "
-                "stale content/vector until a retry succeeds."
+                f"retries: {cause_message}. Search results for this chunk "
+                "may return stale content/vector until a retry succeeds."
             )
 
             # Compensating "mark-failed" (#137): a durable, queryable signal
             # (GET /lineage/{document_id}) that this divergence exists, so
             # it's discoverable even if the caller doesn't act on the 5xx
             # this workflow is about to report. Routed through an explicit
-            # bounded RetryPolicy -- never a bare call -- and this
-            # recording's own failure is logged-and-swallowed by the
-            # activity itself so it can't mask the real error returned below
-            # (#99: the compensation is itself fallible).
+            # bounded RetryPolicy -- never a bare call. The activity itself
+            # now RAISES on failure (see its docstring -- #99: a compensation
+            # that swallows its own error is the exact defect it exists to
+            # prevent, reintroduced one level up) so this RetryPolicy is not
+            # dead code. This outer try/except is what makes raising safe:
+            # it catches the fully-exhausted failure and logs it without
+            # ever masking or replacing the REAL error already captured in
+            # `error_message` above.
             try:
                 await workflow.execute_activity(
                     "record_chunk_edit_weaviate_failure",
@@ -77,21 +96,27 @@ class ChunkEditWorkflow:
                         document_id=input.document_id,
                         workspace_id=input.workspace_id,
                         chunk_index=input.chunk_index,
-                        error_message=str(e),
+                        error_message=cause_message,
                     ),
                     start_to_close_timeout=timedelta(seconds=10),
                     retry_policy=RetryPolicy(
-                        maximum_attempts=2,
+                        maximum_attempts=CHUNK_EDIT_COMPENSATION_MAX_ATTEMPTS,
                         initial_interval=timedelta(seconds=1),
                         maximum_interval=timedelta(seconds=3),
                     ),
                 )
             except Exception as record_err:
-                # The activity itself never raises (see its docstring); this
-                # only catches a Temporal-level dispatch failure. Log, don't
-                # mask the real error below.
-                workflow.logger.error(
-                    f"Failed to record chunk-edit failure lineage event: {record_err}"
+                # Both the Weaviate failure AND its compensating write have
+                # now failed -- the PG/vector divergence this workflow
+                # detected is recorded nowhere. That is the scenario
+                # docs/developer/learnings.md's #99 entry calls "loud
+                # exhaustion": CRITICAL, not a plain warning, so it can't
+                # blend into routine noise.
+                workflow.logger.critical(
+                    "Chunk-edit compensation exhausted: PG/vector divergence "
+                    f"for document {input.document_id} chunk {input.chunk_index} "
+                    f"was never recorded (compensation error: {record_err}; "
+                    f"original error: {cause_message})"
                 )
 
             return ChunkEditResult(

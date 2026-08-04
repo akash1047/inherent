@@ -399,21 +399,34 @@ def create_app(settings: Settings) -> FastAPI:
         db_svc = shared_services.get_db_service()
         document = await db_svc.get_document_status(document_id)
 
-        # Same response for "no such document" and "exists in a workspace you
-        # don't own" -- a distinguishable error would leak cross-tenant
-        # existence of the document_id.
+        # OWNERSHIP GUARD -- must run, and must keep returning exactly this
+        # response, before ANY other check on `document` (including the
+        # chunk_count check right below). Same response for "no such
+        # document" and "exists in a workspace you don't own" -- a
+        # distinguishable error would leak cross-tenant existence of the
+        # document_id. Do not reorder the chunk_count check above this one:
+        # it also 404s and it also reads from `document`, so swapping the
+        # order would let an attacker distinguish "wrong workspace" from
+        # "chunk_index out of range" for a document it doesn't own --
+        # reintroducing the #134 existence leak this guard exists to close.
         if document is None or document.get("workspace_id") != workspace_id:
             raise HTTPException(
                 status_code=404,
                 detail=f"Document {document_id} not found in workspace {workspace_id}.",
             )
 
-        # Reject an out-of-range chunk_index before doing any work (#134
-        # follow-up item 8): get_document_status already returned
+        # Reject an out-of-range chunk_index before doing any more work
+        # (#134 follow-up item 8): get_document_status already returned
         # chunk_count for free, so this costs zero extra queries, and it
         # saves a wasted embed_text round-trip (and, pre-the-#137-fix, a
         # confusingly "successful" no-op) for a chunk that was never going
-        # to exist.
+        # to exist. NOTE: chunk_count is nullable (Column default=0, but the
+        # column itself allows NULL) and is legitimately 0 for a document
+        # that's still `pending`/`processing` -- every chunk_index 404s in
+        # that case, which is CORRECT (there is nothing to edit yet), not a
+        # symptom of the ownership guard above misfiring. This check only
+        # runs once ownership is already proven, so it is a distinct 404
+        # from the one above, not a workspace-scoping bug.
         chunk_count = document.get("chunk_count") or 0
         if chunk_index < 0 or chunk_index >= chunk_count:
             raise HTTPException(

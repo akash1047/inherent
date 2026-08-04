@@ -689,7 +689,13 @@ curl -s -X PATCH "$INGEST_BASE/chunks/$DOC_ID/0?workspace_id=$WORKSPACE_ID" \
 Returns **404** if `document_id` isn't found in `workspace_id` (also returned when the document
 exists but belongs to a different workspace — no cross-tenant existence leak, and when
 `chunk_index` is out of range for the document), **409** if an edit
-is already in progress for that chunk, **500** if the edit fails.
+is already in progress for that chunk, **500** if PostgreSQL updated successfully but the
+Weaviate re-embed did not (even after retries) — the chunk's new text is durable, but search
+results for it may stay stale until a retry succeeds; the failure is also recorded as an
+`ingestion_events` row visible via `GET /lineage/{document_id}`.
+
+Note: an edit does not recompute `start_char`/`end_char` in either store, so after a
+length-changing edit they no longer bracket the chunk's actual content.
 
 ---
 
