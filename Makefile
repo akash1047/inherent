@@ -8,6 +8,10 @@ INGESTION_API_URL    ?= http://localhost:18002
 
 INGESTION_DIR        ?= services/inh-ingestion-svc
 PUBLIC_API_DIR       ?= services/inh-public-api-svc
+# Shared contracts package (#132 item 4) -- previously wired into neither
+# `make test`/`test-fast` nor CI, so a change to a shared constant (e.g.
+# DEFAULT_S3_REGION) or the Weaviate-naming derivation was caught by nothing.
+CONTRACTS_DIR        ?= services/inh-contracts
 
 PG_CONTAINER         ?= inherent-oss-postgres
 PG_USER              ?= postgres
@@ -60,6 +64,7 @@ env:
 install:
 	@uv --project $(INGESTION_DIR) sync --extra dev --group dev
 	@uv --project $(PUBLIC_API_DIR) sync --extra dev --group dev
+	@uv --project $(CONTRACTS_DIR) sync --extra dev --group dev
 
 ## validate: Validate local environment settings across both services.
 validate: env
@@ -141,11 +146,15 @@ check: validate lint format-check type-check security-check test
 test:
 	@cd $(INGESTION_DIR) && uv run pytest
 	@cd $(PUBLIC_API_DIR) && uv run pytest
+	@cd $(CONTRACTS_DIR) && uv run pytest
 
 ## test-fast: Fast offline unit profile for both services (no compose/slow/benchmark).
+##            inh-contracts has no such markers, so it always runs in full --
+##            it takes well under a second either way.
 test-fast:
 	@cd $(INGESTION_DIR) && uv run pytest -m 'not compose and not slow and not benchmark'
 	@cd $(PUBLIC_API_DIR) && uv run pytest -m 'not compose and not slow and not benchmark'
+	@cd $(CONTRACTS_DIR) && uv run pytest
 
 ## test-integration: Run Compose-backed integration tests (requires a running stack).
 test-integration:
@@ -195,11 +204,13 @@ release-down:
 lint:
 	@cd $(INGESTION_DIR) && uv run ruff check src tests
 	@cd $(PUBLIC_API_DIR) && uv run ruff check src tests
+	@cd $(CONTRACTS_DIR) && uv run ruff check src tests
 
 ## format-check: Check formatting for both services.
 format-check:
 	@cd $(INGESTION_DIR) && uv run black --check src tests
 	@cd $(PUBLIC_API_DIR) && uv run black --check src tests
+	@cd $(CONTRACTS_DIR) && uv run black --check src tests
 
 ## type-check: Run mypy for services that currently enable it.
 type-check:

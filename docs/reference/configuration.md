@@ -38,7 +38,7 @@ and binds all datastore ports to `127.0.0.1`.
 | `WEAVIATE_URL` | unset | Full Weaviate URL; overrides host/port below | no |
 | `WEAVIATE_HOST` / `WEAVIATE_PORT` | `localhost` / `8080` | Weaviate address when `WEAVIATE_URL` unset | no |
 | `WEAVIATE_API_KEY` | unset | Bearer key for Weaviate auth (required by the release stack) | yes |
-| `AWS_S3_ENDPOINT` / `AWS_S3_BUCKET` / `AWS_S3_REGION` | `""` / `inherent-documents` / `eu-central-1` | S3-compatible document storage | no |
+| `AWS_S3_ENDPOINT` / `AWS_S3_BUCKET` / `AWS_S3_REGION` | `""` / `inherent-documents` / `us-east-1` | S3-compatible document storage. Region must match ingestion's `AWS_REGION` (#132) — `AWS_S3_REGION` overrides it here if set, but a lone `AWS_REGION` configures this service too | no |
 | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | `""` | S3 credentials | yes |
 
 ### MQ & rate limiting
@@ -110,7 +110,7 @@ and binds all datastore ports to `127.0.0.1`.
 | --- | --- | --- | --- |
 | `STORAGE_BACKEND` | `s3` | `s3` / `gcs` / `local` | no |
 | `STORAGE_BUCKET` | `""` | Bucket name | no |
-| `AWS_S3_ENDPOINT` / `AWS_REGION` | unset / `nbg1` | S3-compatible endpoint + region | no |
+| `AWS_S3_ENDPOINT` / `AWS_REGION` | unset / `us-east-1` | S3-compatible endpoint + region. Region must match public-api's `AWS_S3_REGION` (#132) — public-api also reads this var directly | no |
 | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | unset | S3 credentials | yes |
 
 ### MQ
