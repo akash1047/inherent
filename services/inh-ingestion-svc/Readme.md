@@ -90,7 +90,7 @@ PostgreSQL and Weaviate. All protected routes authenticate with `X-API-Key: $ING
 | `GET` | `/metrics` | none | Prometheus metrics |
 | `POST` | `/ingest` | yes | Trigger ingestion. Async: **202** + `workflow_id`; `?wait=true` → **200** result; **409** if already running |
 | `GET` | `/ingest/{document_id}/status` | yes | Real-time workflow progress (`step`, `progress`, `chunks_created`) |
-| `PATCH` | `/chunks/{document_id}/{chunk_index}` | yes | Edit a chunk (updates PG + re-embeds in Weaviate) |
+| `PATCH` | `/chunks/{document_id}/{chunk_index}?workspace_id=` | yes | Edit a chunk (updates PG + re-embeds in Weaviate). 404 if `document_id` isn't owned by `workspace_id` or `chunk_index` is out of range (#134); 500 if PG updated but the Weaviate re-embed didn't (recorded via `GET /lineage`) |
 | `DELETE` | `/documents/{document_id}?workspace_id=&user_id=` | yes | Delete a document from PG + Weaviate (best-effort) |
 | `GET` | `/lineage/{document_id}` | yes | Ordered ingestion pipeline events for a document |
 | `GET` | `/dead-letter` | yes | List failed-ingestion (dead-letter) jobs; filters `workspace_id`, `status`, `limit` |

@@ -568,10 +568,29 @@ class WeaviateService:
         workspace_id: str,
         user_id: str,
     ) -> None:
-        """Update a single chunk's content in Weaviate (re-embeds automatically).
+        """Update a single chunk's content, hash, timestamp, AND embedding (#137).
 
         Uses the same deterministic UUID as store_chunks_with_tenant so we
         can update in place.
+
+        Chunk vectors are supplied explicitly at store time -- this
+        collection has no server-side vectorizer (Configure.Vectorizer.none()
+        in _get_chunk_properties()/ensure_workspace_collection), so Weaviate
+        never re-embeds on its own. A ``data.update`` that only sets the
+        ``content`` property therefore leaves the OLD vector attached to the
+        NEW text: semantic search keeps matching on stale content while
+        get_document/list_chunks (which read PG) already show the edit. We
+        re-embed here so the stored vector and the stored text never diverge.
+
+        Also advances ``content_hash`` and ``ingested_at`` alongside
+        ``content`` -- mirroring exactly what update_chunk_postgresql already
+        does for the PG row (#9). Before this, an edit updated content here
+        but left the OLD content_hash in place: the public API's
+        content_hash contract (services/inh-public-api-svc/src/models/
+        search.py) is "sha256 of the *returned* content", so a legitimately
+        edited chunk would read back as tampered evidence, and a stale
+        ingested_at could keep reporting is_stale=true right after a fresh
+        edit.
         """
         if not self.client:
             raise RuntimeError("Weaviate not connected")
@@ -584,12 +603,30 @@ class WeaviateService:
             f"{workspace_id}:{user_id}:{document_id}:{chunk_index}",
         )
 
+        # Re-embed the new content. embed_text does blocking HTTP to the TEI
+        # sidecar, so offload it to a thread -- same reasoning as the batch
+        # embed in store_chunks_with_tenant (#19): otherwise this stalls the
+        # event loop for the whole embedding round-trip.
+        from src.services.embedder import embed_text
+
+        vector = await asyncio.to_thread(embed_text, content)
+
         collection = self.client.collections.get(collection_name)
         tenant_collection = collection.with_tenant(tenant_name)
 
         tenant_collection.data.update(
             uuid=chunk_uuid,
-            properties={"content": content},
+            properties={
+                "content": content,
+                # Same hash formula as the store path / update_chunk_postgresql
+                # (#41/#9) -- keeps the evidence hash consistent with the new
+                # content instead of flagging a legitimate edit as tampered.
+                "content_hash": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+                # Freshness (#42): bump so a just-edited chunk isn't reported
+                # stale using the pre-edit ingest time.
+                "ingested_at": datetime.now(UTC),
+            },
+            vector=vector,
         )
 
         logger.info(

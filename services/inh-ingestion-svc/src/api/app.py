@@ -358,21 +358,91 @@ def create_app(settings: Settings) -> FastAPI:
     @chunks_router.patch(
         "/{document_id}/{chunk_index}",
         response_model=ChunkEditResponse,
+        responses={404: {"description": "Document not found in the given workspace"}},
     )
     async def edit_chunk(
         document_id: str,
         chunk_index: int,
         body: ChunkEditRequest,
         request: Request,
+        workspace_id: str = Query(..., description="Workspace that must own document_id"),
     ):
-        """Edit a chunk via Temporal workflow (updates PG + re-embeds in Weaviate)."""
+        """Edit a chunk via Temporal workflow (updates PG + re-embeds in Weaviate).
+
+        Security (#134): before this fix, ChunkEditInput left workspace_id/
+        user_id unset, so the Weaviate write derived its collection/tenant
+        from "" -- no tenant scope at all. We now resolve document_id
+        against PostgreSQL and 404 unless its stored workspace_id equals the
+        caller's claimed workspace_id, then forward only the *resolved*
+        workspace_id/user_id (never caller-supplied) into ChunkEditInput, so
+        a self-consistent (document_id, workspace_id) pair always lands the
+        Weaviate write in the document's real tenant instead of "".
+
+        This is workspace<->document CONSISTENCY, not caller<->workspace
+        ENTITLEMENT -- narrower than what it may look like at a glance.
+        verify_api_key is one shared secret with no key->workspace binding
+        (unlike the public API's resolve_workspace_read, which validates
+        that the calling API key's owner is actually entitled to the
+        workspace before ever looking at a document). Here, workspace_id
+        stays entirely caller-asserted: this check only rejects a caller
+        that gets the pairing wrong, not one that already knows a valid
+        (document_id, workspace_id) pair for a workspace it doesn't own --
+        e.g. by reading one out of GET /dead-letter, which returns rows
+        across all workspaces. That gap is tracked separately (#177) and
+        intentionally not folded into this endpoint-level fix.
+        """
+        from src.temporal import shared_services
+
         client: Client = request.app.state.temporal_client
         settings: Settings = request.app.state.settings
+
+        db_svc = shared_services.get_db_service()
+        document = await db_svc.get_document_status(document_id)
+
+        # OWNERSHIP GUARD -- must run, and must keep returning exactly this
+        # response, before ANY other check on `document` (including the
+        # chunk_count check right below). Same response for "no such
+        # document" and "exists in a workspace you don't own" -- a
+        # distinguishable error would leak cross-tenant existence of the
+        # document_id. Do not reorder the chunk_count check above this one:
+        # it also 404s and it also reads from `document`, so swapping the
+        # order would let an attacker distinguish "wrong workspace" from
+        # "chunk_index out of range" for a document it doesn't own --
+        # reintroducing the #134 existence leak this guard exists to close.
+        if document is None or document.get("workspace_id") != workspace_id:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Document {document_id} not found in workspace {workspace_id}.",
+            )
+
+        # Reject an out-of-range chunk_index before doing any more work
+        # (#134 follow-up item 8): get_document_status already returned
+        # chunk_count for free, so this costs zero extra queries, and it
+        # saves a wasted embed_text round-trip (and, pre-the-#137-fix, a
+        # confusingly "successful" no-op) for a chunk that was never going
+        # to exist. NOTE: chunk_count is nullable (Column default=0, but the
+        # column itself allows NULL) and is legitimately 0 for a document
+        # that's still `pending`/`processing` -- every chunk_index 404s in
+        # that case, which is CORRECT (there is nothing to edit yet), not a
+        # symptom of the ownership guard above misfiring. This check only
+        # runs once ownership is already proven, so it is a distinct 404
+        # from the one above, not a workspace-scoping bug.
+        chunk_count = document.get("chunk_count") or 0
+        if chunk_index < 0 or chunk_index >= chunk_count:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"Chunk {chunk_index} not found for document {document_id} "
+                    f"(document has {chunk_count} chunks)."
+                ),
+            )
 
         workflow_input = ChunkEditInput(
             document_id=document_id,
             chunk_index=chunk_index,
             content=body.content,
+            workspace_id=document["workspace_id"],
+            user_id=document["user_id"],
         )
 
         workflow_id = f"chunk-edit-{document_id}-{chunk_index}"

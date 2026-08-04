@@ -25,6 +25,7 @@ from src.temporal.activities import (
     extract_text,
     fetch_document,
     publish_completion,
+    record_chunk_edit_weaviate_failure,
     record_dead_letter,
     set_document_status,
     store_in_postgresql,
@@ -63,6 +64,7 @@ _ALL_ACTIVITIES: list[Callable[..., Any]] = [
     cleanup_staging,
     update_chunk_postgresql,
     update_chunk_weaviate,
+    record_chunk_edit_weaviate_failure,
     record_dead_letter,
     publish_completion,
 ]

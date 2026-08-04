@@ -342,3 +342,31 @@ class ChunkEditResult:
     chunk_index: int
     success: bool
     error: str | None = None
+
+
+# Single source of truth for the record_chunk_edit_weaviate_failure retry
+# budget, shared by the workflow (which sets this as the activity's
+# RetryPolicy.maximum_attempts) and the activity itself (which checks
+# activity.info().attempt against it to know whether THIS attempt is the
+# last one, so it logs CRITICAL + bumps a counter only once, on true
+# exhaustion, rather than on every retried attempt). Keeping this in one
+# place avoids the two call sites silently drifting out of sync.
+CHUNK_EDIT_COMPENSATION_MAX_ATTEMPTS = 2
+
+
+@dataclass
+class ChunkEditWeaviateFailureInput:
+    """Input for the record_chunk_edit_weaviate_failure activity (#137).
+
+    Carries what's needed to write a durable, queryable ingestion_events row
+    (GET /lineage/{document_id}) when a chunk edit's PostgreSQL write
+    succeeds but its Weaviate re-embed does not, even after retries -- the
+    compensating "mark-failed" signal for that divergence, so it isn't only
+    visible as a one-shot HTTP 5xx the caller may not persist.
+    """
+
+    workflow_id: str
+    document_id: str
+    workspace_id: str
+    chunk_index: int
+    error_message: str
