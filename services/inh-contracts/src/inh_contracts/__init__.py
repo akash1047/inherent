@@ -1,9 +1,11 @@
 """inh-contracts: shared contracts consumed by both Inherent services.
 
-Single source of truth for Weaviate naming (#12) and the versioned cross-service
-event schemas (#17). See ``inh_contracts.naming`` and ``inh_contracts.events``.
+Single source of truth for Weaviate naming (#12), the versioned cross-service
+event schemas (#17), and shared configuration defaults (#132). See
+``inh_contracts.naming``, ``inh_contracts.events`` and ``inh_contracts.defaults``.
 """
 
+from inh_contracts.defaults import DEFAULT_S3_REGION
 from inh_contracts.events import (
     CONTRACT_VERSION,
     DocumentCompletionMessage,
@@ -26,4 +28,5 @@ __all__ = [
     "get_user_tenant_name",
     "WORKSPACE_COLLECTION_PREFIX",
     "USER_TENANT_PREFIX",
+    "DEFAULT_S3_REGION",
 ]

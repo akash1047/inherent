@@ -3,6 +3,7 @@
 from functools import lru_cache
 from typing import Literal
 
+from inh_contracts.defaults import DEFAULT_S3_REGION
 from inh_contracts.events import StorageBackend
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -37,7 +38,11 @@ class Settings(BaseSettings):
     # S3-compatible storage (Hetzner Object Storage, AWS S3, MinIO, etc.)
     s3_access_key_id: str | None = Field(None, alias="AWS_ACCESS_KEY_ID")
     s3_secret_access_key: str | None = Field(None, alias="AWS_SECRET_ACCESS_KEY")
-    s3_region: str = Field("nbg1", alias="AWS_REGION")
+    # Default sourced from inh_contracts.defaults (#132) -- public-api-svc's
+    # aws_s3_region field must default to the SAME constant, or a deployment
+    # that only sets the region env var for one service silently leaves the
+    # other targeting a different region/bucket for uploads vs reads.
+    s3_region: str = Field(DEFAULT_S3_REGION, alias="AWS_REGION")
     s3_endpoint: str | None = Field(None, alias="AWS_S3_ENDPOINT")
 
     # Local Storage (for fetching files from integration service)

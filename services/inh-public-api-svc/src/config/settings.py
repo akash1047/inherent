@@ -3,6 +3,7 @@
 from functools import lru_cache
 from typing import Literal
 
+from inh_contracts.defaults import DEFAULT_S3_REGION
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -109,7 +110,11 @@ class Settings(BaseSettings):
     aws_access_key_id: str = Field(default="", description="S3 access key ID")
     aws_secret_access_key: str = Field(default="", description="S3 secret access key")
     aws_s3_bucket: str = Field(default="inherent-documents", description="S3 bucket for documents")
-    aws_s3_region: str = Field(default="eu-central-1", description="S3 region")
+    # Default sourced from inh_contracts.defaults (#132) -- ingestion-svc's
+    # s3_region field must default to the SAME constant, or a deployment
+    # that only sets the region env var for one service silently leaves the
+    # other targeting a different region/bucket for uploads vs reads.
+    aws_s3_region: str = Field(default=DEFAULT_S3_REGION, description="S3 region")
 
     # MQ (Redis / Valkey)
     mq_redis_url: str = Field(

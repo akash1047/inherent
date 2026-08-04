@@ -76,6 +76,16 @@ All notable changes to Inherent are documented here. The format follows
 
 ### Fixed
 
+- **S3 region default drift between inh-ingestion-svc and inh-public-api-svc
+  (#132).** `aws_s3_region` (public-api) defaulted to `eu-central-1` while
+  `s3_region` (ingestion) defaulted to `nbg1`; a deployment that set the
+  region env var for only one service silently left the other on its own
+  default, so uploads and reads could target different regions/buckets. Both
+  now default from a single `inh_contracts.defaults.DEFAULT_S3_REGION`
+  (`us-east-1`, matching the deployed default already in `docker-compose.yml`
+  / `infra/server.tf` / `.env.example`), with an anti-drift contract test on
+  each side pinning the shared constant.
+
 - **Retrieval-eval baseline ratchet silently never ran (#139 follow-up).**
   `eval-baseline-ratchet` pushed its ratchet commit straight to `main`, but
   branch protection rejects direct `github-actions[bot]` pushes — every
