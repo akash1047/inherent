@@ -369,19 +369,27 @@ def create_app(settings: Settings) -> FastAPI:
     ):
         """Edit a chunk via Temporal workflow (updates PG + re-embeds in Weaviate).
 
-        Security (#134): verify_api_key alone only proves the caller holds a
-        valid service key -- it says nothing about which workspace the caller
-        is allowed to touch. Before this fix the endpoint did the write
-        regardless, so a caller that knew (or guessed) a foreign document_id
-        could re-embed its chunk into Weaviate with no tenant scope
-        (workspace_id/user_id left unset on ChunkEditInput -> collection/
-        tenant name derived from "").
-        We now resolve document_id against PostgreSQL -- the same
-        "workspace_id must match or 404" ownership check the public-API read
-        paths enforce via resolve_workspace_read -- and only pass the
-        *resolved* workspace_id/user_id (never caller-supplied) into
-        ChunkEditInput, so the downstream Weaviate write always lands in the
-        document's actual tenant.
+        Security (#134): before this fix, ChunkEditInput left workspace_id/
+        user_id unset, so the Weaviate write derived its collection/tenant
+        from "" -- no tenant scope at all. We now resolve document_id
+        against PostgreSQL and 404 unless its stored workspace_id equals the
+        caller's claimed workspace_id, then forward only the *resolved*
+        workspace_id/user_id (never caller-supplied) into ChunkEditInput, so
+        a self-consistent (document_id, workspace_id) pair always lands the
+        Weaviate write in the document's real tenant instead of "".
+
+        This is workspace<->document CONSISTENCY, not caller<->workspace
+        ENTITLEMENT -- narrower than what it may look like at a glance.
+        verify_api_key is one shared secret with no key->workspace binding
+        (unlike the public API's resolve_workspace_read, which validates
+        that the calling API key's owner is actually entitled to the
+        workspace before ever looking at a document). Here, workspace_id
+        stays entirely caller-asserted: this check only rejects a caller
+        that gets the pairing wrong, not one that already knows a valid
+        (document_id, workspace_id) pair for a workspace it doesn't own --
+        e.g. by reading one out of GET /dead-letter, which returns rows
+        across all workspaces. That gap is tracked separately (#177) and
+        intentionally not folded into this endpoint-level fix.
         """
         from src.temporal import shared_services
 
@@ -398,6 +406,22 @@ def create_app(settings: Settings) -> FastAPI:
             raise HTTPException(
                 status_code=404,
                 detail=f"Document {document_id} not found in workspace {workspace_id}.",
+            )
+
+        # Reject an out-of-range chunk_index before doing any work (#134
+        # follow-up item 8): get_document_status already returned
+        # chunk_count for free, so this costs zero extra queries, and it
+        # saves a wasted embed_text round-trip (and, pre-the-#137-fix, a
+        # confusingly "successful" no-op) for a chunk that was never going
+        # to exist.
+        chunk_count = document.get("chunk_count") or 0
+        if chunk_index < 0 or chunk_index >= chunk_count:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"Chunk {chunk_index} not found for document {document_id} "
+                    f"(document has {chunk_count} chunks)."
+                ),
             )
 
         workflow_input = ChunkEditInput(

@@ -342,3 +342,21 @@ class ChunkEditResult:
     chunk_index: int
     success: bool
     error: str | None = None
+
+
+@dataclass
+class ChunkEditWeaviateFailureInput:
+    """Input for the record_chunk_edit_weaviate_failure activity (#137).
+
+    Carries what's needed to write a durable, queryable ingestion_events row
+    (GET /lineage/{document_id}) when a chunk edit's PostgreSQL write
+    succeeds but its Weaviate re-embed does not, even after retries -- the
+    compensating "mark-failed" signal for that divergence, so it isn't only
+    visible as a one-shot HTTP 5xx the caller may not persist.
+    """
+
+    workflow_id: str
+    document_id: str
+    workspace_id: str
+    chunk_index: int
+    error_message: str

@@ -149,24 +149,44 @@ All notable changes to Inherent are documented here. The format follows
   the stale packages kept installing silently. Regenerated both lock files —
   no behavior change, but the image install surface actually shrinks now as
   intended.
-- **Chunk-edit Weaviate vector left stale after an edit (#137).**
+- **Chunk-edit Weaviate vector left stale after an edit.**
   `WeaviateService.update_chunk` updated the `content` property but never
   passed a new `vector=`; chunk collections have no server-side vectorizer,
   so the old embedding stayed attached to the new text and semantic search
   kept matching stale content after a `PATCH /chunks/{document_id}/{chunk_index}`
-  edit. Re-embeds the new content and writes the fresh vector on update.
+  edit. Re-embeds the new content, writes the fresh vector, and advances
+  `content_hash`/`ingested_at` alongside `content` (the same fields
+  `update_chunk_postgresql` already keeps current — #9 — now kept current on
+  the Weaviate side too). The Temporal activity also now re-raises on
+  failure instead of swallowing it into a false success: a permanent
+  Weaviate failure surfaces as a 5xx to the caller and is recorded as a
+  compensating `ingestion_events` row instead of silently leaving
+  PostgreSQL and the vector store diverged with no signal. (#137)
 
 ### Security
 
-- **`edit_chunk` wrote to Weaviate with no workspace scoping (#134).**
+- **`edit_chunk` wrote to Weaviate with no workspace scoping.**
   `PATCH /chunks/{document_id}/{chunk_index}` (inh-ingestion-svc) was gated
   only by `verify_api_key`, with `workspace_id`/`user_id` left unset on
   `ChunkEditInput` — the downstream Weaviate write derived its
-  collection/tenant from empty strings, bypassing the ownership check every
-  public-API read path enforces via `resolve_workspace_read`. The endpoint
-  now resolves `document_id` against PostgreSQL, 404s on a workspace
-  mismatch, and forwards only the resolved `workspace_id`/`user_id` into
-  `ChunkEditInput` so the vector write is always correctly tenant-scoped.
+  collection/tenant from empty strings. The endpoint now resolves
+  `document_id` against PostgreSQL, 404s unless its stored `workspace_id`
+  matches the caller's claimed one, and forwards only the resolved
+  `workspace_id`/`user_id` into `ChunkEditInput` so a self-consistent pair
+  always lands the write in the document's real tenant. This proves
+  workspace<->document *consistency*, not caller<->workspace *entitlement*:
+  `verify_api_key` is one shared secret with no key->workspace binding
+  (unlike the public API's `resolve_workspace_read`), so a caller that
+  already holds a valid `(document_id, workspace_id)` pair for a workspace
+  it doesn't own is still not stopped by this fix — five more
+  inh-ingestion-svc endpoints share that gap, including a
+  `GET /dead-letter` → `PATCH /chunks` escalation chain, tracked separately
+  and not yet fixed (#177, #175). (#134)
+- **⚠️ BREAKING (API) — `workspace_id` is now a required query param on
+  `PATCH /chunks/{document_id}/{chunk_index}`.** Required by the fix above;
+  a request omitting it now gets **422** instead of editing the chunk. Every
+  existing caller of this inh-ingestion-svc-internal endpoint must add
+  `?workspace_id=<ws>`. (#134)
 
 ### Removed
 

@@ -568,7 +568,7 @@ class WeaviateService:
         workspace_id: str,
         user_id: str,
     ) -> None:
-        """Update a single chunk's content AND embedding in Weaviate (#137).
+        """Update a single chunk's content, hash, timestamp, AND embedding (#137).
 
         Uses the same deterministic UUID as store_chunks_with_tenant so we
         can update in place.
@@ -581,6 +581,16 @@ class WeaviateService:
         NEW text: semantic search keeps matching on stale content while
         get_document/list_chunks (which read PG) already show the edit. We
         re-embed here so the stored vector and the stored text never diverge.
+
+        Also advances ``content_hash`` and ``ingested_at`` alongside
+        ``content`` -- mirroring exactly what update_chunk_postgresql already
+        does for the PG row (#9). Before this, an edit updated content here
+        but left the OLD content_hash in place: the public API's
+        content_hash contract (services/inh-public-api-svc/src/models/
+        search.py) is "sha256 of the *returned* content", so a legitimately
+        edited chunk would read back as tampered evidence, and a stale
+        ingested_at could keep reporting is_stale=true right after a fresh
+        edit.
         """
         if not self.client:
             raise RuntimeError("Weaviate not connected")
@@ -606,7 +616,16 @@ class WeaviateService:
 
         tenant_collection.data.update(
             uuid=chunk_uuid,
-            properties={"content": content},
+            properties={
+                "content": content,
+                # Same hash formula as the store path / update_chunk_postgresql
+                # (#41/#9) -- keeps the evidence hash consistent with the new
+                # content instead of flagging a legitimate edit as tampered.
+                "content_hash": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+                # Freshness (#42): bump so a just-edited chunk isn't reported
+                # stale using the pre-edit ingest time.
+                "ingested_at": datetime.now(UTC),
+            },
             vector=vector,
         )
 
