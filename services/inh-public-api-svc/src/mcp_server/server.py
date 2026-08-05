@@ -31,6 +31,17 @@ Tools return ``list[TextContent]`` (existing convention). For the memory
 primitives the text payload embeds a JSON ``structured`` block so agents can
 parse the result deterministically while humans still get a readable summary.
 
+Workspace scoping parity (#138)
+--------------------------------
+Every tool that needs "which workspaces can this key touch" calls
+``src.services.auth.get_authorized_workspace_ids`` — the SAME rule REST's
+``_resolve_workspace`` enforces: a workspace-scoped key (``APIKeyInfo.
+workspace_id`` set) is bound to exactly that one workspace, never the
+owning user's full workspace set. Do NOT call
+``database.get_user_workspace_ids`` directly from a tool handler — that was
+the #138 defect (a scoped key could reach any workspace its owner owned via
+MCP, while REST correctly rejected the identical request with 403).
+
 Upload parity (#87 Task 3)
 ---------------------------
 ``upload_document`` is the MCP counterpart of POST /v1/documents, but TEXT
@@ -54,6 +65,7 @@ from mcp.types import TextContent, Tool
 from src.config.constants import ALLOWED_MIME_TYPES, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE
 from src.models.api_key import APIKeyInfo
 from src.models.evals import FeedbackRequest
+from src.services.auth import get_authorized_workspace_ids
 from src.services.compensation import mark_document_failed_with_retry
 from src.services.database import get_database
 from src.services.document_intake import intake_document
@@ -241,23 +253,33 @@ async def _get_workspace_ids(
     """
     Determine which workspace IDs to use for a query.
 
+    Authorisation comes from ``get_authorized_workspace_ids`` — the SAME rule
+    REST's ``_resolve_workspace`` enforces (#138): a workspace-scoped key is
+    bound to exactly its one workspace (never the user's full owned set),
+    while a user-scoped key may use any workspace the user owns. Before the
+    #138 fix this function called ``database.get_user_workspace_ids``
+    directly, which only ever reflected the user's full owned set and ignored
+    ``key_info.workspace_id`` entirely — a scoped key could reach any
+    workspace its owner owned via MCP even though REST rejected that same
+    request with 403.
+
     Returns:
         tuple of (workspace_ids list, error message or None)
     """
     database = await get_database()
+    authorized = await get_authorized_workspace_ids(key_info, database)
 
     if requested_workspace_id:
-        # User specified a workspace - verify they have access
-        user_workspaces = await database.get_user_workspace_ids(key_info.user_id)
-        if requested_workspace_id not in user_workspaces:
+        # User specified a workspace - verify it is in the key's authorised set.
+        if requested_workspace_id not in authorized:
             return [], f"Error: You don't have access to workspace '{requested_workspace_id}'"
         return [requested_workspace_id], None
     else:
-        # No workspace specified - use all user's workspaces
-        user_workspaces = await database.get_user_workspace_ids(key_info.user_id)
-        if not user_workspaces:
+        # No workspace specified - use every workspace the key is authorised
+        # for (exactly one, for a scoped key; every owned workspace otherwise).
+        if not authorized:
             return [], "No workspaces found. Upload documents to create a workspace."
-        return user_workspaces, None
+        return authorized, None
 
 
 async def _run_search(
@@ -391,9 +413,10 @@ async def _handle_get_context(key_info: APIKeyInfo, arguments: dict) -> list[Tex
     if not document:
         return [TextContent(type="text", text=f"Error: Document '{document_id}' not found")]
 
-    # Verify user has access to this workspace
-    user_workspaces = await database.get_user_workspace_ids(key_info.user_id)
-    if document.workspace_id not in user_workspaces:
+    # Verify the key is authorised for this workspace (#138: key binding, not
+    # the user's full owned set — see get_authorized_workspace_ids).
+    authorized = await get_authorized_workspace_ids(key_info, database)
+    if document.workspace_id not in authorized:
         return [
             TextContent(
                 type="text", text=f"Error: You don't have access to document '{document_id}'"
@@ -485,20 +508,22 @@ async def _handle_verify_claim(key_info: APIKeyInfo, arguments: dict) -> list[Te
 
 
 async def _resolve_document_for_user(key_info: APIKeyInfo, document_id: str):
-    """Fetch a document by id and verify the user owns its workspace.
+    """Fetch a document by id and verify the key is authorised for its workspace.
 
-    Returns (document, workspace_ids, error_text). On any access failure the
-    error_text is set and the document is None, so callers return without ever
-    reading further data.
+    Authorisation via ``get_authorized_workspace_ids`` (#138): a
+    workspace-scoped key must own the document's exact workspace, not merely
+    any workspace its owning user has. Returns (document, workspace_ids,
+    error_text). On any access failure the error_text is set and the document
+    is None, so callers return without ever reading further data.
     """
     database = await get_database()
     document = await database.get_document_by_id(document_id)
     if not document:
         return None, [], f"Error: Document '{document_id}' not found"
-    user_workspaces = await database.get_user_workspace_ids(key_info.user_id)
-    if document.workspace_id not in user_workspaces:
-        return None, user_workspaces, f"Error: You don't have access to document '{document_id}'"
-    return document, user_workspaces, None
+    authorized = await get_authorized_workspace_ids(key_info, database)
+    if document.workspace_id not in authorized:
+        return None, authorized, f"Error: You don't have access to document '{document_id}'"
+    return document, authorized, None
 
 
 async def _handle_explain_lineage(key_info: APIKeyInfo, arguments: dict) -> list[TextContent]:
@@ -649,9 +674,12 @@ async def _handle_report_feedback(key_info: APIKeyInfo, arguments: dict) -> list
 
     Delegates to the shared ``submit_feedback`` service (same promotion rules
     REST uses at POST /v1/evals/feedback) so the two surfaces never drift.
+    ``workspace_ids`` comes from ``get_authorized_workspace_ids`` (#138) so a
+    workspace-scoped key can only promote/attach feedback within its own
+    workspace, matching REST's ``[auth.workspace_id]`` (src/api/v1/evals.py).
     """
     database = await get_database()
-    workspace_ids = await database.get_user_workspace_ids(key_info.user_id)
+    workspace_ids = await get_authorized_workspace_ids(key_info, database)
     req = FeedbackRequest(
         event_id=arguments["event_id"],
         verdict=arguments["verdict"],
@@ -673,11 +701,12 @@ async def _handle_report_feedback(key_info: APIKeyInfo, arguments: dict) -> list
 async def _handle_get_retrieval_health(key_info: APIKeyInfo, arguments: dict) -> list[TextContent]:
     """Return the workspace scorecard so agents can calibrate trust (evals v1).
 
-    Enforces the same workspace-ownership check every other tool uses before
-    handing the workspace_id to ``build_scorecard``.
+    Enforces the same authorised-workspace check every other tool uses (#138:
+    ``get_authorized_workspace_ids`` — key binding, not the user's full owned
+    set) before handing the workspace_id to ``build_scorecard``.
     """
     database = await get_database()
-    workspace_ids = await database.get_user_workspace_ids(key_info.user_id)
+    workspace_ids = await get_authorized_workspace_ids(key_info, database)
     workspace_id = arguments["workspace_id"]
     if workspace_id not in workspace_ids:
         return [TextContent(type="text", text="Error: workspace not accessible with this key")]
@@ -789,8 +818,11 @@ async def _resolve_single_workspace_for_upload(
             return None, error
         return workspace_ids[0], None
 
+    # #138: authorised set, not the user's full owned set — a scoped key
+    # narrows to its one workspace here too (len(owned) == 1), never forcing
+    # disambiguation among workspaces the key isn't even bound to.
     database = await get_database()
-    owned = await database.get_user_workspace_ids(key_info.user_id)
+    owned = await get_authorized_workspace_ids(key_info, database)
     if not owned:
         return None, "Error: No workspaces found. Upload documents to create a workspace."
     if len(owned) > 1:

@@ -158,6 +158,22 @@ All notable changes to Inherent are documented here. The format follows
   breaker or sync driver is imported), and `packaging` from
   `inh-ingestion-svc` (not imported anywhere). No behavior change.
 
+### Security
+
+- **⚠️ BREAKING (auth) — MCP now enforces workspace-scoped API key binding
+  (#138).** REST's `_resolve_workspace` binds a workspace-scoped key to
+  exactly its one workspace; MCP's `_get_workspace_ids` derived access from
+  the user's full owned-workspace set instead, letting a scoped key reach any
+  workspace its owner also owned via an MCP tool call — silently allowed
+  where REST 403'd the identical request. Both surfaces now share one rule
+  (`get_authorized_workspace_ids` in `src/services/auth.py`). **Existing MCP
+  callers using a workspace-scoped key may see new errors**: a `workspace_id`
+  argument naming a different (but owner-owned) workspace, or an unauthorized
+  document/event id from that other workspace, now returns an `Error: ...`
+  result instead of succeeding; omitting `workspace_id` now narrows to the
+  key's one bound workspace instead of fanning out over every workspace the
+  owner has.
+
 ## [0.5.0] — 2026-07-13
 
 Repository-level release tag, continuing from the last published tag

@@ -9,9 +9,15 @@ enforcement and failure behavior.
 - **Transport: stdio.** Start the service with `SERVICE_MODE=mcp`; the MCP
   server runs as its own process (it is not mounted on the REST app).
 - Every tool call carries the API key as a schema argument (`api_key`) —
-  there are no transport headers on stdio. The key is validated and the
+  there are no transport headers on stdio (no `X-Workspace-Id`; use the
+  `workspace_id` schema argument instead). The key is validated and the
   tool's permission checked **before** the handler runs, mirroring REST
-  401/403 behavior. Handlers additionally enforce workspace ownership.
+  401/403 behavior. Handlers additionally enforce workspace scoping via
+  the same rule REST uses (`get_authorized_workspace_ids` in
+  `src/services/auth.py`, #138): a workspace-scoped key is bound to
+  exactly its one workspace — a `workspace_id` naming any other workspace
+  is rejected, even one the key's owner also owns. A user-scoped key
+  (`workspace_id` unset on the key) may use any workspace its owner owns.
 - Tools, schemas, permissions, and dispatch all derive from a single
   `_TOOLS` registry entry per tool, so the advertised surface cannot drift
   from the enforced one.
@@ -24,7 +30,7 @@ All tools require `api_key` (string). Additional parameters below.
 
 | Tool | Parameters | Purpose | REST twin |
 | --- | --- | --- | --- |
-| `search_documents` | `query` (required); `workspace_id`, `limit` (10), `min_score` (0.0), `document_ids[]`, `search_mode` (`semantic`/`hybrid`/`keyword`), `alpha` (0.7) | Search chunks; fans out across all owned workspaces when none given | `POST /v1/search` |
+| `search_documents` | `query` (required); `workspace_id`, `limit` (10), `min_score` (0.0), `document_ids[]`, `search_mode` (`semantic`/`hybrid`/`keyword`), `alpha` (0.7) | Search chunks; with no `workspace_id`, fans out across every workspace the key is authorized for (its one bound workspace if scoped, otherwise every workspace its owner owns) | `POST /v1/search` |
 | `search_memory` | same as `search_documents` | Memory-primitive alias — identical behavior | `POST /v1/search` |
 | `get_citations` | same as `search_documents` | Search returning claim-level citation objects (spans, score, provenance, freshness) | `POST /v1/search` |
 | `report_feedback` | `event_id`, `verdict` (`answered`/`partial`/`not_relevant`) required; `useful_chunk_ids[]`, `note` | Record a verdict on a captured search event; builds the workspace eval set | `POST /v1/evals/feedback` |

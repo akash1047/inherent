@@ -142,6 +142,29 @@ async def get_write_permission(
     return key_info
 
 
+async def get_authorized_workspace_ids(
+    key_info: APIKeyInfo, database: DatabaseService
+) -> list[str]:
+    """Return every workspace_id ``key_info`` is authorised to act on.
+
+    This is the SINGLE source of truth for the key-scoping rule (#138),
+    shared by REST (``_resolve_workspace`` below) and MCP
+    (``src/mcp_server/server.py``) so the two surfaces cannot drift:
+
+    - A *workspace-scoped* key (``key_info.workspace_id`` set) is bound to
+      exactly that one workspace — regardless of how many workspaces the
+      owning user owns. We deliberately do NOT cross-check this against
+      ``database.get_user_workspace_ids``: the key's binding IS the grant,
+      and re-deriving it from the user's full owned set is exactly the bug
+      this function exists to prevent (see auth.py module history / #138).
+    - A *user-scoped* key (``workspace_id is None``) may act on every
+      workspace its owning user owns.
+    """
+    if key_info.workspace_id is not None:
+        return [key_info.workspace_id]
+    return await database.get_user_workspace_ids(key_info.user_id)
+
+
 async def _resolve_workspace(
     key_info: APIKeyInfo,
     header_workspace_id: str | None,
@@ -181,7 +204,7 @@ async def _resolve_workspace(
     workspace_id = header_workspace_id
     if workspace_id:
         database = await get_database()
-        user_workspaces = await database.get_user_workspace_ids(key_info.user_id)
+        user_workspaces = await get_authorized_workspace_ids(key_info, database)
         if workspace_id in user_workspaces:
             return ResolvedAuth(key_info=key_info, workspace_id=workspace_id)
         # Log the attempted vs authorised set so support can tell "user pasted
@@ -202,7 +225,7 @@ async def _resolve_workspace(
 
     # No workspace from header or key — try to resolve from user's workspaces
     database = await get_database()
-    user_workspaces = await database.get_user_workspace_ids(key_info.user_id)
+    user_workspaces = await get_authorized_workspace_ids(key_info, database)
 
     if required:
         if not user_workspaces:
