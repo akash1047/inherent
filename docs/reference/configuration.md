@@ -64,6 +64,8 @@ and binds all datastore ports to `127.0.0.1`.
 | `EMBEDDING_DIM` | `384` | Embedding vector dimension |
 | `EMBEDDING_TIMEOUT_S` | `30.0` | Per-request TEI timeout (seconds) |
 | `ENABLE_RERANKER` / `ENABLE_GRAPHRAG_INDEX` / `ENABLE_HIERARCHY_INDEX` | `false` | EXPERIMENTAL retrieval scaffolding — off by default, not implemented |
+| `ENABLE_DIVERSIFICATION` | `true` | Round-robin search results across `document_id` before truncating to page size, so one document can't crowd out every other result (#146). Set `false` to restore pre-2026-08-06 ranking. |
+| `DIVERSIFICATION_OVER_FETCH_MULTIPLIER` | `5` | When `ENABLE_DIVERSIFICATION` is on, fetch up to `min(100, limit * this)` candidates to diversify across; ignored when off |
 
 ### Evals
 

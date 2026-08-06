@@ -163,18 +163,21 @@ All notable changes to Inherent are documented here. The format follows
   retrieval-eval report. Visibility only; the existing loose SLO assertions
   are still what fails a build.
 
-- **Per-document result diversification (#146, opt-in).** New
-  `enable_diversification` flag (default `False`) round-robins search
-  results across `document_id` before truncating to the page size, so one
-  long, many-chunk document can no longer silently crowd every other
-  relevant document out of the result page — measured on a new golden-corpus
-  category (`multi_doc_crowding`, `q14`): recall@5 0.5 → 1.0, nDCG@5
-  ~0.61 → ~0.88-0.92 across all three search modes, with every pooled
-  per-mode metric flat or improved and none regressed. Gated behind the same
-  eval-gate policy as the #47 advanced methods (documented improvement +
-  maintainer approval before defaulting on) because it changes ranking order
-  for every multi-chunk query, not just crowded ones — see
-  [ADR 0004](https://github.com/inherent-prime/inherent/blob/main/docs/adr/0004-per-document-diversification.md).
+- **Per-document result diversification (#146).** New `enable_diversification`
+  flag round-robins search results across `document_id` before truncating to
+  the page size, so one long, many-chunk document can no longer silently
+  crowd every other relevant document out of the result page — measured on a
+  new golden-corpus category (`multi_doc_crowding`, `q14`): recall@5
+  0.5 → 1.0, nDCG@5 ~0.61 → ~0.88-0.92 across all three search modes, with
+  every pooled per-mode metric flat or improved and none regressed. Shipped
+  opt-in (default `False`), gated behind the same eval-gate policy as the
+  #47 advanced methods (documented improvement + maintainer approval before
+  defaulting on) because it changes ranking order for every multi-chunk
+  query, not just crowded ones. **Flipped to default `True` later in this
+  same `[Unreleased]` section once both gate conditions were met — see the
+  `### Changed` entry below and
+  [ADR 0004](https://github.com/inherent-prime/inherent/blob/main/docs/adr/0004-per-document-diversification.md)
+  and its amendment.**
 
 ### Changed
 
@@ -263,6 +266,31 @@ All notable changes to Inherent are documented here. The format follows
   surface), #199 (tabular/structured judgments in the retrieval-eval
   corpus — the tabular hint's row-based chunking, the largest behavioral
   change here, is currently invisible to the eval gate).
+
+- **⚠️ BREAKING (behavior) — per-document result diversification now on by
+  default (#146).** `enable_diversification` (added opt-in, off by default,
+  in the entry above) now defaults to `True`: both eval-gate conditions this
+  ADR required — documented eval improvement (recall@5 0.5 → 1.0 on the
+  `multi_doc_crowding` golden-corpus category, every other pooled per-mode
+  metric flat or improved) and maintainer approval — are now met (ADR 0004's
+  2026-08-06 amendment). Search results for every caller now round-robin
+  across `document_id` before truncating to the page size instead of a plain
+  score-sorted truncate, so a query where one document's chunks previously
+  filled the whole result page will now surface other genuinely relevant
+  documents too; ranking order can shift for any multi-chunk-per-document
+  query, not just crowded ones, even when nothing about that query's own
+  relevance changed. Reproduced concretely by this same release's #129
+  chunking change: `sample.json` going from 1 to 4 chunks crowded the
+  keyword-mode top-5 on the golden corpus (`keyword.mrr` 0.8205 → 0.7821,
+  `keyword.ndcg@5` 0.7137 → 0.6835, both beyond the 0.02 gate tolerance,
+  `recall@5` unchanged in all three modes — the right document stayed
+  retrievable, only its rank slipped); diversification exists to prevent
+  exactly this. The mechanism (`SearchService._diversify_by_document`, the
+  wider Weaviate over-fetch in `_build_graphql`) is unchanged code — only the
+  default moved. **Upgrade:** an operator who wants the pre-#146 ranking sets
+  `ENABLE_DIVERSIFICATION=false`. See
+  [ADR 0004](https://github.com/inherent-prime/inherent/blob/main/docs/adr/0004-per-document-diversification.md)
+  and its amendment.
 
 ### Fixed
 
