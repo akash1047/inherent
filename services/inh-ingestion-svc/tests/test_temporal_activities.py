@@ -171,10 +171,13 @@ class TestExtractTextActivity:
     @patch("src.temporal.shared_services.get_staging_service")
     @patch("src.temporal.shared_services.get_storage_service")
     @pytest.mark.asyncio
-    async def test_extract_text_xlsx_raises_until_supported(
-        self, mock_get_storage, mock_get_staging
-    ):
-        """Spreadsheet binaries should fail explicitly until XLSX extraction exists."""
+    async def test_extract_text_xlsx_corrupt_bytes_raises(self, mock_get_storage, mock_get_staging):
+        """#118: XLSX now HAS a FILE_TYPE_REGISTRY entry and a real
+        extractor. Garbage bytes (not a real workbook) still fail -- just at
+        a different, more specific layer: openpyxl can't open them, wrapped
+        as an actionable RuntimeError by `_extract_xlsx_text` (see
+        test_extraction_by_type.py::TestXlsxFailurePaths for the extractor
+        unit test this pins end-to-end through the activity)."""
         mock_storage = MagicMock()
         mock_storage.read_file.return_value = b"PK\x03\x04fake workbook bytes"
         mock_get_storage.return_value = mock_storage
@@ -192,17 +195,58 @@ class TestExtractTextActivity:
 
         from src.temporal.activities.extract import extract_text
 
-        # #117: XLSX has no FILE_TYPE_REGISTRY entry, so this is now the
-        # generic "unregistered content type" hard failure (previously a
-        # spreadsheet-specific special case) -- the exact path acceptance
-        # criterion "unregistered type reaching extraction -> failed with a
-        # clear error_message" is written against. Non-retryable
-        # ApplicationError (#117 review item 13): deterministic, retrying
-        # cannot fix it.
-        with pytest.raises(ApplicationError, match="No extractor registered"):
+        with pytest.raises(RuntimeError, match="Failed to open XLSX workbook"):
             await extract_text(input_data)
 
         mock_staging.write_text.assert_not_called()
+
+    @patch("src.temporal.shared_services.get_staging_service")
+    @patch("src.temporal.shared_services.get_storage_service")
+    @pytest.mark.asyncio
+    async def test_extract_text_pptx_corrupt_bytes_raises(self, mock_get_storage, mock_get_staging):
+        """#119: same shape as the XLSX case above, for PPTX."""
+        mock_storage = MagicMock()
+        mock_storage.read_file.return_value = b"PK\x03\x04fake deck bytes"
+        mock_get_storage.return_value = mock_storage
+
+        mock_staging = MagicMock()
+        mock_get_staging.return_value = mock_staging
+
+        input_data = ExtractTextInput(
+            workflow_run_id="wf_pptx",
+            storage_backend="local",
+            storage_path="deck.pptx",
+            content_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            original_filename="deck.pptx",
+        )
+
+        from src.temporal.activities.extract import extract_text
+
+        with pytest.raises(RuntimeError, match="Failed to open PPTX presentation"):
+            await extract_text(input_data)
+
+        mock_staging.write_text.assert_not_called()
+
+    def test_legacy_xls_content_type_is_unregistered(self):
+        """#118: legacy .xls (application/vnd.ms-excel, OLE2 binary format --
+        NOT the same format as .xlsx) has no FILE_TYPE_REGISTRY entry, so it
+        hits the SAME generic "unregistered content type" non-retryable
+        failure #117 established -- never silently mis-parsed as its OOXML
+        successor."""
+        from src.temporal.activities.extract import _resolve_extractor
+
+        with pytest.raises(ApplicationError, match="No extractor registered") as exc_info:
+            _resolve_extractor("application/vnd.ms-excel")
+        assert exc_info.value.non_retryable
+
+    def test_legacy_ppt_content_type_is_unregistered(self):
+        """#119: same contract as legacy .xls above, for legacy .ppt
+        (application/vnd.ms-powerpoint, OLE2 binary format)."""
+        from src.temporal.activities.extract import _resolve_extractor
+
+        with pytest.raises(ApplicationError, match="No extractor registered") as exc_info:
+            _resolve_extractor("application/vnd.ms-powerpoint")
+        assert exc_info.value.non_retryable
 
     @patch("src.temporal.shared_services.get_storage_service")
     @pytest.mark.asyncio

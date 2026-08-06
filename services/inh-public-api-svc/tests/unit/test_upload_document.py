@@ -678,10 +678,17 @@ class TestUploadAllowedMimeTypes:
         ), f"MIME {mime} should be accepted but got {response.status_code}"
         application.dependency_overrides.clear()
 
-    async def test_xlsx_rejected_until_extraction_is_supported(
+    async def test_xlsx_with_mismatched_bytes_still_rejected(
         self, write_key, mock_db, mock_storage, mock_mq
     ):
-        """Do not accept spreadsheet uploads until ingestion has an XLSX extractor."""
+        """#118: XLSX is now a registered, accepted type (see
+        test_allowed_mime_types_accepted above, parametrized over
+        all_mime_types() -- which now includes xlsx). This test pins a
+        DIFFERENT contract: content declared as XLSX whose bytes are NOT a
+        real XLSX (here, the default PDF-signature payload from
+        _file_payload()) still 400s -- via the #117 magic-byte sniff
+        (ContentTypeMismatchError), not the old "type not in registry at
+        all" rejection this test used to pin pre-#118."""
         application = create_app()
         application.dependency_overrides[get_api_key_info] = lambda: write_key
         application.dependency_overrides[get_write_permission] = lambda: write_key

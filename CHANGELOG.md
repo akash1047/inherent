@@ -7,6 +7,28 @@ All notable changes to Inherent are documented here. The format follows
 
 ### Added
 
+- **XLSX and PPTX upload/extraction support (#118, #119).** Both are now
+  `FILE_TYPE_REGISTRY` entries (#117): XLSX
+  (`application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`,
+  `.xlsx`, REST-only) extracts row-aware, sheet-boundary-preserving text
+  (`## Sheet: <name>` headers, pipe-delimited rows, computed formula values
+  via `openpyxl` `data_only=True`), with cost guards on evaluated-cell count
+  and emitted text length. PPTX
+  (`application/vnd.openxmlformats-officedocument.presentationml.presentation`,
+  `.pptx`, REST-only) extracts slide-boundary text (`## Slide <n>: <title>`
+  headers, in-order text frames, pipe-delimited table rows, speaker notes
+  under `Notes:`) via `python-pptx`, with a slide-count and text-length cost
+  guard. Both are core (non-optional) dependencies of `inh-ingestion-svc`
+  (`openpyxl`, `python-pptx`), `hard_fail` degradation. Legacy `.xls`/`.ppt`
+  (a different, OLE2-based binary format) have no registry entry and
+  continue to 400 with the standard unsupported-type message rather than
+  being silently mis-parsed. XLSX, PPTX, and the existing DOCX format all
+  share the same ZIP local-file-header magic bytes (`PK\x03\x04`) — the
+  intake-time byte sniff cannot distinguish them from each other by design;
+  a mismatched filename extension is caught at upload (`ExtensionMismatchError`,
+  400), and a mismatched-but-extensionless upload is caught at the
+  extraction stage instead (the wrong OOXML part set fails to parse, never
+  silently mis-read as another format).
 - **Ingestion-source Temporal memo on `DocumentIngestionWorkflow` starts
   (#141).** `core.document.uploaded.v1` now optionally carries `source`
   (`connector:<provider>` | `public-api` | `manual`), `connection_id`, and

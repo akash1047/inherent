@@ -22,6 +22,7 @@ TestFileTypeRegistryDispatch``), never a silent lossy decode:
   so, instead of a bare ``KeyError`` crashing the Temporal worker.
 """
 
+import datetime
 import io
 from collections.abc import Callable
 
@@ -224,6 +225,8 @@ EXTRACTORS: dict[str, Callable[[bytes, str], str]] = {
     "html": lambda content, filename: _extract_html_text(content),
     "pdf": lambda content, filename: _extract_pdf_text(content),
     "docx": lambda content, filename: _extract_docx_text(content),
+    "xlsx": lambda content, filename: _extract_xlsx_text(content),
+    "pptx": lambda content, filename: _extract_pptx_text(content),
     "image_ocr": lambda content, filename: _extract_image_text(content, filename),
 }
 
@@ -309,6 +312,221 @@ def _extract_docx_text(content: bytes) -> str:
     doc = Document(io.BytesIO(content))
     paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
     return "\n\n".join(paragraphs)
+
+
+# Cost guards for XLSX extraction (#118 issue requirement: "cap evaluated
+# cells (e.g. 500k) and emitted text length; exceeding -> document `failed`
+# with actionable error, never OOM"). Both are checked incrementally WHILE
+# reading (not after building the full string) so a pathological workbook
+# fails fast instead of allocating gigabytes of Python objects first.
+_MAX_XLSX_CELLS = 500_000
+_MAX_XLSX_TEXT_CHARS = 5_000_000
+
+# Mirrors the XLSX guard above for PPTX: a slide-count ceiling generous
+# enough that a genuinely large deck (the #119 issue's illustrative "500
+# slides" case) still extracts in full, plus a text-length ceiling as a
+# second line of defense against any single pathological slide (e.g. one
+# with an enormous table) blowing up memory even under the slide cap.
+_MAX_PPTX_SLIDES = 5_000
+_MAX_PPTX_TEXT_CHARS = 5_000_000
+
+
+def _format_xlsx_cell(value: object) -> str:
+    """Render one cell's value deterministically (#118 acceptance criterion:
+    "Numbers and dates render deterministically; formula cells render
+    computed values").
+
+    ``openpyxl`` (opened with ``data_only=True``, see `_extract_xlsx_text`)
+    already resolves formula cells to their last-computed value before this
+    function ever sees them, so there is no formula-vs-literal branch here --
+    every value arriving is already the value to render. `datetime`/`date`
+    get an explicit ISO-8601 rendering (stable across locale/platform, unlike
+    ``str()`` on a `datetime`, which is locale-INDEPENDENT for
+    ``datetime`` too, but explicit is clearer than relying on that
+    implementation detail holding forever); every other type (str, int,
+    float, bool) is already deterministic under plain `str()`.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, (datetime.datetime, datetime.date)):
+        return value.isoformat()
+    return str(value)
+
+
+def _extract_xlsx_text(content: bytes) -> str:
+    """Extract text from XLSX content with row-aware, sheet-boundary
+    serialization (#118).
+
+    Per sheet, emits ``## Sheet: <name>`` then one pipe-delimited line per
+    non-empty row, cells in column order -- so an agent reading the
+    flattened text can still tell which value sat in which column (row-aware
+    serialization) and which sheet a row came from (sheet boundaries), the
+    two properties #118 requires for the output to be useful to an AI-agent
+    reader rather than an undifferentiated wall of cell values.
+
+    ``data_only=True`` reads each formula cell's last-COMPUTED value (the
+    cached result Excel/LibreOffice stores when it saves the file) rather
+    than the formula source text -- exactly the "computed values only, no
+    formula source" contract in the #118 issue. ``read_only=True`` streams
+    rows instead of loading the whole workbook into memory, which is also
+    what makes the incremental cell-count cap below actually protective
+    instead of cosmetic (the OOM the cap prevents would otherwise already
+    have happened by the time a non-read-only load finished).
+
+    Raises:
+        RuntimeError: openpyxl can't open `content` at all (corrupt/
+            truncated zip, password-protected/OLE2 file, a legitimately
+            different binary format sharing the OOXML zip signature -- see
+            inh_contracts.file_types's docx entry comment), the evaluated-
+            cell cap is exceeded, or the emitted text exceeds the character
+            cap. Every one of these is a clear, actionable message -- never
+            a bare zipfile/openpyxl exception surfacing to the caller, and
+            never a silent partial result.
+    """
+    try:
+        import openpyxl
+    except ImportError:
+        raise RuntimeError("openpyxl not available for XLSX extraction")
+
+    try:
+        workbook = openpyxl.load_workbook(io.BytesIO(content), read_only=True, data_only=True)
+    except Exception as e:
+        # Covers corrupt/truncated zips (zipfile.BadZipFile), password-
+        # protected files (OLE2/CFBF container -- not a zip at all), and any
+        # other "openpyxl couldn't make sense of this" failure -- one clear
+        # message instead of a library-specific exception type leaking out.
+        raise RuntimeError(f"Failed to open XLSX workbook: {e}") from e
+
+    sheet_parts: list[str] = []
+    total_cells = 0
+    try:
+        for sheet in workbook.worksheets:
+            sheet_lines = [f"## Sheet: {sheet.title}"]
+            for row in sheet.iter_rows(values_only=True):
+                total_cells += len(row)
+                if total_cells > _MAX_XLSX_CELLS:
+                    raise RuntimeError(
+                        f"XLSX exceeds the {_MAX_XLSX_CELLS}-cell evaluated-cell "
+                        f"cap (hit while reading sheet '{sheet.title}'). Split "
+                        f"the workbook into smaller files and re-upload."
+                    )
+                # Skip fully blank rows (read-only mode yields a None-filled
+                # row for a blank row, and for every row spanned by a merged
+                # cell past its top-left anchor) -- an all-None row carries
+                # no information worth a pipe-delimited line of empty cells.
+                if all(cell is None for cell in row):
+                    continue
+                sheet_lines.append(" | ".join(_format_xlsx_cell(cell) for cell in row))
+            sheet_parts.append("\n".join(sheet_lines))
+    finally:
+        # read_only workbooks hold an open zip/file handle until closed --
+        # always release it, success or failure.
+        workbook.close()
+
+    text = "\n\n".join(sheet_parts)
+    if len(text) > _MAX_XLSX_TEXT_CHARS:
+        raise RuntimeError(
+            f"XLSX extracted text exceeds the {_MAX_XLSX_TEXT_CHARS}-character "
+            f"cost guard. Split the workbook into smaller files and re-upload."
+        )
+    return text
+
+
+def _pptx_slide_title(slide: object) -> str | None:
+    """Best-effort slide title, or None if this slide has no title
+    placeholder (a valid, common case -- e.g. a section-divider or
+    image-only slide)."""
+    shapes = getattr(slide, "shapes", None)
+    title_shape = getattr(shapes, "title", None) if shapes is not None else None
+    if title_shape is None:
+        return None
+    text = (title_shape.text or "").strip()
+    return text or None
+
+
+def _pptx_slide_notes(slide: object) -> str | None:
+    """Speaker notes text for `slide`, or None if it has no notes slide, or
+    the notes slide has no non-whitespace text."""
+    if not slide.has_notes_slide:
+        return None
+    notes_text = (slide.notes_slide.notes_text_frame.text or "").strip()
+    return notes_text or None
+
+
+def _extract_pptx_text(content: bytes) -> str:
+    """Extract text from PPTX content with slide-boundary sections (#119).
+
+    Per slide, emits ``## Slide <n>: <title>`` (or ``## Slide <n>`` when the
+    slide has no title placeholder), then every text-frame shape's text in
+    shape order (reading order as authored), then any table shape's rows
+    pipe-delimited (same row-aware convention as XLSX, #118), then speaker
+    notes under a ``Notes:`` line -- so a query matching only speaker-notes
+    text still lands in the same chunk as its slide's visible content once
+    #129's chunker splits on these section boundaries. Embedded images are
+    deliberately excluded in v1 (#119: "no OCR to manage costs" -- consistent
+    with PNG's OCR being an explicit opt-in optional extra elsewhere in this
+    module, not a default-on cost for every upload).
+
+    Raises:
+        RuntimeError: python-pptx can't open `content` at all (corrupt/
+            truncated zip, password-protected/OLE2 file, a different binary
+            format sharing the OOXML zip signature), the slide-count cost
+            guard is exceeded, or the emitted text exceeds the character
+            cap. Same "clear, actionable, never silent" contract as XLSX
+            above.
+    """
+    try:
+        from pptx import Presentation
+    except ImportError:
+        raise RuntimeError("python-pptx not available for PPTX extraction")
+
+    try:
+        presentation = Presentation(io.BytesIO(content))
+    except Exception as e:
+        # Covers corrupt/truncated zips, password-protected (OLE2/CFBF)
+        # files, and any other "python-pptx couldn't open this" failure.
+        raise RuntimeError(f"Failed to open PPTX presentation: {e}") from e
+
+    slide_parts: list[str] = []
+    for index, slide in enumerate(presentation.slides, start=1):
+        if index > _MAX_PPTX_SLIDES:
+            raise RuntimeError(
+                f"PPTX exceeds the {_MAX_PPTX_SLIDES}-slide cap. Split the "
+                f"deck into smaller files and re-upload."
+            )
+
+        title = _pptx_slide_title(slide)
+        heading = f"## Slide {index}: {title}" if title else f"## Slide {index}"
+        slide_lines = [heading]
+
+        for shape in slide.shapes:
+            if shape.has_text_frame:
+                # Title text is already in the heading above -- skip it here
+                # so it isn't duplicated in the body.
+                if shape == slide.shapes.title:
+                    continue
+                for paragraph in shape.text_frame.paragraphs:
+                    paragraph_text = "".join(run.text for run in paragraph.runs)
+                    if paragraph_text.strip():
+                        slide_lines.append(paragraph_text)
+            elif shape.has_table:
+                for row in shape.table.rows:
+                    slide_lines.append(" | ".join(cell.text for cell in row.cells))
+
+        notes = _pptx_slide_notes(slide)
+        if notes:
+            slide_lines.append("Notes:")
+            slide_lines.append(notes)
+
+        slide_parts.append("\n".join(slide_lines))
+
+    text = "\n\n".join(slide_parts)
+    if len(text) > _MAX_PPTX_TEXT_CHARS:
+        raise RuntimeError(
+            f"PPTX extracted text exceeds the {_MAX_PPTX_TEXT_CHARS}-character "
+            f"cost guard. Split the deck into smaller files and re-upload."
+        )
+    return text
 
 
 def _extract_image_text(content: bytes, original_filename: str) -> str:

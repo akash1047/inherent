@@ -232,17 +232,59 @@ FILE_TYPE_REGISTRY: tuple[FileTypeSpec, ...] = (
         extensions=(".docx",),
         # DOCX is a ZIP container (OOXML); PK\x03\x04 is the local-file-header
         # signature every ZIP starts with. NOTE: this signature is shared by
-        # every OOXML sibling format (#118 XLSX, #119 PPTX) and by ZIP itself
-        # (#130) -- a 4-byte prefix cannot distinguish "this zip is a .docx"
-        # from "this zip is a .xlsx". It DOES still catch a non-zip file
-        # (text, PNG, ...) mislabeled as docx, which is what #117 requires;
-        # disambiguating between OOXML siblings needs inspecting the zip's
-        # internal `[Content_Types].xml`, left to whichever of #118/#119 lands
-        # second.
+        # every OOXML sibling format (xlsx below, pptx below, and ZIP itself
+        # #130) -- a 4-byte prefix cannot distinguish "this zip is a .docx"
+        # from "this zip is a .xlsx" or "this zip is a .pptx". It DOES still
+        # catch a non-zip file (text, PNG, ...) mislabeled as docx, which is
+        # what #117 requires. Disambiguating between OOXML siblings needs
+        # inspecting the zip's internal `[Content_Types].xml`, which this
+        # lightweight sniff deliberately does not do -- see
+        # `check_extension_consistency` (filename) and the extraction stage
+        # (fails loudly on a structurally wrong OOXML part set) for the two
+        # layers that catch a genuinely mislabeled upload instead.
         magic=b"PK\x03\x04",
         surfaces=frozenset({"rest"}),
         extractor="docx",
         chunking_hint="prose",
+    ),
+    FileTypeSpec(
+        key="xlsx",
+        mime_types=("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",),
+        extensions=(".xlsx",),
+        # Same ZIP local-file-header signature as docx/pptx -- see the docx
+        # entry's comment and `_magic_families_overlap` for why this is
+        # correct (allow, not reject) rather than a bug. Legacy `.xls` is a
+        # completely different binary format (OLE2/CFBF, magic
+        # D0 CF 11 E0 A1 B1 1A E1) with NO registry entry -- it is not this
+        # spec's `extensions`, so a declared `.xls` upload 400s via the
+        # standard `UnknownContentTypeError` (never accept-then-garble). That
+        # message names every supported type, including this xlsx entry, so
+        # it IS actionable -- but it is the generic list, not the #118 issue
+        # body's suggested bespoke "convert to .xlsx" wording; a friendlier,
+        # legacy-format-specific message is filed as a follow-up (see
+        # surface-friction issue linked from the #118/#119 PR).
+        magic=b"PK\x03\x04",
+        surfaces=frozenset({"rest"}),
+        extractor="xlsx",
+        chunking_hint="tabular",
+    ),
+    FileTypeSpec(
+        key="pptx",
+        mime_types=("application/vnd.openxmlformats-officedocument.presentationml.presentation",),
+        extensions=(".pptx",),
+        # Same ZIP family as docx/xlsx -- see the docx entry's comment.
+        # Legacy `.ppt` (OLE2/CFBF) has no registry entry, same reasoning as
+        # xlsx/.xls above.
+        magic=b"PK\x03\x04",
+        surfaces=frozenset({"rest"}),
+        extractor="pptx",
+        # ChunkingHint has no "sections" member (the #119 issue's proposed
+        # name for slide-boundary chunking) -- "structured" is the closest
+        # existing value: like JSON, a PPTX is a sequence of discrete,
+        # addressable units (slides) rather than continuous prose, which is
+        # exactly what #129's format-aware chunker needs to know to chunk on
+        # slide boundaries instead of sentence/paragraph breaks.
+        chunking_hint="structured",
     ),
     FileTypeSpec(
         key="png",

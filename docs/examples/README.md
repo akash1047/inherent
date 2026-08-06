@@ -122,7 +122,9 @@ Upload registers a file in storage and queues it for ingestion. The returned `do
 
 Allowed MIME types: `text/plain`, `text/markdown`, `text/csv`, `text/html`,
 `application/pdf`, `application/json`,
-`application/vnd.openxmlformats-officedocument.wordprocessingml.document`,
+`application/vnd.openxmlformats-officedocument.wordprocessingml.document` (DOCX),
+`application/vnd.openxmlformats-officedocument.spreadsheetml.sheet` (XLSX),
+`application/vnd.openxmlformats-officedocument.presentationml.presentation` (PPTX),
 `image/png` (OCR) — see the full [supported file types](../reference/file-types.md)
 reference for extensions, chunking strategy, and optional-dependency notes.
 Max size: 50 MB. Binary formats are magic-byte sniffed against the declared
@@ -199,6 +201,33 @@ curl -s -X POST "$API_BASE/v1/documents" \
   | jq .
 ```
 
+### Upload XLSX
+
+```bash
+curl -s -X POST "$API_BASE/v1/documents" \
+  -H "X-API-Key: $API_KEY" \
+  -H "X-Workspace-Id: $WORKSPACE_ID" \
+  -F "file=@docs/examples/sample-documents/sample.xlsx;type=application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" \
+  | jq .
+```
+
+Extracted text is row-aware and sheet-boundary-preserving (`## Sheet: <name>`
+headers, pipe-delimited rows) — see [supported file types](../reference/file-types.md).
+
+### Upload PPTX
+
+```bash
+curl -s -X POST "$API_BASE/v1/documents" \
+  -H "X-API-Key: $API_KEY" \
+  -H "X-Workspace-Id: $WORKSPACE_ID" \
+  -F "file=@docs/examples/sample-documents/sample.pptx;type=application/vnd.openxmlformats-officedocument.presentationml.presentation" \
+  | jq .
+```
+
+Extracted text preserves slide boundaries (`## Slide <n>: <title>` headers),
+table rows, and speaker notes (under a `Notes:` line) — see
+[supported file types](../reference/file-types.md).
+
 ### Upload PNG (OCR)
 
 ```bash
@@ -251,7 +280,7 @@ curl -s -X POST "$API_BASE/v1/documents" \
   "type": "https://api.inherent.systems/errors/bad-request",
   "title": "Bad Request",
   "status": 400,
-  "detail": "Unsupported file type 'application/octet-stream'. Allowed types: text/plain, text/markdown, text/csv, text/html, application/pdf, application/json, application/vnd.openxmlformats-officedocument.wordprocessingml.document, image/png"
+  "detail": "Unsupported file type 'application/octet-stream'. Allowed types: text/plain, text/markdown, text/csv, text/html, application/pdf, application/json, application/vnd.openxmlformats-officedocument.wordprocessingml.document, application/vnd.openxmlformats-officedocument.spreadsheetml.sheet, application/vnd.openxmlformats-officedocument.presentationml.presentation, image/png"
 }
 ```
 
@@ -1037,6 +1066,8 @@ depend on it.
 | `sample.html` | `text/html` | `docs/examples/sample-documents/sample.html` |
 | `sample.pdf` | `application/pdf` | Generate with any PDF tool; not committed (binary) |
 | `sample.docx` | `application/vnd.openxmlformats-officedocument.wordprocessingml.document` | Generate with LibreOffice/Word; not committed (binary) |
+| `sample.xlsx` | `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet` | `docs/examples/sample-documents/sample.xlsx` |
+| `sample.pptx` | `application/vnd.openxmlformats-officedocument.presentationml.presentation` | `docs/examples/sample-documents/sample.pptx` |
 | `sample.png` | `image/png` | `docs/examples/sample-documents/sample.png` |
 
 ### Generate sample PDF (requires `enscript` + `ps2pdf`)
