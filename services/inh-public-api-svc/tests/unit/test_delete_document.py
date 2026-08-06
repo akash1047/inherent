@@ -388,7 +388,11 @@ class TestMcpDeleteDocument:
                 _key(permissions=["read", "write"], workspace_id=None),
             )
 
-        assert "don't have access" in result[0].text
+        # Undifferentiated not-found, not a distinguishable "you don't have
+        # access" (#138 blocker-1 follow-up: that distinction was a
+        # cross-workspace existence oracle a caller could use to learn which
+        # document ids exist in a workspace it can't read).
+        assert result[0].text == "Error: Document 'doc-001' not found"
         db.delete_document.assert_not_awaited()
 
     async def test_delete_success_returns_structured_payload(self):

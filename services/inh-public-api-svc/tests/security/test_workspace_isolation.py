@@ -183,7 +183,14 @@ async def test_denied_workspace_access_is_logged_with_attempted_id() -> None:
 @pytest.mark.asyncio
 async def test_scoped_key_mismatch_is_logged_with_attempted_id() -> None:
     """A 403 from a workspace-scoped key requesting a different workspace logs
-    the key's binding and the requested id for the same diagnostic reason."""
+    the key's binding and the requested id for the same diagnostic reason.
+
+    DB is mocked with the key's own workspace in the owned set (#138
+    blocker-2 follow-up: get_authorized_workspace_ids now always confirms
+    the binding is still owned, so this must isolate the header-mismatch
+    branch from the separate stale-binding branch below it) — the point of
+    this test is the header mismatch, not the ownership check.
+    """
     key = APIKeyInfo(
         key_id="key-ws",
         user_id="user-1",
@@ -193,10 +200,55 @@ async def test_scoped_key_mismatch_is_logged_with_attempted_id() -> None:
         expires_at=None,
         status="active",
     )
-    with patch("src.services.auth.logger") as mock_logger:
-        with pytest.raises(HTTPException):
-            await _resolve_workspace(key, "ws-other", required=False)
+    with _patch_user_workspaces(["ws-scoped"]):
+        with patch("src.services.auth.logger") as mock_logger:
+            with pytest.raises(HTTPException):
+                await _resolve_workspace(key, "ws-other", required=False)
     mock_logger.warning.assert_called_once()
     _, kwargs = mock_logger.warning.call_args
     assert kwargs["requested_workspace_id"] == "ws-other"
     assert kwargs["key_workspace_id"] == "ws-scoped"
+
+
+@pytest.mark.asyncio
+async def test_scoped_key_with_deleted_binding_fails_closed() -> None:
+    """#138 blocker-2: a scoped key whose bound workspace the owner no longer
+    owns (deleted/transferred in Mongo, the canonical ownership source — the
+    Postgres api_keys row is never told) must be rejected, not silently
+    served. This is the intersection check get_authorized_workspace_ids adds:
+    trusting key_info.workspace_id unconditionally would have let a stale
+    binding through even with no header requesting anything different."""
+    key = APIKeyInfo(
+        key_id="key-ws",
+        user_id="user-1",
+        workspace_id="ws-revoked",
+        permissions=["read", "search"],
+        rate_limit=100,
+        expires_at=None,
+        status="active",
+    )
+    # The owner's current set no longer includes ws-revoked.
+    with _patch_user_workspaces(["ws-a"]):
+        with pytest.raises(HTTPException) as exc_info:
+            await _resolve_workspace(key, None, required=False)
+    assert exc_info.value.status_code == status.HTTP_403_FORBIDDEN
+
+
+@pytest.mark.asyncio
+async def test_scoped_key_with_no_owned_workspaces_fails_closed() -> None:
+    """Fail-closed edge case: the owner owns NOTHING at all (every workspace
+    deleted/transferred). A scoped key must still be rejected, never fall
+    back to an empty "search everything" or crash on an out-of-range index."""
+    key = APIKeyInfo(
+        key_id="key-ws",
+        user_id="user-1",
+        workspace_id="ws-revoked",
+        permissions=["read", "search"],
+        rate_limit=100,
+        expires_at=None,
+        status="active",
+    )
+    with _patch_user_workspaces([]):
+        with pytest.raises(HTTPException) as exc_info:
+            await _resolve_workspace(key, None, required=False)
+    assert exc_info.value.status_code == status.HTTP_403_FORBIDDEN

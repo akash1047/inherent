@@ -508,7 +508,10 @@ class TestEvalsMcpTools:
             )
 
         assert content[0].text.startswith("Error:")
-        assert "not accessible" in content[0].text
+        # Wording unified with every other workspace-argument rejection
+        # (#138 follow-up: describe_workspace_denial) — a user-scoped key
+        # gets the generic "you don't have access" message.
+        assert "don't have access" in content[0].text
 
 
 # =========================================================================== #
@@ -561,7 +564,15 @@ class TestGetDocumentTool:
 
     async def test_cross_workspace_document_denies_access_without_leak(self, sample_document):
         """A document belonging to a workspace the caller does not own must not
-        leak its metadata — mirrors _resolve_document_for_user's access check."""
+        leak its metadata — mirrors _resolve_document_for_user's access check.
+
+        Answers with the SAME undifferentiated "not found" used for a document
+        that doesn't exist at all (#138 blocker-1 follow-up), not a
+        distinguishable "you don't have access" — that distinction is a
+        cross-workspace existence oracle. See
+        tests/security/test_mcp_workspace_boundaries.py for the paired
+        not-found-vs-unauthorized proof.
+        """
         foreign = sample_document.model_copy(update={"workspace_id": "ws-foreign"})
         db = AsyncMock()
         db.validate_api_key = AsyncMock(return_value=self._key())
@@ -571,8 +582,7 @@ class TestGetDocumentTool:
         with patch.object(mcp_server, "get_database", AsyncMock(return_value=db)):
             content = await _call_tool("get_document", {"api_key": "x", "document_id": "doc-1"})
 
-        assert content[0].text.startswith("Error:")
-        assert "don't have access" in content[0].text
+        assert content[0].text == "Error: Document 'doc-1' not found"
         # No leaked document fields (e.g. the foreign workspace id) in the error.
         assert "ws-foreign" not in content[0].text
 
@@ -639,6 +649,10 @@ class TestListChunksTool:
         db.get_document_chunks_by_doc_id.assert_not_called()
 
     async def test_cross_workspace_document_denies_access_without_leak(self, sample_document):
+        """Undifferentiated not-found, matching the missing-document case
+        above — not a distinguishable "you don't have access" (#138
+        blocker-1 follow-up: that distinction was a cross-workspace
+        existence oracle)."""
         foreign = sample_document.model_copy(update={"workspace_id": "ws-foreign"})
         db = AsyncMock()
         db.validate_api_key = AsyncMock(return_value=self._key())
@@ -649,8 +663,7 @@ class TestListChunksTool:
         with patch.object(mcp_server, "get_database", AsyncMock(return_value=db)):
             content = await _call_tool("list_chunks", {"api_key": "x", "document_id": "doc-1"})
 
-        assert content[0].text.startswith("Error:")
-        assert "don't have access" in content[0].text
+        assert content[0].text == "Error: Document 'doc-1' not found"
         db.get_document_chunks_by_doc_id.assert_not_called()
 
     async def test_denied_without_read_permission(self):

@@ -61,3 +61,15 @@ All tools require `api_key` (string). Additional parameters below.
   `get_document_context` for surrounding text.
 - Permissions are exact membership, same as REST: `write` does not imply
   `read` or `search`.
+- Document-scoped tools (`get_document`, `list_chunks`, `explain_lineage`,
+  `delete_document`, `refresh_stale_source`, `get_document_context`) answer a
+  document id that doesn't exist and one that exists in a workspace you
+  aren't authorized for with the SAME `Error: Document '<id>' not found` —
+  matching REST's undifferentiated `404` (#138). Do not rely on distinguishing
+  these two cases; neither surface tells them apart.
+- `search_documents` / `search_memory` / `get_citations` / `list_documents`
+  carry a `workspaces_searched` field in their structured JSON payload (the
+  fenced ```json block after the summary) listing the workspace ids the call
+  actually covered — check it rather than assuming the prose summary means
+  every workspace you own was searched, which is only true for a user-scoped
+  key with no narrower request.

@@ -22,11 +22,18 @@ derives workspace access from the user's full owned-workspace set on its own,
 so a workspace-scoped key binds identically everywhere it is used
 ([#138](https://github.com/inherent-prime/inherent/issues/138)).
 
-Cross-workspace documents read as `404`, not `403`, so a caller cannot probe
-for the existence of content outside their workspaces. See the
-[REST API reference](reference/rest-api.md#workspace-scoping) for the exact
-status codes and [ADR 0002](adr/0002-weaviate-multi-tenancy-scale.md) for the
-tenancy model.
+A document that exists in a workspace the caller isn't authorized for and a
+document id that doesn't exist at all are answered IDENTICALLY on both
+surfaces — REST's `404 "Document not found"`, MCP's
+`Error: Document '<id>' not found` — so a caller cannot probe for the
+existence of content outside their workspaces on either transport. (MCP's
+document-scoped tools closed this identically in #138's follow-up; before
+that they had a separate "you don't have access to document" message for the
+unauthorized case, which was a working cross-workspace existence oracle a
+scoped key could use to enumerate ids in a workspace it couldn't read.) See
+the [REST API reference](reference/rest-api.md#workspace-scoping) for the
+exact status codes and [ADR 0002](adr/0002-weaviate-multi-tenancy-scale.md)
+for the tenancy model.
 
 ## What tenant scoping does not do
 

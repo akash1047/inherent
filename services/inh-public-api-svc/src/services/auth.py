@@ -149,20 +149,61 @@ async def get_authorized_workspace_ids(
 
     This is the SINGLE source of truth for the key-scoping rule (#138),
     shared by REST (``_resolve_workspace`` below) and MCP
-    (``src/mcp_server/server.py``) so the two surfaces cannot drift:
+    (``src/mcp_server/server.py``) so the two surfaces cannot drift.
 
-    - A *workspace-scoped* key (``key_info.workspace_id`` set) is bound to
-      exactly that one workspace — regardless of how many workspaces the
-      owning user owns. We deliberately do NOT cross-check this against
-      ``database.get_user_workspace_ids``: the key's binding IS the grant,
-      and re-deriving it from the user's full owned set is exactly the bug
-      this function exists to prevent (see auth.py module history / #138).
+    Always consults ``database.get_user_workspace_ids`` — current ownership,
+    backed by Mongo (the canonical source, see ``database.py:770``) — even
+    for a workspace-scoped key (#138 blocker-2 follow-up). The first #138 cut
+    trusted ``key_info.workspace_id`` unconditionally for a scoped key, which
+    reopened a narrower hole: the Postgres ``api_keys`` row is not kept in
+    sync with Mongo, so if a workspace is deleted or transferred away from
+    the key's owner after the key was issued, the stale row's
+    ``workspace_id`` / ``status='active'`` never gets revoked and the key
+    would still be served that workspace. This costs one extra ownership
+    lookup per scoped-key request; correctness here outweighs it (the lookup
+    is a single indexed query, not a fan-out).
+
+    - A *workspace-scoped* key (``key_info.workspace_id`` set) is authorised
+      for AT MOST that one workspace, and only while its owner still owns
+      it — the INTERSECTION of the key's binding and current ownership. If
+      the owner no longer owns it, the key is authorised for NOTHING: fail
+      closed, never fall back to the user's other workspaces (that fallback
+      is exactly the scope-expansion #138 exists to prevent).
     - A *user-scoped* key (``workspace_id is None``) may act on every
-      workspace its owning user owns.
+      workspace its owning user currently owns.
+    """
+    owned = await database.get_user_workspace_ids(key_info.user_id)
+    if key_info.workspace_id:
+        # Truthy, not `is not None`: an empty-string workspace_id (no
+        # issuance path produces one today) is treated as unscoped rather
+        # than as a binding to "", matching _resolve_workspace's truthiness
+        # checks elsewhere in this module (#138 follow-up).
+        return [key_info.workspace_id] if key_info.workspace_id in owned else []
+    return owned
+
+
+def describe_workspace_denial(key_info: APIKeyInfo, requested_workspace_id: str) -> str:
+    """Return the rejection message for a workspace ``key_info`` is not
+    authorised for — the single wording shared by REST (``_resolve_workspace``)
+    and every MCP call site that rejects an out-of-scope workspace, so the two
+    surfaces (and MCP's own call sites, which previously had two different
+    strings of their own) never describe the same rejection three different
+    ways (#138 follow-up).
+
+    A workspace-scoped key gets an ACTIONABLE message naming its OWN bound
+    workspace: that is the caller's own grant, not the owner's other
+    workspaces, so revealing it leaks nothing and lets the caller immediately
+    retry with the right id instead of treating the rejection as "workspace
+    doesn't exist" and guessing or giving up. A user-scoped key gets the
+    generic "you don't have access" message, since there is no one workspace
+    to point back to — the caller must consult its own owned set.
     """
     if key_info.workspace_id is not None:
-        return [key_info.workspace_id]
-    return await database.get_user_workspace_ids(key_info.user_id)
+        return (
+            f"API key is scoped to workspace '{key_info.workspace_id}' "
+            f"and cannot access workspace '{requested_workspace_id}'"
+        )
+    return f"You don't have access to workspace '{requested_workspace_id}'"
 
 
 async def _resolve_workspace(
@@ -179,9 +220,23 @@ async def _resolve_workspace(
     key's binding would collapse the key's scope to "any workspace the user
     owns", defeating the point of issuing a scoped key. Only *user-scoped* keys
     (``workspace_id is None``) may select among the user's workspaces via header.
+
+    Every branch below derives its authorised set from
+    ``get_authorized_workspace_ids`` — INCLUDING the scoped-key branch, which
+    used to trust ``key_info.workspace_id`` directly without confirming the
+    binding is still owned. That was a second, independent implementation of
+    the same scoping rule living inline here instead of in the shared
+    function, and the two copies had already started to drift (#138
+    blocker-2/item-6 follow-up): this collapses them into one.
     """
-    # Workspace-scoped key: the binding wins. Reject a header that disagrees.
-    if key_info.workspace_id is not None:
+    database = await get_database()
+    authorized = await get_authorized_workspace_ids(key_info, database)
+
+    # Workspace-scoped key: the binding wins, but only while it is still
+    # owned — get_authorized_workspace_ids intersects the binding with
+    # current ownership, so a stale binding (workspace deleted/transferred
+    # away from the key's owner) fails closed here too, not just on MCP.
+    if key_info.workspace_id:
         if header_workspace_id is not None and header_workspace_id != key_info.workspace_id:
             logger.warning(
                 "workspace_access_denied",
@@ -193,9 +248,26 @@ async def _resolve_workspace(
             )
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
+                detail=describe_workspace_denial(key_info, header_workspace_id),
+            )
+        if key_info.workspace_id not in authorized:
+            # The header agrees with the binding (or is absent), but the
+            # binding itself is stale: get_authorized_workspace_ids found the
+            # key's owner no longer owns this workspace. Fail closed instead
+            # of serving a workspace the owner has lost — never fall back to
+            # whatever else the owner currently owns.
+            logger.warning(
+                "workspace_access_denied",
+                reason="scoped_key_binding_not_owned",
+                user_id=key_info.user_id,
+                key_id=key_info.key_id,
+                key_workspace_id=key_info.workspace_id,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
                 detail=(
-                    f"API key is scoped to workspace '{key_info.workspace_id}' "
-                    f"and cannot access workspace '{header_workspace_id}'"
+                    f"API key is scoped to workspace '{key_info.workspace_id}', "
+                    "which is no longer accessible"
                 ),
             )
         return ResolvedAuth(key_info=key_info, workspace_id=key_info.workspace_id)
@@ -203,9 +275,7 @@ async def _resolve_workspace(
     # User-scoped key: a header may select any workspace the user actually owns.
     workspace_id = header_workspace_id
     if workspace_id:
-        database = await get_database()
-        user_workspaces = await get_authorized_workspace_ids(key_info, database)
-        if workspace_id in user_workspaces:
+        if workspace_id in authorized:
             return ResolvedAuth(key_info=key_info, workspace_id=workspace_id)
         # Log the attempted vs authorised set so support can tell "user pasted
         # the wrong id (e.g. Clerk org_id / workspace name)" apart from a real
@@ -216,24 +286,21 @@ async def _resolve_workspace(
             user_id=key_info.user_id,
             key_id=key_info.key_id,
             requested_workspace_id=workspace_id,
-            authorised_workspace_ids=user_workspaces,
+            authorised_workspace_ids=authorized,
         )
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail=f"You don't have access to workspace '{workspace_id}'",
+            detail=describe_workspace_denial(key_info, workspace_id),
         )
 
-    # No workspace from header or key — try to resolve from user's workspaces
-    database = await get_database()
-    user_workspaces = await get_authorized_workspace_ids(key_info, database)
-
+    # No workspace from header or key — try to resolve from the authorised set.
     if required:
-        if not user_workspaces:
+        if not authorized:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="No workspaces found. Provide X-Workspace-Id header.",
             )
-        if len(user_workspaces) > 1:
+        if len(authorized) > 1:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=(
@@ -241,11 +308,11 @@ async def _resolve_workspace(
                     "to specify which workspace to use."
                 ),
             )
-        return ResolvedAuth(key_info=key_info, workspace_id=user_workspaces[0])
+        return ResolvedAuth(key_info=key_info, workspace_id=authorized[0])
 
     # For read/search — use first workspace if exactly one, else None
-    if len(user_workspaces) == 1:
-        return ResolvedAuth(key_info=key_info, workspace_id=user_workspaces[0])
+    if len(authorized) == 1:
+        return ResolvedAuth(key_info=key_info, workspace_id=authorized[0])
 
     return ResolvedAuth(key_info=key_info, workspace_id=None)
 

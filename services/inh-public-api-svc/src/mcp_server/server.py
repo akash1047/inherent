@@ -65,7 +65,7 @@ from mcp.types import TextContent, Tool
 from src.config.constants import ALLOWED_MIME_TYPES, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE
 from src.models.api_key import APIKeyInfo
 from src.models.evals import FeedbackRequest
-from src.services.auth import get_authorized_workspace_ids
+from src.services.auth import describe_workspace_denial, get_authorized_workspace_ids
 from src.services.compensation import mark_document_failed_with_retry
 from src.services.database import get_database
 from src.services.document_intake import intake_document
@@ -114,7 +114,9 @@ _SEARCH_INPUT_SCHEMA = {
         "query": {"type": "string", "description": "The search query"},
         "workspace_id": {
             "type": "string",
-            "description": "Optional: specific workspace to search. If omitted, searches all your workspaces.",
+            "description": "Optional: specific workspace to search. If omitted, searches every "
+            "workspace your key is authorized for (a workspace-scoped key: exactly its bound "
+            "workspace; a key with no fixed workspace: every workspace you own).",
         },
         "limit": {
             "type": "integer",
@@ -263,6 +265,13 @@ async def _get_workspace_ids(
     workspace its owner owned via MCP even though REST rejected that same
     request with 403.
 
+    The rejection text comes from ``describe_workspace_denial`` — the SAME
+    wording REST's ``_resolve_workspace`` raises (#138 follow-up). A generic
+    "you don't have access" reads to an agent as "that workspace doesn't
+    exist" and invites it to guess other ids or give up; naming a scoped
+    key's own bound workspace costs nothing (it's the caller's own grant) and
+    lets the caller retry immediately with the right id.
+
     Returns:
         tuple of (workspace_ids list, error message or None)
     """
@@ -272,7 +281,7 @@ async def _get_workspace_ids(
     if requested_workspace_id:
         # User specified a workspace - verify it is in the key's authorised set.
         if requested_workspace_id not in authorized:
-            return [], f"Error: You don't have access to workspace '{requested_workspace_id}'"
+            return [], f"Error: {describe_workspace_denial(key_info, requested_workspace_id)}"
         return [requested_workspace_id], None
     else:
         # No workspace specified - use every workspace the key is authorised
@@ -285,23 +294,28 @@ async def _get_workspace_ids(
 async def _run_search(
     key_info: APIKeyInfo,
     arguments: dict,
-) -> tuple[list, str | None, str | None]:
+) -> tuple[list, list[str], str | None]:
     """Shared retrieval used by search_documents/search_memory/get_citations.
 
     Builds the SearchRequest via the shared ``build_search_request`` helper (so
     it matches REST exactly, #14), fans out over the authorised workspaces, and
-    returns (results, requested_workspace_id, error). ``results`` items are
+    returns (results, workspaces_searched, error). ``results`` items are
     ``(workspace_id, SearchResult)`` tuples sorted by score and truncated to the
-    requested limit.
+    requested limit. ``workspaces_searched`` is the ACTUAL set queried — not
+    the caller's ``workspace_id`` argument, which is often absent — so callers
+    can state real coverage instead of assuming "all workspaces" (#138
+    follow-up: a workspace-scoped key silently narrows this to one, and the
+    caller must be able to see that, not just guess it from an unqualified
+    "across all workspaces" claim).
     """
     requested_workspace_id = arguments.get("workspace_id")
     query = arguments.get("query", "")
     if not query:
-        return [], requested_workspace_id, "Error: Query is required"
+        return [], [], "Error: Query is required"
 
     workspace_ids, error = await _get_workspace_ids(key_info, requested_workspace_id)
     if error:
-        return [], requested_workspace_id, error
+        return [], [], error
 
     request = build_search_request(arguments)
     search_service: SearchService = await get_search_service()
@@ -313,7 +327,26 @@ async def _run_search(
             tagged.append((workspace_id, result))
 
     tagged.sort(key=_search_rank_key)
-    return tagged[: request.limit], requested_workspace_id, None
+    return tagged[: request.limit], workspace_ids, None
+
+
+def _coverage_note(workspace_ids: list[str]) -> str:
+    """Describe the ACTUAL set of workspaces a call covered, for use in both
+    the human summary and (as ``workspaces_searched``) the structured JSON
+    payload (#138 follow-up).
+
+    Never says "all workspaces" — that phrase is only true for a user-scoped
+    key with no narrower request, and reads as false coverage for a
+    workspace-scoped key (which is authorised for exactly one, regardless of
+    how many its owner owns) or for an explicit single-workspace request.
+    Stating the real, named set costs nothing and lets an agent verify
+    coverage instead of trusting prose.
+    """
+    if len(workspace_ids) == 1:
+        return f" in workspace '{workspace_ids[0]}'"
+    if not workspace_ids:
+        return ""
+    return f" across your {len(workspace_ids)} authorized workspaces ({', '.join(workspace_ids)})"
 
 
 def _search_rank_key(pair: tuple[str, object]) -> tuple[float, str, str]:
@@ -329,25 +362,27 @@ def _search_rank_key(pair: tuple[str, object]) -> tuple[float, str, str]:
 
 
 async def _handle_search(key_info: APIKeyInfo, arguments: dict) -> list[TextContent]:
-    """Handle search_documents / search_memory tools (#14/#40)."""
-    tagged, requested_workspace_id, error = await _run_search(key_info, arguments)
+    """Handle search_documents / search_memory tools (#14/#40).
+
+    The summary states the ACTUAL set of workspaces searched via
+    ``_coverage_note``, and the structured payload carries the same set as
+    ``workspaces_searched`` (#138 follow-up) — narrowing to a scoped key's one
+    workspace is correct behavior, but claiming "across all workspaces" while
+    only one was searched is a false affirmation an agent has no way to catch
+    from prose alone. ``workspaces_searched`` gives it a programmatic check.
+    """
+    tagged, workspace_ids, error = await _run_search(key_info, arguments)
     if error:
         return [TextContent(type="text", text=error)]
 
     query = arguments.get("query", "")
+    note = _coverage_note(workspace_ids)
     if not tagged:
-        note = (
-            f" in workspace '{requested_workspace_id}'"
-            if requested_workspace_id
-            else " across your workspaces"
+        return _structured(
+            f"No results found for: {query}{note}",
+            {"query": query, "results": [], "workspaces_searched": workspace_ids},
         )
-        return _structured(f"No results found for: {query}{note}", {"query": query, "results": []})
 
-    note = (
-        f" in workspace '{requested_workspace_id}'"
-        if requested_workspace_id
-        else " across all workspaces"
-    )
     summary = f"Found {len(tagged)} results for '{query}'{note}:\n\n"
     structured_results = []
     for i, (workspace_id, result) in enumerate(tagged, 1):
@@ -370,12 +405,20 @@ async def _handle_search(key_info: APIKeyInfo, arguments: dict) -> list[TextCont
             }
         )
 
-    return _structured(summary.rstrip(), {"query": query, "results": structured_results})
+    return _structured(
+        summary.rstrip(),
+        {"query": query, "results": structured_results, "workspaces_searched": workspace_ids},
+    )
 
 
 async def _handle_get_citations(key_info: APIKeyInfo, arguments: dict) -> list[TextContent]:
-    """Handle get_citations: run a search and return the Citation objects (#40)."""
-    tagged, requested_workspace_id, error = await _run_search(key_info, arguments)
+    """Handle get_citations: run a search and return the Citation objects (#40).
+
+    Carries ``workspaces_searched`` in the structured payload for the same
+    reason ``_handle_search`` does (#138 follow-up): the caller must be able
+    to verify actual coverage, not infer it from result count alone.
+    """
+    tagged, workspace_ids, error = await _run_search(key_info, arguments)
     if error:
         return [TextContent(type="text", text=error)]
 
@@ -386,43 +429,45 @@ async def _handle_get_citations(key_info: APIKeyInfo, arguments: dict) -> list[T
             citations.append({"workspace_id": workspace_id, **result.citation.model_dump()})
 
     if not citations:
-        return _structured(f"No citations found for: {query}", {"query": query, "citations": []})
-
-    summary = f"Found {len(citations)} citations for '{query}':\n\n"
-    for i, cit in enumerate(citations, 1):
-        summary += (
-            f"**{i}. {cit['document_name']}** (score: {cit['score']:.2f}) "
-            f"chunk {cit['chunk_id']}\n"
+        return _structured(
+            f"No citations found for: {query}",
+            {"query": query, "citations": [], "workspaces_searched": workspace_ids},
         )
 
-    return _structured(summary.rstrip(), {"query": query, "citations": citations})
+    note = _coverage_note(workspace_ids)
+    summary = f"Found {len(citations)} citations for '{query}'{note}:\n\n"
+    for i, cit in enumerate(citations, 1):
+        summary += (
+            f"**{i}. {cit['document_name']}** (score: {cit['score']:.2f}) chunk {cit['chunk_id']}\n"
+        )
+
+    return _structured(
+        summary.rstrip(),
+        {"query": query, "citations": citations, "workspaces_searched": workspace_ids},
+    )
 
 
 async def _handle_get_context(key_info: APIKeyInfo, arguments: dict) -> list[TextContent]:
-    """Handle get_document_context tool."""
+    """Handle get_document_context tool.
+
+    Delegates lookup + authorization to ``_resolve_document_for_user`` — the
+    SAME check every other document-scoped tool uses — instead of duplicating
+    it inline. Before #138 follow-up this handler had its own copy of the
+    check with its own distinguishable "you don't have access" message,
+    which was a cross-workspace existence oracle REST doesn't have; routing
+    through the shared helper means the undifferentiated-not-found rule is
+    expressed in exactly one place and this handler cannot drift from it.
+    """
     document_id = arguments.get("document_id", "")
 
     if not document_id:
         return [TextContent(type="text", text="Error: Document ID is required")]
 
+    document, _, error = await _resolve_document_for_user(key_info, document_id)
+    if error:
+        return [TextContent(type="text", text=error)]
+
     database = await get_database()
-
-    # Get document and verify user has access
-    document = await database.get_document_by_id(document_id)
-
-    if not document:
-        return [TextContent(type="text", text=f"Error: Document '{document_id}' not found")]
-
-    # Verify the key is authorised for this workspace (#138: key binding, not
-    # the user's full owned set — see get_authorized_workspace_ids).
-    authorized = await get_authorized_workspace_ids(key_info, database)
-    if document.workspace_id not in authorized:
-        return [
-            TextContent(
-                type="text", text=f"Error: You don't have access to document '{document_id}'"
-            )
-        ]
-
     chunks = await database.get_document_chunks_by_doc_id(document_id)
     full_text = "\n\n".join(chunk.content for chunk in chunks)
 
@@ -438,7 +483,13 @@ async def _handle_get_context(key_info: APIKeyInfo, arguments: dict) -> list[Tex
 
 
 async def _handle_list_documents(key_info: APIKeyInfo, arguments: dict) -> list[TextContent]:
-    """Handle list_documents tool."""
+    """Handle list_documents tool.
+
+    States the ACTUAL set of workspaces listed via ``_coverage_note`` and
+    carries it as ``workspaces_searched`` in a trailing structured JSON block
+    (#138 follow-up) — this handler previously said "across all workspaces"
+    even when a scoped key narrowed the listing to exactly one.
+    """
     # Clamp to the same bounds the REST route enforces (page>=1,
     # 1<=page_size<=MAX_PAGE_SIZE) so an agent can't request a negative SQL
     # OFFSET or dump the whole tenant in one call (#13).
@@ -469,24 +520,24 @@ async def _handle_list_documents(key_info: APIKeyInfo, arguments: dict) -> list[
         )
 
     if not documents:
-        workspace_note = (
-            f" in workspace '{requested_workspace_id}'" if requested_workspace_id else ""
+        return _structured(
+            f"No documents found{_coverage_note(workspace_ids)}",
+            {"total": 0, "page": page, "workspaces_searched": workspace_ids},
         )
-        return [TextContent(type="text", text=f"No documents found{workspace_note}")]
 
-    workspace_note = (
-        f" in workspace '{requested_workspace_id}'"
-        if requested_workspace_id
-        else " across all workspaces"
+    result_text = (
+        f"Found {total} documents{_coverage_note(workspace_ids)} (showing page {page}):\n\n"
     )
-    result_text = f"Found {total} documents{workspace_note} (showing page {page}):\n\n"
     for doc in documents:
         result_text += f"- **{doc.name}**\n"
         result_text += f"  ID: `{doc.id}`\n"
         result_text += f"  Type: {doc.source_type} | Size: {doc.size_bytes:,} bytes\n"
         result_text += f"  Chunks: {doc.chunk_count} | Status: {doc.status} | Workspace: {doc.workspace_id}\n\n"
 
-    return [TextContent(type="text", text=result_text)]
+    return _structured(
+        result_text.rstrip(),
+        {"total": total, "page": page, "workspaces_searched": workspace_ids},
+    )
 
 
 async def _handle_verify_claim(key_info: APIKeyInfo, arguments: dict) -> list[TextContent]:
@@ -501,8 +552,7 @@ async def _handle_verify_claim(key_info: APIKeyInfo, arguments: dict) -> list[Te
 
     verdict = verify_claim(claim, [str(e) for e in evidence])
     summary = (
-        f"Claim support: **{verdict.support_level}** (score: {verdict.score:.2f})\n"
-        f"{verdict.reason}"
+        f"Claim support: **{verdict.support_level}** (score: {verdict.score:.2f})\n{verdict.reason}"
     )
     return _structured(summary, verdict.model_dump())
 
@@ -512,17 +562,32 @@ async def _resolve_document_for_user(key_info: APIKeyInfo, document_id: str):
 
     Authorisation via ``get_authorized_workspace_ids`` (#138): a
     workspace-scoped key must own the document's exact workspace, not merely
-    any workspace its owning user has. Returns (document, workspace_ids,
-    error_text). On any access failure the error_text is set and the document
-    is None, so callers return without ever reading further data.
+    any workspace its owning user has.
+
+    Returns an UNDIFFERENTIATED "not found" for both a missing document and
+    one that exists but is in a workspace the key isn't authorised for (#138
+    follow-up) — matching REST's ``GET /v1/documents/{id}``
+    (``src/api/v1/documents.py``), whose workspace-scoped query returns
+    ``None`` in both cases and so always answers `404`. A distinct "you
+    don't have access" message here would be a cross-workspace EXISTENCE
+    ORACLE: a caller could iterate document ids and learn exactly which ones
+    exist in a workspace it cannot read (e.g. a contractor key scoped to
+    ``ws_tier1`` probing which ids exist in ``ws_tier2``) — precisely what
+    REST's undifferentiated 404 exists to prevent. Do not reintroduce a
+    distinguishable message for the unauthorized branch.
+
+    Returns (document, workspace_ids, error_text). On any access failure the
+    error_text is set and the document is None, so callers return without
+    ever reading further data.
     """
     database = await get_database()
     document = await database.get_document_by_id(document_id)
+    not_found = f"Error: Document '{document_id}' not found"
     if not document:
-        return None, [], f"Error: Document '{document_id}' not found"
+        return None, [], not_found
     authorized = await get_authorized_workspace_ids(key_info, database)
     if document.workspace_id not in authorized:
-        return None, authorized, f"Error: You don't have access to document '{document_id}'"
+        return None, authorized, not_found
     return document, authorized, None
 
 
@@ -652,8 +717,7 @@ async def _handle_refresh_stale_source(key_info: APIKeyInfo, arguments: dict) ->
             TextContent(
                 type="text",
                 text=(
-                    "Error: failed to queue the document for re-processing. "
-                    "Please try again later."
+                    "Error: failed to queue the document for re-processing. Please try again later."
                 ),
             )
         ]
@@ -703,13 +767,21 @@ async def _handle_get_retrieval_health(key_info: APIKeyInfo, arguments: dict) ->
 
     Enforces the same authorised-workspace check every other tool uses (#138:
     ``get_authorized_workspace_ids`` — key binding, not the user's full owned
-    set) before handing the workspace_id to ``build_scorecard``.
+    set) before handing the workspace_id to ``build_scorecard``. The
+    rejection uses ``describe_workspace_denial`` — the same wording every
+    other workspace-argument rejection uses (#138 follow-up: this used to be
+    a THIRD distinct wording, "workspace not accessible with this key",
+    alongside REST's and ``_get_workspace_ids``'s).
     """
     database = await get_database()
     workspace_ids = await get_authorized_workspace_ids(key_info, database)
     workspace_id = arguments["workspace_id"]
     if workspace_id not in workspace_ids:
-        return [TextContent(type="text", text="Error: workspace not accessible with this key")]
+        return [
+            TextContent(
+                type="text", text=f"Error: {describe_workspace_denial(key_info, workspace_id)}"
+            )
+        ]
     scorecard = await build_scorecard(database, workspace_id=workspace_id)
     return [TextContent(type="text", text=scorecard.model_dump_json())]
 
@@ -896,8 +968,9 @@ async def _handle_upload_document(key_info: APIKeyInfo, arguments: dict) -> list
 _TOOLS: dict[str, ToolDef] = {
     "search_documents": ToolDef(
         description="Search for relevant documents and chunks using semantic, hybrid, or "
-        "keyword search. Omit workspace_id to search across ALL your workspaces. "
-        "Requires 'search' permission.",
+        "keyword search. Omit workspace_id to search every workspace your key is authorized "
+        "for (a workspace-scoped key: exactly its bound workspace). Requires 'search' "
+        "permission.",
         input_schema=_SEARCH_INPUT_SCHEMA,
         permission="search",
         handler=_handle_search,
@@ -919,8 +992,7 @@ _TOOLS: dict[str, ToolDef] = {
         handler=_handle_get_citations,
     ),
     "get_document_context": ToolDef(
-        description="Get the full content of a document for context. Requires 'read' "
-        "permission.",
+        description="Get the full content of a document for context. Requires 'read' permission.",
         input_schema={
             "type": "object",
             "properties": {
@@ -936,15 +1008,18 @@ _TOOLS: dict[str, ToolDef] = {
         handler=_handle_get_context,
     ),
     "list_documents": ToolDef(
-        description="List all documents. Omit workspace_id to list from ALL your "
-        "workspaces. Requires 'read' permission.",
+        description="List all documents. Omit workspace_id to list from every workspace "
+        "your key is authorized for (a workspace-scoped key: exactly its bound workspace). "
+        "Requires 'read' permission.",
         input_schema={
             "type": "object",
             "properties": {
                 "api_key": {"type": "string", "description": "Your Inherent API key"},
                 "workspace_id": {
                     "type": "string",
-                    "description": "Optional: specific workspace. If omitted, lists from all your workspaces.",
+                    "description": "Optional: specific workspace. If omitted, lists from every "
+                    "workspace your key is authorized for (a workspace-scoped key: exactly its "
+                    "bound workspace).",
                 },
                 "page": {
                     "type": "integer",
