@@ -15,6 +15,7 @@ from inh_contracts.file_types import (
     FILE_TYPE_REGISTRY,
     ContentTypeMismatchError,
     ExtensionMismatchError,
+    FileTypeSpec,
     UnknownContentTypeError,
     all_mime_types,
     check_extension_consistency,
@@ -104,23 +105,26 @@ class TestLookups:
         assert get_spec_by_key("does-not-exist") is None
 
     def test_all_mime_types_matches_historical_allowed_list(self):
-        """Pins the exact SET of MIME types the pre-#117 hand-maintained
-        ALLOWED_MIME_TYPES list in constants.py accepted, so the migration is
-        provably behavior-preserving (registry entry order follows
-        docs/index.md's prose order -- JSON before PDF -- which differs only
-        in list POSITION, never in membership, from the old constants.py
-        list; nothing reads ALLOWED_MIME_TYPES order, only membership)."""
-        assert set(all_mime_types()) == {
+        """Pins byte-for-byte parity (SET *and* ORDER) with the pre-#117
+        hand-maintained ALLOWED_MIME_TYPES list in constants.py, so the 400
+        error text's exact wording is unchanged by this migration."""
+        assert all_mime_types() == [
             "text/plain",
             "text/markdown",
             "text/csv",
             "text/html",
-            "application/json",
             "application/pdf",
+            "application/json",
             "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             "image/png",
-        }
-        assert len(all_mime_types()) == 8, "no type dropped or duplicated by the migration"
+        ]
+
+    def test_get_spec_for_mime_strips_content_type_parameters(self):
+        """The most common real-world Content-Type variation -- a browser or
+        HTTP client appending '; charset=...' -- must not 400 (#117 review)."""
+        spec = get_spec_for_mime("text/plain; charset=utf-8")
+        assert spec is not None
+        assert spec.key == "txt"
 
     def test_mcp_mime_types_matches_historical_text_subset(self):
         """Pins byte-for-byte parity with the pre-#117
@@ -185,6 +189,85 @@ class TestSniffContentType:
         )
         assert spec.key == "docx"
 
+    # -- BLOCKER 3: bounded-prefix signature scan, not strict byte-0 match --
+    # This repo's own pypdf parses each of these leading-junk PDFs to a real
+    # page (verified directly against pypdf.PdfReader, not asserted blind);
+    # a strict startswith() rejected uploads that worked fine end-to-end.
+
+    def test_pdf_with_leading_blank_line_accepted(self):
+        content = b"\n\n%PDF-1.4\n%useful pdf content follows"
+        spec = sniff_content_type(content, "application/pdf")
+        assert spec.key == "pdf"
+
+    def test_pdf_with_leading_utf8_bom_accepted(self):
+        content = b"\xef\xbb\xbf%PDF-1.4\n%useful pdf content follows"
+        spec = sniff_content_type(content, "application/pdf")
+        assert spec.key == "pdf"
+
+    def test_pdf_with_leading_whitespace_accepted(self):
+        content = b"   %PDF-1.7\n%useful pdf content follows"
+        spec = sniff_content_type(content, "application/pdf")
+        assert spec.key == "pdf"
+
+    def test_pdf_signature_must_still_appear_somewhere_in_the_window(self):
+        """The bounded-prefix tolerance is not "accept anything declared
+        PDF" -- content with NO PDF signature anywhere in the sniff window
+        is still rejected."""
+        with pytest.raises(ContentTypeMismatchError):
+            sniff_content_type(b"this text never contains the pdf marker at all", "application/pdf")
+
+    # -- BLOCKER 4: shared-magic-prefix formats (the OOXML/ZIP family) must
+    # not mutually reject each other the moment a sibling registers. This is
+    # the load-bearing test #118 (XLSX)/#119 (PPTX)/#130 (ZIP) all rely on:
+    # registering a new spec with the SAME magic as an existing one must
+    # leave the EXISTING one (docx) still valid, not newly broken.
+
+    def test_shared_magic_family_does_not_mutually_reject(self, monkeypatch):
+        """Simulates #118 landing: register a synthetic 'xlsx' spec with the
+        identical ZIP signature docx already uses, then confirm BOTH a real
+        DOCX-declared-as-DOCX and a real XLSX-declared-as-XLSX still sniff
+        clean -- neither one takes the other down."""
+        import inh_contracts.file_types as ft
+
+        docx_spec = get_spec_by_key("docx")
+        xlsx_spec = FileTypeSpec(
+            key="xlsx",
+            mime_types=("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",),
+            extensions=(".xlsx",),
+            magic=b"PK\x03\x04",  # identical signature -- the whole point
+            surfaces=frozenset({"rest"}),
+            extractor="xlsx",
+            chunking_hint="tabular",
+        )
+        monkeypatch.setattr(ft, "FILE_TYPE_REGISTRY", (*FILE_TYPE_REGISTRY, xlsx_spec))
+
+        docx_result = ft.sniff_content_type(b"PK\x03\x04 real docx bytes", docx_spec.mime_types[0])
+        assert docx_result.key == "docx"
+
+        xlsx_result = ft.sniff_content_type(b"PK\x03\x04 real xlsx bytes", xlsx_spec.mime_types[0])
+        assert xlsx_result.key == "xlsx"
+
+    def test_shared_magic_family_still_rejects_a_genuinely_different_binary(self, monkeypatch):
+        """The overlap tolerance is family-scoped, not "PDF/PNG can now claim
+        to be a docx" -- a real cross-family mismatch is still caught even
+        with the synthetic xlsx sibling present."""
+        import inh_contracts.file_types as ft
+
+        docx_spec = get_spec_by_key("docx")
+        xlsx_spec = FileTypeSpec(
+            key="xlsx",
+            mime_types=("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",),
+            extensions=(".xlsx",),
+            magic=b"PK\x03\x04",
+            surfaces=frozenset({"rest"}),
+            extractor="xlsx",
+            chunking_hint="tabular",
+        )
+        monkeypatch.setattr(ft, "FILE_TYPE_REGISTRY", (*FILE_TYPE_REGISTRY, xlsx_spec))
+
+        with pytest.raises(ContentTypeMismatchError):
+            ft.sniff_content_type(b"\x89PNG\r\n\x1a\n fake png bytes", docx_spec.mime_types[0])
+
 
 # ---------------------------------------------------------------------------
 # check_extension_consistency -- the third leg of the sniffing story.
@@ -201,14 +284,55 @@ class TestCheckExtensionConsistency:
         check_extension_consistency("report.pdf", spec)  # must not raise
 
     def test_mismatched_known_extension_rejected(self):
-        """The '.pdf' extension belongs to a DIFFERENT registered spec than
-        the declared 'text/plain' -- a real disagreement, not a false
-        positive on an unrelated file."""
+        """The '.pdf' extension is a BINARY (magic-bearing) format, so
+        declaring it 'text/plain' is a real, actionable disagreement."""
         spec = get_spec_for_mime("text/plain")
         with pytest.raises(ExtensionMismatchError) as exc_info:
             check_extension_consistency("report.pdf", spec)
         assert "pdf" in str(exc_info.value)
         assert "txt" in str(exc_info.value)
+
+    # -- BLOCKER 1: TEXT-format extensions (magic is None) must NEVER reject,
+    # regardless of which text/* type is declared. text/plain is a truthful,
+    # IANA-valid Content-Type for Markdown/CSV/HTML uploads (text/markdown
+    # was only registered in 2016; plenty of clients and OS mime databases
+    # still emit text/plain for any text file) -- these are exactly the
+    # correctly-labeled uploads the #117 review caught being rejected.
+
+    @pytest.mark.parametrize(
+        "filename,declared_mime",
+        [
+            ("README.md", "text/plain"),
+            ("data.csv", "text/plain"),
+            ("page.html", "text/plain"),
+            ("cfg.json", "text/plain"),
+            ("notes.txt", "text/markdown"),
+            ("notes.txt", "text/csv"),
+        ],
+    )
+    def test_sibling_text_extension_is_accepted(self, filename, declared_mime):
+        """Every text-format extension (magic is None) declared as any
+        other text-format type must be accepted -- the exact scenarios named
+        in the #117 review's BLOCKER 1."""
+        spec = get_spec_for_mime(declared_mime)
+        check_extension_consistency(filename, spec)  # must not raise
+
+    def test_binary_extension_declared_as_text_is_still_rejected(self):
+        """The check still catches a REAL contradiction: a '.pdf' (binary,
+        magic-bearing) file declared as any text/* type."""
+        for declared_mime in ("text/plain", "text/markdown", "text/csv"):
+            spec = get_spec_for_mime(declared_mime)
+            with pytest.raises(ExtensionMismatchError):
+                check_extension_consistency("report.pdf", spec)
+
+    def test_text_extension_declared_as_binary_is_not_caught_here(self):
+        """The mirror case (declared PDF, filename says .txt) is NOT caught
+        by this function -- .txt has no magic, so it never triggers the
+        check. It IS still caught overall, by `sniff_content_type`'s byte
+        sniff (real text bytes won't match the PDF signature) -- this
+        function is one of two checks, not the only one."""
+        spec = get_spec_for_mime("application/pdf")
+        check_extension_consistency("notes.txt", spec)  # must not raise
 
     def test_unknown_extension_is_not_an_error(self):
         """An extension the registry doesn't recognize (e.g. a format #117

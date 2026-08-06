@@ -43,7 +43,9 @@ libraries (pypdf, python-docx, pytesseract, ...) it doesn't otherwise need.
 The ``extractor`` field is therefore a string dispatch KEY, not an import --
 the actual function lives in ``inh-ingestion-svc``'s extraction module and is
 looked up by that key (see ``EXTRACTORS`` there, and
-``test_file_types_contract.py`` which pins that every key here is wired).
+``services/inh-ingestion-svc/tests/test_temporal_activities.py::
+TestFileTypeRegistryDispatch::test_every_registry_extractor_key_is_wired``,
+which pins that every key here is wired).
 """
 
 from __future__ import annotations
@@ -152,10 +154,13 @@ class FileTypeSpec:
 # The registry
 # ---------------------------------------------------------------------------
 # One entry per currently-supported format. Order here is the order rendered
-# in error messages and generated docs -- matches the historical
-# ALLOWED_MIME_TYPES / docs/index.md ordering (plain text, Markdown, CSV,
-# HTML, JSON, PDF, DOCX, PNG) so this migration changes no user-visible
-# ordering.
+# in error messages and generated docs -- matches the pre-#117
+# constants.py ALLOWED_MIME_TYPES ordering exactly (plain text, Markdown,
+# CSV, HTML, PDF, JSON, DOCX, PNG), so the 400 error text is byte-for-byte
+# unchanged by this migration. (docs/index.md's prose list happened to state
+# JSON before PDF -- a pre-existing, harmless inconsistency between two
+# human-readable listings that predates #117; this registry follows the
+# CODE's order, the one that actually appears in a response body.)
 #
 # Adding a NEW format (the whole point of #117) is:
 #   1. One FileTypeSpec entry below.
@@ -201,6 +206,15 @@ FILE_TYPE_REGISTRY: tuple[FileTypeSpec, ...] = (
         chunking_hint="prose",
     ),
     FileTypeSpec(
+        key="pdf",
+        mime_types=("application/pdf",),
+        extensions=(".pdf",),
+        magic=b"%PDF-",
+        surfaces=frozenset({"rest"}),
+        extractor="pdf",
+        chunking_hint="prose",
+    ),
+    FileTypeSpec(
         key="json",
         mime_types=("application/json",),
         extensions=(".json",),
@@ -211,15 +225,6 @@ FILE_TYPE_REGISTRY: tuple[FileTypeSpec, ...] = (
         surfaces=frozenset({"rest"}),
         extractor="json_pretty",
         chunking_hint="structured",
-    ),
-    FileTypeSpec(
-        key="pdf",
-        mime_types=("application/pdf",),
-        extensions=(".pdf",),
-        magic=b"%PDF-",
-        surfaces=frozenset({"rest"}),
-        extractor="pdf",
-        chunking_hint="prose",
     ),
     FileTypeSpec(
         key="docx",
@@ -262,10 +267,13 @@ FILE_TYPE_REGISTRY: tuple[FileTypeSpec, ...] = (
 def get_spec_for_mime(mime_type: str) -> FileTypeSpec | None:
     """Look up the registry entry whose ``mime_types`` contains `mime_type`.
 
-    Case-insensitive/whitespace-tolerant since Content-Type headers are
-    client-supplied and inconsistently cased in the wild.
+    Case-insensitive/whitespace-tolerant, and strips any Content-Type
+    PARAMETERS (e.g. ``text/plain; charset=utf-8`` -> ``text/plain``) --
+    the most common real-world Content-Type variation, routinely emitted by
+    browsers and HTTP client libraries, since Content-Type headers are
+    entirely client-supplied and inconsistently formatted in the wild.
     """
-    normalized = mime_type.strip().lower()
+    normalized = mime_type.split(";", 1)[0].strip().lower()
     for spec in FILE_TYPE_REGISTRY:
         if normalized in spec.mime_types:
             return spec
@@ -353,6 +361,47 @@ class ContentTypeMismatchError(ValueError):
         )
 
 
+# Bounded prefix window magic bytes are searched within, instead of requiring
+# an exact match at byte offset 0. PDF is the concrete reason: this repo's
+# own pypdf parses PDFs that have a leading blank line, a UTF-8 BOM, or
+# leading whitespace before "%PDF-" just fine (scanner/legacy-tool output
+# routinely has this shape; the PDF spec itself tolerates junk before the
+# header), so a strict startswith() rejected real, already-working uploads.
+# 1024 bytes is the conventional tolerance (matches common `file`-style
+# magic detectors) -- generous enough for any realistic preamble, small
+# enough that an unrelated coincidental match deep in a large file is not a
+# realistic concern for the formats registered today.
+_SNIFF_WINDOW = 1024
+
+
+def _contains_signature(content: bytes, magic: bytes) -> bool:
+    """Whether `magic` appears within the first `_SNIFF_WINDOW` bytes of
+    `content` -- see the module comment above for why this isn't a strict
+    ``content.startswith(magic)``."""
+    return magic in content[:_SNIFF_WINDOW]
+
+
+def _magic_families_overlap(a: bytes, b: bytes) -> bool:
+    """Whether two magic signatures belong to the same underlying container
+    format (#117 structural fix -- see the `docx` registry entry's comment).
+
+    OOXML formats (docx/xlsx/pptx) and plain ZIP all share the identical
+    4-byte ZIP local-file-header signature ``PK\\x03\\x04`` -- a 4-byte
+    prefix cannot distinguish "this zip is a .docx" from "this zip is a
+    .xlsx" without inspecting the archive's internal ``[Content_Types].xml``,
+    which this lightweight, dependency-free sniff deliberately does not do.
+    One signature being a PREFIX of the other (equal, in the current
+    registry, but checked both ways for any future format whose signature
+    happens to extend another's) means "same family, cannot disambiguate at
+    this level" -- and the correct response to "cannot disambiguate" is to
+    ALLOW both, not reject both. Rejecting would mean the moment a second
+    OOXML-family format (#118 XLSX) is registered, EVERY upload of the
+    FIRST one (docx) starts failing too -- the exact structural bug a
+    sibling-format issue must not be able to introduce.
+    """
+    return a.startswith(b) or b.startswith(a)
+
+
 def sniff_content_type(content: bytes, declared_mime: str) -> FileTypeSpec:
     """Validate that `content`'s magic bytes agree with `declared_mime` (#117).
 
@@ -364,11 +413,14 @@ def sniff_content_type(content: bytes, declared_mime: str) -> FileTypeSpec:
     just text" claim gets caught:
 
     1. `declared_mime` maps to a spec with a known signature -> `content`
-       MUST start with it (catches "declared PDF, isn't actually PDF").
+       MUST contain it within the first `_SNIFF_WINDOW` bytes (catches
+       "declared PDF, isn't actually PDF").
     2. `content`'s bytes match a DIFFERENT spec's signature than the
        declared one -> still a mismatch (catches "PNG bytes declared as
        text/plain", where text/plain has no signature of its own for
-       check 1 to fail on).
+       check 1 to fail on) -- UNLESS the two signatures belong to the same
+       container family (see `_magic_families_overlap`), in which case
+       neither can be disambiguated at this level and both are allowed.
 
     Formats with no magic signature (every current text/* format) skip
     check 1 -- there is nothing to compare against -- but remain subject to
@@ -384,7 +436,7 @@ def sniff_content_type(content: bytes, declared_mime: str) -> FileTypeSpec:
     if spec is None:
         raise UnknownContentTypeError(declared_mime)
 
-    if spec.magic is not None and not content.startswith(spec.magic):
+    if spec.magic is not None and not _contains_signature(content, spec.magic):
         raise ContentTypeMismatchError(
             declared_mime,
             f"expected the '{spec.key}' file signature but the bytes did not match it",
@@ -393,7 +445,9 @@ def sniff_content_type(content: bytes, declared_mime: str) -> FileTypeSpec:
     for other in FILE_TYPE_REGISTRY:
         if other.magic is None or other.key == spec.key:
             continue
-        if content.startswith(other.magic):
+        if spec.magic is not None and _magic_families_overlap(spec.magic, other.magic):
+            continue
+        if _contains_signature(content, other.magic):
             raise ContentTypeMismatchError(
                 declared_mime,
                 f"the bytes match the '{other.key}' file signature instead",
@@ -423,31 +477,40 @@ def check_extension_consistency(filename: str, declared_spec: FileTypeSpec) -> N
     Three independent signals describe an upload: the declared content type,
     the filename's extension, and the actual bytes. `sniff_content_type`
     checks bytes against the declared type; this checks the filename against
-    the declared type. Between the two, any pairwise disagreement among the
-    three signals is caught by at least one of them -- e.g. a file named
-    ``report.pdf`` whose bytes are actually a PNG is caught here if it's
-    declared ``image/png`` (extension says pdf, declared says png) or by
-    `sniff_content_type` if it's declared ``application/pdf`` (declared says
-    pdf, bytes say png).
+    the declared type -- but ONLY when the extension resolves to a BINARY
+    format (``magic is not None``). A binary-format extension (``.pdf``,
+    ``.docx``, ``.png``, ...) claiming a different declared type than that
+    IS a real, actionable contradiction. A text-format extension does not
+    get the same treatment, because MIME type for plain text is inherently
+    ambiguous: ``text/plain`` is a truthful, IANA-valid Content-Type for a
+    Markdown, CSV, or HTML file too (``text/markdown`` was only registered
+    in 2016; plenty of HTTP clients and OS mime databases still default any
+    text file to ``text/plain``), so ``README.md`` declared ``text/plain``,
+    ``data.csv`` declared ``text/plain``, ``page.html`` declared
+    ``text/plain``, and ``notes.txt`` declared ``text/markdown`` are all
+    correctly-labeled uploads that worked before #117 and must keep working.
+    Rejecting those combinations bought nothing (three of the four dispatch
+    to the identical ``"text_passthrough"`` extractor regardless of which
+    was declared) and broke working callers.
 
     Deliberately permissive when the extension is NOT one this registry
-    recognizes (e.g. ``.log``, ``.yaml`` -- formats #117 doesn't cover yet,
-    or no extension at all, e.g. the REST route's ``"unnamed"`` fallback):
-    content type remains the authoritative signal, and an unrecognized
-    extension is not evidence of anything, so it is silently allowed rather
-    than treated as suspicious. Only a KNOWN extension mapping to a
-    DIFFERENT spec than `declared_spec` is a real, actionable disagreement.
+    recognizes at all (e.g. ``.log``, ``.yaml`` -- formats #117 doesn't cover
+    yet, or no extension at all, e.g. the REST route's ``"unnamed"``
+    fallback): content type remains the authoritative signal, and an
+    unrecognized extension is not evidence of anything.
 
     Raises:
-        ExtensionMismatchError: the filename's extension is registered to a
-            different type than `declared_spec`.
+        ExtensionMismatchError: the filename has a BINARY-format extension
+            registered to a different type than `declared_spec`.
     """
     extension = "." + filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
     if not extension:
         return
 
     extension_spec = get_spec_for_extension(extension)
-    if extension_spec is None or extension_spec.key == declared_spec.key:
+    if extension_spec is None or extension_spec.magic is None:
+        return
+    if extension_spec.key == declared_spec.key:
         return
 
     raise ExtensionMismatchError(filename, declared_spec.key, extension_spec.key)

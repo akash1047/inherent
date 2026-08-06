@@ -94,34 +94,46 @@ All notable changes to Inherent are documented here. The format follows
 
 ### Fixed
 
-- **⚠️ BREAKING (API) — uploads are now magic-byte AND filename-extension
-  sniffed against their declared content type; unregistered types reaching
-  extraction hard-fail instead of silently garbling (#117).** Three
-  validation holes the file-type registry closed, one per pair of the three
-  independent signals an upload carries (declared content type, filename,
-  actual bytes): (1) `Content-Type` was entirely client-supplied and never
-  checked against the actual bytes — a mislabeled binary (e.g. PNG bytes
-  declared `text/plain`) passed upload validation and was garbled by a
-  downstream text decode; `POST /v1/documents` (and the MCP `upload_document`
-  tool, which shares the same `intake_document` pipeline) now rejects a
-  byte/type mismatch with `400 Bad Request` before anything is stored — no
-  document row, no S3 object. (2) The filename was never cross-checked
-  against the declared type either — a file named `report.pdf` uploaded as
-  `text/plain` (bytes and declared type agreeing with each other, just not
-  with the name) now also gets `400` for the same reason; a filename whose
-  extension the registry doesn't recognize is unaffected (content type stays
-  authoritative for formats #117 doesn't cover yet). (3) A content type
-  accepted at upload but missing from ingestion's extraction dispatch fell
-  through to `content.decode("utf-8", errors="ignore")`, silently producing
-  empty or corrupted chunks; extraction now fails the document with a clear
-  `error_message` instead. Text extraction also switched from
-  `errors="ignore"` (which silently DELETED any non-UTF-8 byte) to
-  `charset-normalizer` encoding detection, so non-UTF-8 text uploads decode
-  correctly instead of losing bytes with no signal. **Upgrade note**: a
-  client that was uploading a mislabeled or corrupted file and relying on it
-  silently "working" (with garbled or truncated extracted text) will now see
-  a `400` at upload or a `failed` document status instead — this is the
-  intended fix, not a regression.
+- **⚠️ BREAKING (API) — genuinely mislabeled uploads (byte/type or
+  filename/type contradictions) are now rejected at intake; unregistered
+  types reaching extraction hard-fail instead of silently garbling (#117).**
+  No correctly-labeled upload of any of the 8 supported types is newly
+  rejected — that was the bar an internal review held this to, catching and
+  fixing four false-positive rejections before merge (see PR discussion):
+  sibling text/* mislabeling (`README.md` sent as `text/plain`, `data.csv`
+  as `text/plain`, etc. — `text/plain` is a truthful, IANA-valid
+  Content-Type for any text file and is routinely what real clients send),
+  a PDF whose bytes start with a BOM/leading whitespace before `%PDF-`
+  (pypdf parses these fine; the sniff now scans a 1024-byte window instead
+  of requiring the signature at byte 0), and a structural bug that would
+  have made the registry reject EVERY `.docx` upload the moment a sibling
+  OOXML format (#118 XLSX) is registered (shared-signature formats are now
+  explicitly tolerated as "cannot disambiguate, allow both" rather than
+  "reject both"). What IS newly rejected: (1) bytes that contradict the
+  declared type at the binary-signature level (e.g. PNG bytes declared
+  `text/plain`, or a file declared `application/pdf` whose bytes are not a
+  PDF) — `POST /v1/documents` and the MCP `upload_document` tool (sharing
+  the same `intake_document` pipeline) now return `400 Bad Request` before
+  anything is stored, no document row, no S3 object; (2) a filename with a
+  recognized BINARY extension (`.pdf`, `.docx`, `.png`, ...) that contradicts
+  the declared type (e.g. `report.pdf` declared `text/plain`) — a
+  text-format extension never triggers this, only a binary one; (3) a
+  content type accepted at upload but missing from ingestion's extraction
+  dispatch, which fell through to `content.decode("utf-8", errors="ignore")`
+  producing empty/corrupted chunks, now fails the document with a clear
+  `error_message` instead. Also **benign widening**, not a tightening:
+  `Content-Type` matching is now case-insensitive and strips parameters
+  (`TEXT/PLAIN` and `text/plain; charset=utf-8` were both previously
+  rejected by exact string match and are now accepted as `text/plain`) —
+  same 8 supported types, just more of their real-world spellings
+  recognized. Text extraction also switched from `errors="ignore"` (which
+  silently DELETED any non-UTF-8 byte) to `charset-normalizer` encoding
+  detection. **Upgrade note**: a client uploading a file whose declared
+  type, filename, and bytes genuinely disagree with each other — previously
+  silently "working" with garbled or truncated extracted text — now gets a
+  `400` at upload or a `failed` document status instead; this is the
+  intended fix, not a regression. A client sending any consistent,
+  correctly-labeled upload of the 8 supported types is unaffected.
 
 - **Retrieval-eval baseline ratchet silently never ran (#139 follow-up).**
   `eval-baseline-ratchet` pushed its ratchet commit straight to `main`, but

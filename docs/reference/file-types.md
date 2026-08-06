@@ -28,8 +28,8 @@ the build if this table and the registry ever disagree.
 | markdown | `.md`, `.markdown` | `text/markdown` | rest + mcp | prose | — |
 | csv | `.csv` | `text/csv` | rest + mcp | tabular | — |
 | html | `.html`, `.htm` | `text/html` | rest + mcp | prose | — |
-| json | `.json` | `application/json` | rest | structured | — |
 | pdf | `.pdf` | `application/pdf` | rest | prose | — |
+| json | `.json` | `application/json` | rest | structured | — |
 | docx | `.docx` | `application/vnd.openxmlformats-officedocument.wordprocessingml.document` | rest | prose | — |
 | png | `.png` | `image/png` | rest | media | `ocr` |
 

@@ -121,7 +121,7 @@ curl -s "$INGEST_BASE/health" | jq .
 Upload registers a file in storage and queues it for ingestion. The returned `document_id` is what every other endpoint uses to reference this document.
 
 Allowed MIME types: `text/plain`, `text/markdown`, `text/csv`, `text/html`,
-`application/json`, `application/pdf`,
+`application/pdf`, `application/json`,
 `application/vnd.openxmlformats-officedocument.wordprocessingml.document`,
 `image/png` (OCR) — see the full [supported file types](../reference/file-types.md)
 reference for extensions, chunking strategy, and optional-dependency notes.
@@ -251,7 +251,7 @@ curl -s -X POST "$API_BASE/v1/documents" \
   "type": "https://api.inherent.systems/errors/bad-request",
   "title": "Bad Request",
   "status": 400,
-  "detail": "Unsupported file type 'application/octet-stream'. Allowed types: text/plain, text/markdown, text/csv, text/html, application/json, application/pdf, application/vnd.openxmlformats-officedocument.wordprocessingml.document, image/png"
+  "detail": "Unsupported file type 'application/octet-stream'. Allowed types: text/plain, text/markdown, text/csv, text/html, application/pdf, application/json, application/vnd.openxmlformats-officedocument.wordprocessingml.document, image/png"
 }
 ```
 

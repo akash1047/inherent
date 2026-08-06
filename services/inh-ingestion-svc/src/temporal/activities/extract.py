@@ -29,6 +29,7 @@ import charset_normalizer
 import structlog
 from inh_contracts.file_types import all_mime_types, get_spec_for_mime
 from temporalio import activity
+from temporalio.exceptions import ApplicationError
 
 from src.temporal.lineage import track_event
 from src.temporal.models import ExtractTextInput, ExtractTextOutput
@@ -230,8 +231,17 @@ EXTRACTORS: dict[str, Callable[[bytes, str], str]] = {
 def _resolve_extractor(content_type: str) -> Callable[[bytes, str], str]:
     """Resolve the extractor function for `content_type`, or fail loudly.
 
-    Two distinct, explicit failure modes (both raise RuntimeError so
-    Temporal retries/fails the activity -- never a silent lossy decode):
+    Two distinct, explicit failure modes -- both DETERMINISTIC (the same
+    `content_type` will fail identically on every retry, since neither is a
+    transient dependency/network condition), so both raise a non-retryable
+    ``ApplicationError`` instead of a bare ``RuntimeError``: Temporal fails
+    the activity after the FIRST attempt rather than burning the workflow's
+    full retry budget (multiple attempts with backoff) on a bug retrying
+    cannot fix (#117 review item 13) -- cheaper and faster to reach the same
+    terminal `failed` document status. Contrast with other RuntimeErrors in
+    this module (storage read failures, a missing extraction library) that
+    genuinely may succeed on retry and deliberately keep the default retry
+    policy.
 
     1. No FILE_TYPE_REGISTRY entry for this content type at all -- an
        unsupported or unrecognized upload reaching extraction.
@@ -243,18 +253,22 @@ def _resolve_extractor(content_type: str) -> Callable[[bytes, str], str]:
     """
     spec = get_spec_for_mime(content_type)
     if spec is None:
-        raise RuntimeError(
+        raise ApplicationError(
             f"No extractor registered for content type '{content_type}'. "
-            f"Supported types: {', '.join(all_mime_types())}"
+            f"Supported types: {', '.join(all_mime_types())}",
+            type="UnregisteredContentType",
+            non_retryable=True,
         )
 
     extractor = EXTRACTORS.get(spec.extractor)
     if extractor is None:
-        raise RuntimeError(
+        raise ApplicationError(
             f"Registry entry '{spec.key}' ({content_type}) names extractor "
             f"'{spec.extractor}', which has no function wired in EXTRACTORS. "
             f"This is a wiring bug: add EXTRACTORS['{spec.extractor}'] in "
-            f"src/temporal/activities/extract.py."
+            f"src/temporal/activities/extract.py.",
+            type="ExtractorWiringBug",
+            non_retryable=True,
         )
     return extractor
 

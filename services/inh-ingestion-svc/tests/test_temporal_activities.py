@@ -10,6 +10,7 @@ constructing service instances directly.
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
+from temporalio.exceptions import ApplicationError
 
 from src.temporal.models import (
     ExtractTextInput,
@@ -195,8 +196,10 @@ class TestExtractTextActivity:
         # generic "unregistered content type" hard failure (previously a
         # spreadsheet-specific special case) -- the exact path acceptance
         # criterion "unregistered type reaching extraction -> failed with a
-        # clear error_message" is written against.
-        with pytest.raises(RuntimeError, match="No extractor registered"):
+        # clear error_message" is written against. Non-retryable
+        # ApplicationError (#117 review item 13): deterministic, retrying
+        # cannot fix it.
+        with pytest.raises(ApplicationError, match="No extractor registered"):
             await extract_text(input_data)
 
         mock_staging.write_text.assert_not_called()
@@ -293,23 +296,27 @@ class TestFileTypeRegistryDispatch:
     def test_unregistered_content_type_raises_actionable_error(self):
         """A content type with no FILE_TYPE_REGISTRY entry at all fails with
         a message naming the offending type and the supported set -- never a
-        silent decode-and-hope."""
+        silent decode-and-hope. Non-retryable (#117 review item 13): the
+        same content_type fails identically on every retry."""
         from src.temporal.activities.extract import _resolve_extractor
 
-        with pytest.raises(RuntimeError, match="application/x-made-up"):
+        with pytest.raises(ApplicationError, match="application/x-made-up") as exc_info:
             _resolve_extractor("application/x-made-up")
+        assert exc_info.value.non_retryable
 
     def test_registry_entry_with_unwired_extractor_fails_loudly(self, monkeypatch):
         """The second failure mode: a VALID registry entry whose `extractor`
         key has no matching EXTRACTORS function. This must never surface as
         a bare KeyError (a confusing crash in Temporal's activity worker) --
-        it's a wiring bug, and the message must say so."""
+        it's a wiring bug, and the message must say so. Non-retryable: a
+        wiring bug cannot be fixed by retrying."""
         import src.temporal.activities.extract as extract_module
 
         monkeypatch.setattr(extract_module, "EXTRACTORS", {})  # simulate the gap
 
-        with pytest.raises(RuntimeError, match="wiring"):
+        with pytest.raises(ApplicationError, match="wiring") as exc_info:
             extract_module._resolve_extractor("application/pdf")
+        assert exc_info.value.non_retryable
 
     def test_correctly_registered_type_resolves(self):
         from src.temporal.activities.extract import _resolve_extractor

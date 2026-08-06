@@ -52,9 +52,14 @@ async def intake_document(
     1. Validate ``content_type`` against ``ALLOWED_MIME_TYPES`` (derived from
        the FILE_TYPE_REGISTRY single source of truth, see constants.py).
     2. Cross-check the filename's extension against the declared type
-       (#117). A KNOWN extension (e.g. ``.pdf``) registered to a DIFFERENT
-       type than the one declared is a real disagreement -- an unrecognized
-       or absent extension is not evidence of anything and is allowed.
+       (#117). A known BINARY-format extension (e.g. ``.pdf``, ``.docx``,
+       ``.png``) registered to a DIFFERENT type than the one declared is a
+       real disagreement. A text-format extension (``.txt``/``.md``/``.csv``/
+       ``.html``/``.json``) never triggers this -- ``text/plain`` is a
+       truthful, IANA-valid Content-Type for any of those, and real clients
+       routinely send it; an unrecognized or absent extension is likewise
+       not evidence of anything. Only a genuine binary-vs-declared
+       contradiction is rejected.
     3. Validate size (non-empty, under the type's ``max_size_bytes`` override
        or the global ``MAX_UPLOAD_SIZE_BYTES`` default).
     4. Sniff: verify the bytes' magic signature agrees with the declared
