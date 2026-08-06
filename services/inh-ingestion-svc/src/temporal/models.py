@@ -246,11 +246,24 @@ class StoreDocumentInput:
 
 @dataclass
 class StoreDocumentOutput:
-    """Output from store_document activities."""
+    """Output from store_document activities.
+
+    superseded (#110): True when this activity's write was skipped because
+    active_run_id no longer matched workflow_run_id -- a newer workflow run
+    claimed the document in the meantime (TERMINATE_EXISTING supersession,
+    see src/services/database.py::store_processed_document). Distinct from a
+    plain success=False: this is not an error to retry or dead-letter, it is
+    the fencing check working as intended. The workflow that owns this
+    activity call has, by definition, already been terminated by the time
+    this can happen, so nothing acts on the distinction at the call site
+    today -- it exists for observability (logs/metrics) and so tests can
+    assert the fenced path was taken rather than a genuine failure.
+    """
 
     success: bool
     chunks_stored: int
     error: str | None = None
+    superseded: bool = False
 
 
 @dataclass
@@ -286,11 +299,17 @@ class UpdateStatsInput:
 
 @dataclass
 class CreatePendingDocumentInput:
-    """Input for the create_pending_document activity (#10).
+    """Input for the create_pending_document activity (#10, #110).
 
     Creates a minimal 'processing' processed_documents row at workflow start so
     a failure during fetch/extract/chunk is observable via the status API
     instead of returning 'not found'. The store step later upserts the full row.
+
+    workflow_run_id (#110): also claims the document's fencing token (see
+    DatabaseService.create_pending_document / migration 016) so a later
+    store commit from a DIFFERENT, superseded run for the same document_id
+    can detect it's been superseded and skip its write instead of clobbering
+    this run's content.
     """
 
     document_id: str
@@ -302,6 +321,7 @@ class CreatePendingDocumentInput:
     size_bytes: int
     storage_backend: str
     storage_path: str
+    workflow_run_id: str
     storage_bucket: str | None = None
     storage_url: str | None = None
 

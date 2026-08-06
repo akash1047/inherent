@@ -16,11 +16,14 @@ logger = structlog.get_logger(__name__)
 
 @activity.defn
 async def create_pending_document(input: CreatePendingDocumentInput) -> bool:
-    """Create a minimal 'processing' processed_documents row at workflow start.
+    """Create a minimal 'processing' processed_documents row at workflow start
+    AND claim the document's fencing token for this workflow run (#110).
 
     Makes the document observable in the status API before the store step, so a
     failure during fetch/extract/chunk is visible instead of 'not found' (#10).
-    Best-effort and idempotent (no-op if the row already exists).
+    The row-create is idempotent (no-op if it already exists); the fencing
+    claim (active_run_id) happens on every call regardless -- see
+    DatabaseService.create_pending_document for why.
     """
     from src.temporal.shared_services import get_db_service
 
@@ -35,12 +38,14 @@ async def create_pending_document(input: CreatePendingDocumentInput) -> bool:
         size_bytes=input.size_bytes,
         storage_backend=input.storage_backend,
         storage_path=input.storage_path,
+        workflow_run_id=input.workflow_run_id,
         storage_bucket=input.storage_bucket,
         storage_url=input.storage_url,
     )
     logger.info(
-        "Created pending document row",
+        "Created pending document row and claimed fencing token",
         document_id=input.document_id,
+        workflow_run_id=input.workflow_run_id,
         created=created,
     )
     return created

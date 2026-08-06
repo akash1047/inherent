@@ -200,6 +200,16 @@ class DatabaseService:
                 default=lambda: datetime.now(UTC),
             ),
             Column("processed_at", DateTime(timezone=True), nullable=True),
+            # Fencing token (#110, migration 016): the Temporal run_id that
+            # currently "owns" this document. Every workflow run claims the
+            # row (create_pending_document) as its first action; the store
+            # activities only commit when this still matches the run doing
+            # the write. Stops a TERMINATE_EXISTING-superseded run's
+            # already-dispatched (and therefore unstoppable -- no activity
+            # heartbeat/cancellation is wired) store activity from clobbering
+            # a newer run's already-committed content when it finally
+            # completes. See docs/developer/learnings.md.
+            Column("active_run_id", String(255), nullable=True),
             Index("idx_processed_documents_workspace_id", "workspace_id"),
             Index("idx_processed_documents_user_id", "user_id"),
             Index("idx_processed_documents_tenant_id", "tenant_id"),
@@ -794,8 +804,9 @@ class DatabaseService:
         chunks: list[DocumentChunk],
         text_length: int,
         processing_time_ms: int,
+        workflow_run_id: str,
         tenant_id: int | None = None,
-    ) -> int:
+    ) -> int | None:
         """Store processed document and its chunks with proper FK relationship.
 
         Args:
@@ -803,10 +814,19 @@ class DatabaseService:
             chunks: List of document chunks
             text_length: Total extracted text length
             processing_time_ms: Processing time in milliseconds
+            workflow_run_id: The Temporal run doing this write. Fenced (#110):
+                if a NEWER run has since claimed this document_id (a fresher
+                re-index superseded this run's workflow via
+                TERMINATE_EXISTING while this store step was already in
+                flight -- termination does not stop an already-dispatched
+                activity), the write is skipped entirely rather than
+                clobbering the newer run's content.
             tenant_id: Optional tenant_id for multi-tenancy
 
         Returns:
-            ID of the stored document record
+            ID of the stored document record, or None if the write was
+            skipped because a newer workflow run has since claimed the
+            document (fenced out -- see workflow_run_id above).
         """
         if not self.engine:
             raise RuntimeError("Database not connected")
@@ -815,7 +835,15 @@ class DatabaseService:
             try:
                 now = datetime.now(UTC)
 
-                # Upsert document record
+                # Upsert document record. The WHERE on the conflict branch is
+                # the fencing check (#110): apply the update only if this
+                # document is unclaimed (active_run_id IS NULL -- true for a
+                # document that predates migration 016) or still claimed by
+                # THIS run. A row claimed by a DIFFERENT, newer run means this
+                # write has been superseded; the WHERE makes the UPDATE
+                # affect zero rows instead of applying it, and unconditionally
+                # re-asserting active_run_id in SET reinforces this run's own
+                # claim for any later write in the same run (e.g. a retry).
                 stmt = pg_insert(self.processed_documents).values(
                     document_id=message.document_id,
                     workspace_id=message.workspace_id,
@@ -833,6 +861,7 @@ class DatabaseService:
                     chunk_count=len(chunks),
                     text_length=text_length,
                     processing_time_ms=processing_time_ms,
+                    active_run_id=workflow_run_id,
                     created_at=now,
                     updated_at=now,
                     processed_at=now,
@@ -846,14 +875,34 @@ class DatabaseService:
                         "text_length": text_length,
                         "processing_time_ms": processing_time_ms,
                         "tenant_id": tenant_id,
+                        "active_run_id": workflow_run_id,
                         "updated_at": now,
                         "processed_at": now,
                         "error_message": None,
                     },
+                    where=(
+                        self.processed_documents.c.active_run_id.is_(None)
+                        | (self.processed_documents.c.active_run_id == workflow_run_id)
+                    ),
                 ).returning(self.processed_documents.c.id)
 
                 result = session.execute(stmt)
-                doc_id: int = result.scalar_one()  # type: ignore[assignment]
+                row = result.first()
+                if row is None:
+                    # Fenced out: a newer run claimed this document_id since
+                    # this run started (#110). Do NOT touch document_chunks --
+                    # skipping here, before the delete/insert below, is what
+                    # protects the newer run's already-committed chunks.
+                    logger.warning(
+                        "Skipped storing document: superseded by a newer "
+                        "workflow run (fencing check, #110)",
+                        document_id=message.document_id,
+                        workflow_run_id=workflow_run_id,
+                    )
+                    return None
+                # Already consumed via result.first() above -- do not call
+                # .scalar_one() again on the same Result (single-use cursor).
+                doc_id: int = row[0]  # type: ignore[assignment]
 
                 # Delete existing chunks for this document (for re-processing)
                 session.execute(
@@ -941,17 +990,27 @@ class DatabaseService:
         size_bytes: int,
         storage_backend: str,
         storage_path: str,
+        workflow_run_id: str,
         storage_bucket: str | None = None,
         storage_url: str | None = None,
     ) -> bool:
-        """Create a minimal 'processing' processed_documents row up front (#10).
+        """Create a minimal 'processing' processed_documents row up front (#10)
+        AND claim the fencing token for this workflow run (#110).
 
-        Without this, no row exists until the store step, so an early
-        'processing'/'failed' status write hits 0 rows and a document that fails
-        during fetch/extract/chunk is invisible ('not found') to the status API.
-        No-op if the row already exists (the store step upserts the full record).
+        Without the row, no early 'processing'/'failed' status write can land
+        (0 rows updated), so a document that fails during fetch/extract/chunk
+        is invisible ('not found') to the status API. The INSERT is a no-op if
+        the row already exists (the store step upserts the full record) --
+        but the fencing CLAIM must still happen on every call, insert or not,
+        so a re-index's run always records itself as the document's current
+        owner. See migration 016 / store_processed_document for the other
+        half: the store activities only commit when this claim still points
+        at the run doing the write, which is what stops a
+        TERMINATE_EXISTING-superseded run's late write from clobbering a
+        newer run's already-committed content.
 
-        Returns True if a row was created, False if one already existed.
+        Returns True if a row was created, False if one already existed
+        (claim semantics are identical either way).
         """
         if not self.engine:
             raise RuntimeError("Database not connected")
@@ -974,13 +1033,65 @@ class DatabaseService:
                     storage_url=storage_url,
                     status=DocumentStatus.PROCESSING.value,
                     chunk_count=0,
+                    active_run_id=workflow_run_id,
                     created_at=now,
                     updated_at=now,
                 )
                 .on_conflict_do_nothing(index_elements=["document_id"])
             )
             result = session.execute(stmt)
-            return bool(result.rowcount and result.rowcount > 0)
+            created = bool(result.rowcount and result.rowcount > 0)
+
+            # Claim regardless of insert-vs-existing (#110): this is the step
+            # that lets a fresh re-index's run supersede a stale one's later
+            # write. A plain UPDATE (not part of the upsert above) so the
+            # "created" return value keeps its original, simple meaning
+            # (rowcount from the INSERT statement only) and every existing
+            # caller/test of that meaning is unaffected.
+            session.execute(
+                self.processed_documents.update()
+                .where(self.processed_documents.c.document_id == document_id)
+                .values(active_run_id=workflow_run_id, updated_at=now)
+            )
+
+            return created
+
+    async def is_active_run(self, document_id: str, workflow_run_id: str) -> bool:
+        """Check the fencing token before a non-transactional write (#110).
+
+        PostgreSQL writes fence themselves atomically via the conditional
+        UPSERT in store_processed_document (the WHERE clause and the check
+        happen in the same statement, so there is no race). Weaviate has no
+        equivalent transactional primitive, so store_in_weaviate
+        (activities/store.py) calls this immediately before its destructive
+        delete+write as a best-effort guard -- it narrows the window a
+        superseded run's write can land in from "the whole activity duration
+        (up to ~60s, dominated by the embedding batch call)" to "one extra DB
+        round trip immediately before the write", not to zero. A document
+        that predates migration 016, or was never claimed for some other
+        reason, has active_run_id IS NULL, which is treated as unclaimed
+        (permitted) -- consistent with the Postgres-side fencing check.
+
+        Returns:
+            True if unclaimed or claimed by workflow_run_id (write permitted);
+            False if claimed by a DIFFERENT run (write should be skipped).
+        """
+        if not self.engine:
+            raise RuntimeError("Database not connected")
+
+        with self.get_session() as session:
+            row = session.execute(
+                self.processed_documents.select().with_only_columns(
+                    self.processed_documents.c.active_run_id
+                )
+                .where(self.processed_documents.c.document_id == document_id)
+            ).first()
+
+        if row is None:
+            # No document row at all yet -- nothing to conflict with.
+            return True
+        active_run_id = row[0]
+        return active_run_id is None or active_run_id == workflow_run_id
 
     async def update_document_status(
         self,

@@ -258,7 +258,18 @@ class DocumentIngestionWorkflow:
             # Create a minimal 'processing' row up front so the document is
             # observable via the status API before the store step; a failure in
             # fetch/extract/chunk then shows as 'failed', not 'not found' (#10).
-            # Best-effort: a create failure must not fail the workflow.
+            # ALSO claims this run's fencing token (active_run_id, #110) --
+            # this must run as early as possible so a fresh run that just
+            # superseded a stale one (TERMINATE_EXISTING) claims the document
+            # before the stale run's own store step can commit. Best-effort:
+            # a create/claim failure must not fail the workflow (unchanged
+            # from #10) -- residual risk this accepts: if the claim itself
+            # fails AND a stale run's write is in flight, the stale write
+            # could still land, since nothing re-claimed to block it. Judged
+            # acceptable because (a) this is a single lightweight UPDATE with
+            # its own 2-attempt retry, and (b) a DB failure here is very
+            # likely to also fail this run's own later store step, which
+            # would fail the run and dead-letter it either way.
             try:
                 await workflow.execute_activity(
                     create_pending_document,
@@ -272,6 +283,7 @@ class DocumentIngestionWorkflow:
                         size_bytes=input.size_bytes,
                         storage_backend=input.storage_backend,
                         storage_path=input.storage_path,
+                        workflow_run_id=workflow_run_id,
                         storage_bucket=input.storage_bucket,
                         storage_url=input.storage_url,
                     ),
@@ -284,7 +296,7 @@ class DocumentIngestionWorkflow:
                     ),
                 )
             except Exception:
-                workflow.logger.warning("Failed to create pending document row (non-fatal)")
+                workflow.logger.warning("Failed to create/claim pending document row (non-fatal)")
 
             # Mark the document as 'processing' before heavy work begins.
             # Best-effort: a status-write failure must not fail the workflow.

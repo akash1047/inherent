@@ -18,6 +18,7 @@ ensuring proper tenant isolation in both PostgreSQL and Weaviate.
 from __future__ import annotations
 
 import time
+import uuid
 from typing import TYPE_CHECKING
 
 import structlog
@@ -700,11 +701,17 @@ class DocumentProcessor:
         # Store in PostgreSQL if available
         if self.db_service:
             try:
+                # workflow_run_id (#110): this legacy, non-Temporal processing
+                # path (not used in production -- see DocumentIngestionWorkflow
+                # for the live path) has no real "run" concept to fence
+                # against, so a fresh id per call satisfies the now-required
+                # parameter without claiming any actual supersession semantics.
                 await self.db_service.store_processed_document(
                     message=message,
                     chunks=chunks,
                     text_length=text_length,
                     processing_time_ms=processing_time_ms,
+                    workflow_run_id=str(uuid.uuid4()),
                     tenant_id=tenant_id,
                 )
                 logger.info(

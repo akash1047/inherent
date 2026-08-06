@@ -89,15 +89,53 @@ async def store_in_postgresql(input: StoreDocumentInput) -> StoreDocumentOutput:
             timestamp="",  # Not needed for storage
         )
 
-        await db_service.store_processed_document(
+        doc_pk = await db_service.store_processed_document(
             message=message,
             chunks=chunks,
             text_length=input.text_length,
             processing_time_ms=input.processing_time_ms,
+            workflow_run_id=input.workflow_run_id,
             tenant_id=input.tenant_id,
         )
 
         duration_ms = int((time.monotonic() - start) * 1000)
+
+        if doc_pk is None:
+            # Fenced out (#110): a newer workflow run claimed this document
+            # since this run started -- most likely this run was terminated
+            # (TERMINATE_EXISTING) and this activity, already dispatched
+            # before that happened, is only completing now. Not an error:
+            # return normally (do NOT raise) so Temporal's RetryPolicy does
+            # not retry an outcome that can never change. By the time this
+            # can happen the owning workflow has already been terminated, so
+            # nothing consumes this result -- it exists for the lineage
+            # event below and for tests.
+            logger.warning(
+                "PostgreSQL store skipped: superseded by a newer workflow run",
+                document_id=input.document_id,
+                workflow_run_id=input.workflow_run_id,
+            )
+            try:
+                await db_service.record_ingestion_event(
+                    workflow_run_id=input.workflow_run_id,
+                    document_id=input.document_id,
+                    workspace_id=input.workspace_id,
+                    event_type="stored_postgresql",
+                    status="superseded",
+                    duration_ms=duration_ms,
+                )
+            except Exception as rec_err:
+                logger.warning(
+                    "Failed to record lineage event",
+                    event_type="stored_postgresql",
+                    error=str(rec_err),
+                )
+            return StoreDocumentOutput(
+                success=False,
+                chunks_stored=0,
+                error="superseded_by_newer_workflow_run",
+                superseded=True,
+            )
 
         logger.info(
             "Stored document in PostgreSQL",
@@ -220,6 +258,44 @@ async def store_in_weaviate(input: StoreDocumentInput) -> StoreDocumentOutput:
             # transient reconnect window; the RetryPolicy should get a shot
             # before the doc is failed/dead-lettered (#2).
             raise RuntimeError("Weaviate not connected")
+
+        # Fencing check (#110), immediately before the destructive delete+write
+        # below -- as close to the mutation as possible to minimize the window.
+        # Weaviate has no transactional WHERE-on-write like the Postgres upsert
+        # in store_processed_document, so this is a plain check-then-write with
+        # an inherent (but now much smaller) race: previously a superseded run
+        # could clobber a newer one any time in this activity's full duration
+        # (dominated by the embedding batch call, tens of seconds); now only in
+        # the gap between this check and the write immediately following it.
+        db_service = get_db_service()
+        if not await db_service.is_active_run(input.document_id, input.workflow_run_id):
+            duration_ms = int((time.monotonic() - start) * 1000)
+            logger.warning(
+                "Weaviate store skipped: superseded by a newer workflow run",
+                document_id=input.document_id,
+                workflow_run_id=input.workflow_run_id,
+            )
+            try:
+                await db_service.record_ingestion_event(
+                    workflow_run_id=input.workflow_run_id,
+                    document_id=input.document_id,
+                    workspace_id=input.workspace_id,
+                    event_type="stored_weaviate",
+                    status="superseded",
+                    duration_ms=duration_ms,
+                )
+            except Exception as rec_err:
+                logger.warning(
+                    "Failed to record lineage event",
+                    event_type="stored_weaviate",
+                    error=str(rec_err),
+                )
+            return StoreDocumentOutput(
+                success=False,
+                chunks_stored=0,
+                error="superseded_by_newer_workflow_run",
+                superseded=True,
+            )
 
         # Convert chunk dicts to DocumentChunk objects. metadata carries the
         # per-chunk risk signal (#44) so it can be written as Weaviate properties.

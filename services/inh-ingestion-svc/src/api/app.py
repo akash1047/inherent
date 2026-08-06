@@ -17,8 +17,8 @@ import structlog
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
-from temporalio.client import Client
-from temporalio.exceptions import WorkflowAlreadyStartedError
+from temporalio.client import Client, WorkflowFailureError
+from temporalio.exceptions import TerminatedError, WorkflowAlreadyStartedError
 from temporalio.service import RPCError
 
 from src.api.auth import verify_api_key
@@ -80,7 +80,7 @@ class IngestAcceptedResponse(BaseModel):
 
     workflow_id: str
     document_id: str
-    status: Literal["started", "already_running"] = "started"
+    status: Literal["started", "already_running", "superseded_by_newer_request"] = "started"
 
 
 class IngestResultResponse(BaseModel):
@@ -233,7 +233,14 @@ def create_app(settings: Settings) -> FastAPI:
         response_model=IngestAcceptedResponse,
         responses={
             200: {"model": IngestResultResponse, "description": "Completed (wait=true)"},
-            409: {"description": "Workflow already running for this document"},
+            409: {
+                "description": (
+                    "Workflow already running for this document, OR (wait=true only) "
+                    "this run was terminated mid-wait by a newer concurrent request for "
+                    "the same document (#110) -- check GET /ingest/{document_id}/status "
+                    "or the document's own status endpoint for the outcome that won."
+                )
+            },
         },
     )
     async def trigger_ingestion(
@@ -297,7 +304,49 @@ def create_app(settings: Settings) -> FastAPI:
         )
 
         if wait:
-            result: WorkflowResult = await handle.result()
+            # #110 blocker 4: this run can now be terminated out from under us
+            # by an UNRELATED concurrent MQ refresh/re-index for the same
+            # document_id (trigger_workflow_async's supersede_running=True
+            # default, see src/temporal/trigger.py) -- Temporal workflow ids
+            # are global, not scoped to how the run was started. Pre-#110 this
+            # path was safe uncaught: the workflow always caught its own
+            # exceptions and returned WorkflowResult(success=False, ...), so
+            # handle.result() effectively never raised. Post-#110 it can raise
+            # WorkflowFailureError(cause=TerminatedError) here, which without
+            # this except would surface as an unhandled 500. Report it as a
+            # clear 409 instead -- the caller's own request is not what
+            # failed; a newer one for the same document won the race.
+            try:
+                result: WorkflowResult = await handle.result()
+            except WorkflowFailureError as e:
+                if isinstance(e.cause, TerminatedError):
+                    logger.info(
+                        "Ingestion terminated by a newer request for this document",
+                        workflow_id=workflow_id,
+                        document_id=body.document_id,
+                    )
+                    return JSONResponse(
+                        status_code=409,
+                        content=IngestAcceptedResponse(
+                            workflow_id=workflow_id,
+                            document_id=body.document_id,
+                            status="superseded_by_newer_request",
+                        ).model_dump(),
+                    )
+                # Any other WorkflowFailureError (cancellation, timeout) is
+                # unexpected here -- the workflow normally reports its own
+                # failures via WorkflowResult(success=False, ...) rather than
+                # raising. Surface it rather than crashing without a body.
+                logger.error(
+                    "Unexpected workflow failure while waiting for result",
+                    workflow_id=workflow_id,
+                    document_id=body.document_id,
+                    error=str(e.cause),
+                )
+                raise HTTPException(
+                    status_code=500, detail=f"Ingestion workflow failed: {e.cause}"
+                ) from e
+
             return JSONResponse(
                 status_code=200,
                 content=IngestResultResponse(
@@ -585,11 +634,20 @@ def create_app(settings: Settings) -> FastAPI:
         # Increment retry count
         await db_svc.increment_dead_letter_retry(job_id)
 
-        # Re-trigger workflow
+        # Re-trigger workflow. supersede_running=False (#110 blocker 3): this
+        # replays a POTENTIALLY STALE payload (whatever failed and got
+        # dead-lettered, possibly long ago). If a healthy, newer run for the
+        # same document_id is meanwhile in flight (e.g. the user re-uploaded
+        # corrected content after the original failure), superseding it would
+        # silently terminate that newer run and overwrite it with this old
+        # payload. Keeping the default (raise-on-collision) behavior here
+        # means that case surfaces as the 500 below instead.
         original_message = job.get("original_message", {})
         trigger = request.app.state.trigger
         try:
-            workflow_id = await trigger.trigger_workflow_async(original_message)
+            workflow_id = await trigger.trigger_workflow_async(
+                original_message, supersede_running=False
+            )
             return {"retried": True, "job_id": job_id, "new_workflow_id": workflow_id}
         except Exception as e:
             # Reset status back to pending on failure

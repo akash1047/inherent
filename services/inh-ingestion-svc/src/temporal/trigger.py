@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING
 import structlog
 from pydantic import ValidationError as PydanticValidationError
 from temporalio.client import Client
-from temporalio.common import WorkflowIDConflictPolicy, WorkflowIDReusePolicy
+from temporalio.common import WorkflowIDConflictPolicy
 
 from src.config.settings import Settings
 from src.models.document import DocumentUploadMessage, ProcessingResult
@@ -34,18 +34,22 @@ from src.temporal.workflows import DocumentIngestionWorkflow
 # however long that stale run takes to close on its own (#110; ~10min was
 # observed in CI, not a fixed timeout -- see docs/developer/learnings.md).
 #
-# Fix: supersede instead of collide. TERMINATE_EXISTING tells Temporal to
-# terminate the same-id running execution and start the new one atomically,
-# so start_workflow always returns fast instead of raising. This is the
-# correct semantics for an AI-agent caller that will retry a re-index: the
-# fresh event always represents the content that should win, so the newest
-# request should supersede a stale in-flight run rather than queue behind
-# it or bounce off it as a conflict. ALLOW_DUPLICATE (the SDK default, named
-# explicitly here for clarity) is unaffected -- it only governs whether a
-# new run may start after a *previous, closed* run with the same id, which
-# re-index/refresh always needs regardless of how that previous run ended.
-_INGEST_ID_REUSE_POLICY = WorkflowIDReusePolicy.ALLOW_DUPLICATE
-_INGEST_ID_CONFLICT_POLICY = WorkflowIDConflictPolicy.TERMINATE_EXISTING
+# Fix: supersede instead of collide, BUT only for callers whose fresh event
+# genuinely represents newer content. TERMINATE_EXISTING tells Temporal to
+# terminate the same-id running execution and start the new one atomically
+# instead of raising. That is correct for the MQ upload/refresh path (the
+# default here) -- but WRONG for a dead-letter retry of a *stale* payload
+# racing a healthy, newer run for the same document: superseding there would
+# silently discard the newer content in favor of the old dead-letter one
+# (#110 follow-up review, blocker 3). So this is a per-call parameter, not a
+# module constant -- callers must decide, not inherit a default silently.
+# See DocumentIngestionWorkflow's store activities (store.py) for the second
+# half of the fix this alone is not sufficient for: terminating a workflow
+# does not stop an activity it already dispatched (no heartbeat/cancellation
+# is wired), so a fencing check at commit time is what actually prevents a
+# superseded run's late write from clobbering the newer one.
+_SUPERSEDE_CONFLICT_POLICY = WorkflowIDConflictPolicy.TERMINATE_EXISTING
+_REJECT_CONFLICT_POLICY = WorkflowIDConflictPolicy.UNSPECIFIED  # SDK default: raise on collision
 
 if TYPE_CHECKING:
     from src.services.database import DatabaseService
@@ -160,7 +164,9 @@ class TemporalWorkflowTrigger:
                 error=str(e),
             )
 
-    async def trigger_workflow(self, message: dict) -> ProcessingResult:
+    async def trigger_workflow(
+        self, message: dict, *, supersede_running: bool = True
+    ) -> ProcessingResult:
         """Trigger a document ingestion workflow from an MQ message.
 
         This method:
@@ -175,6 +181,13 @@ class TemporalWorkflowTrigger:
 
         Args:
             message: Raw message dictionary from MQ
+            supersede_running: When True (default), a same-id run already open
+                for this document_id is terminated and superseded (#110) --
+                correct when `message` is fresh content that should win. Pass
+                False when replaying a message that may be *stale* relative to
+                a run already in flight (e.g. a dead-letter retry, #110 blocker
+                3): a collision then raises WorkflowAlreadyStartedError instead
+                of silently discarding the newer run's work.
 
         Returns:
             ProcessingResult with success status
@@ -233,14 +246,17 @@ class TemporalWorkflowTrigger:
             workflow_id = f"ingest-{upload_message.document_id}"
 
             # Supersede a still-open prior run for this document_id instead of
-            # colliding with it (#110) -- see module comment above.
+            # colliding with it (#110) -- see module comment above. The caller
+            # decides via supersede_running whether this message's content
+            # should win a collision (default) or lose one (dead-letter retry).
             handle = await self._client.start_workflow(
                 DocumentIngestionWorkflow.run,
                 workflow_input,
                 id=workflow_id,
                 task_queue=self.settings.temporal_task_queue,
-                id_reuse_policy=_INGEST_ID_REUSE_POLICY,
-                id_conflict_policy=_INGEST_ID_CONFLICT_POLICY,
+                id_conflict_policy=(
+                    _SUPERSEDE_CONFLICT_POLICY if supersede_running else _REJECT_CONFLICT_POLICY
+                ),
             )
 
             logger.info(
@@ -289,7 +305,9 @@ class TemporalWorkflowTrigger:
                 error=str(e),
             )
 
-    async def trigger_workflow_async(self, message: dict) -> str:
+    async def trigger_workflow_async(
+        self, message: dict, *, supersede_running: bool = True
+    ) -> str:
         """Trigger a workflow without waiting for completion.
 
         This method starts a workflow and returns immediately with the
@@ -297,6 +315,18 @@ class TemporalWorkflowTrigger:
 
         Args:
             message: Raw message dictionary from Pub/Sub
+            supersede_running: When True (default), a same-id run already open
+                for this document_id is terminated and superseded (#110) --
+                correct for the MQ upload/refresh path this method normally
+                serves, where `message` is always fresh content that should
+                win. Pass False when `message` may be *stale* relative to a
+                run already in flight -- e.g. dead-letter retry
+                (`POST /dead-letter/{id}/retry`, src/api/app.py): replaying an
+                old failed payload must never silently clobber a healthy,
+                newer run for the same document (#110 blocker 3). With False,
+                a collision raises WorkflowAlreadyStartedError as before this
+                fix, so the caller's existing handling (reset to pending,
+                surface an error) still applies unchanged.
 
         Returns:
             Workflow ID for tracking
@@ -365,13 +395,18 @@ class TemporalWorkflowTrigger:
         # exception in this method) also propagates for MQ redelivery -- but
         # every redelivery hits the same collision until the stale run closes
         # on its own, stalling the caller for however long that takes.
+        #
+        # supersede_running=False (dead-letter retry) keeps the original
+        # raise-on-collision behavior so a stale replay can't silently
+        # terminate a healthy newer run (#110 blocker 3).
         await self._client.start_workflow(
             DocumentIngestionWorkflow.run,
             workflow_input,
             id=workflow_id,
             task_queue=self.settings.temporal_task_queue,
-            id_reuse_policy=_INGEST_ID_REUSE_POLICY,
-            id_conflict_policy=_INGEST_ID_CONFLICT_POLICY,
+            id_conflict_policy=(
+                _SUPERSEDE_CONFLICT_POLICY if supersede_running else _REJECT_CONFLICT_POLICY
+            ),
         )
 
         # Record admission latency: MQ-receive → Temporal-accepted.
