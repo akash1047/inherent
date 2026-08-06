@@ -124,6 +124,74 @@ class TestRegistryShape:
                 assert ext not in seen, f"extension '{ext}' claimed by multiple specs"
                 seen.add(ext)
 
+    def test_registry_is_hashable(self):
+        """#197 review follow-up: `mime_type_by_extension` (a NEW field, #197)
+        must not break this `@dataclass(frozen=True)`'s own contract. Every
+        other field is a tuple/frozenset/str/bytes/bool/int specifically so a
+        `FileTypeSpec` stays hashable -- a plain `dict` field would silently
+        make `hash(spec)` and `set(FILE_TYPE_REGISTRY)` raise `TypeError:
+        unhashable type: 'dict'` the moment anything (a future caller,
+        de-duplication, a cache key) hashes a spec. Nothing in this module
+        hashes a spec today, which is exactly why this needs its own pin
+        rather than relying on an existing call site to catch a regression."""
+        for spec in FILE_TYPE_REGISTRY:
+            hash(spec)  # must not raise
+        assert len(set(FILE_TYPE_REGISTRY)) == len(FILE_TYPE_REGISTRY)
+
+    def test_mime_type_by_extension_keys_are_a_subset_of_the_specs_own_extensions(self):
+        """#197 review follow-up, generalized across the whole registry (not
+        just "code"): every extension named in a spec's OWN
+        `mime_type_by_extension` override must be one of that SAME spec's
+        `extensions` -- an override naming an extension the spec doesn't
+        even declare is dead, unreachable configuration (`get_spec_for_extension`
+        would never resolve THIS spec for that extension in the first
+        place)."""
+        for spec in FILE_TYPE_REGISTRY:
+            if spec.mime_type_by_extension is None:
+                continue
+            for extension, _mime in spec.mime_type_by_extension:
+                assert extension in spec.extensions, (
+                    f"{spec.key}'s mime_type_by_extension names '{extension}', "
+                    f"which is not in its own extensions {spec.extensions}"
+                )
+
+    def test_mime_type_by_extension_values_are_members_of_the_specs_own_mime_types(self):
+        """#197 review follow-up: every MIME an override resolves to must be
+        a member of that SAME spec's `mime_types` -- otherwise the default
+        `_default_upload_content_type` picks for an omitted `content_type`
+        (`mcp_server/server.py`) could resolve to a value that then fails
+        `content_type not in SUPPORTED_TEXT_MIME_TYPES`
+        (`mcp_server/server.py`), hard-rejecting an upload of a format this
+        registry is supposed to accept -- silently, since nothing else in
+        this suite cross-checks the override map against `mime_types`."""
+        for spec in FILE_TYPE_REGISTRY:
+            if spec.mime_type_by_extension is None:
+                continue
+            for extension, mime in spec.mime_type_by_extension:
+                assert mime in spec.mime_types, (
+                    f"{spec.key}'s mime_type_by_extension['{extension}'] = '{mime}', "
+                    f"which is not among its own mime_types {spec.mime_types}"
+                )
+
+    def test_every_spec_extension_covered_by_mime_type_by_extension_when_present(self):
+        """#197 review follow-up (moved from TestMimeTypeForExtension, made
+        registry-wide): whenever a spec DOES define an override map, it must
+        cover EVERY extension the spec declares -- an extension missing from
+        the map silently falls back to `mime_types[0]` (`mime_type_for_extension`'s
+        documented, deliberate degradation for a spec that has no override
+        at all), quietly reintroducing #197 for just that one uncovered
+        extension on a spec that otherwise opted into per-extension
+        resolution."""
+        for spec in FILE_TYPE_REGISTRY:
+            if spec.mime_type_by_extension is None:
+                continue
+            covered = {extension for extension, _mime in spec.mime_type_by_extension}
+            for extension in spec.extensions:
+                assert extension in covered, (
+                    f"{spec.key}'s mime_type_by_extension has no entry for "
+                    f"'{extension}', one of its own declared extensions"
+                )
+
 
 # ---------------------------------------------------------------------------
 # Lookups
@@ -500,29 +568,6 @@ class TestMimeTypeForExtension:
         assert mime_type_for_extension(spec, ".go") == "text/x-go"
         assert mime_type_for_extension(spec, ".go") != "text/x-python"
 
-    def test_every_code_extension_has_an_override(self):
-        """The override map must cover every extension the spec declares --
-        a future extension added to `extensions` without a matching
-        `mime_type_by_extension` entry would silently fall back to
-        `mime_types[0]`, quietly reintroducing #197 for just that one new
-        extension."""
-        spec = get_spec_by_key("code")
-        assert spec.mime_type_by_extension is not None
-        for extension in spec.extensions:
-            assert extension in spec.mime_type_by_extension, (
-                f"{extension} has no mime_type_by_extension override"
-            )
-
-    def test_every_override_value_is_itself_an_accepted_alias(self):
-        """Every resolved MIME must still be one of the spec's own declared
-        `mime_types` -- the override narrows WHICH alias is canonical for a
-        given extension, it must never invent a value REST/MCP validation
-        would then reject if the caller declared it explicitly."""
-        spec = get_spec_by_key("code")
-        for extension in spec.extensions:
-            resolved = mime_type_for_extension(spec, extension)
-            assert resolved in spec.mime_types
-
     def test_extension_without_leading_dot_is_tolerated(self):
         """Matches `get_spec_for_extension`'s own with-or-without-dot
         tolerance."""
@@ -547,8 +592,11 @@ class TestMimeTypeForExtension:
         upload path."""
         spec = get_spec_by_key("code")
         assert spec.mime_type_by_extension is not None
-        trimmed = dict(spec.mime_type_by_extension)
-        trimmed.pop(".py")
+        # Drop the ".py" pair -- mime_type_by_extension is a tuple of pairs
+        # (see its docstring for why: hashable/immutable, matching every
+        # other field on this frozen dataclass), so "trimming" it means
+        # filtering the tuple, not popping a dict key.
+        trimmed = tuple(pair for pair in spec.mime_type_by_extension if pair[0] != ".py")
         stub = FileTypeSpec(
             key="code-stub",
             mime_types=spec.mime_types,

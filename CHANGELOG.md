@@ -339,17 +339,34 @@ All notable changes to Inherent are documented here. The format follows
 - **PDF and JSON extractors retried deterministic (unfixable) failures 3x
   (#195).** `_extract_pdf_text`/`_extract_json_text`
   (`services/inh-ingestion-svc/src/temporal/activities/extract.py`) left
-  `pypdf.PdfReader`/page iteration and `json.loads` completely unwrapped — a
+  `pypdf.PdfReader()` construction and `json.loads` completely unwrapped — a
   corrupt/truncated/password-protected PDF or malformed JSON upload raised
   the library's raw exception directly, and Temporal's default 3-attempt
   `RetryPolicy` retried it 3x before giving up on an outcome already known
   at attempt 1 (the same defect the #118/#119 review fixed for XLSX/PPTX/
   DOCX). Both now raise a non-retryable `ApplicationError` naming the likely
-  cause (corrupt/truncated/password-protected/wrong format), never leaking
-  the raw library exception into the document's `error_message` /
-  dead-letter row. Pattern sweep found the same defect, unfixed, in EPUB,
-  RTF, ODT, and SRT/WebVTT extraction — filed separately as #206 (out of
-  this issue's scope).
+  cause (corrupt/truncated/password-protected/wrong format). PDF's wrap is
+  scoped to ONLY `PdfReader()` construction — matching `_extract_xlsx_text`'s
+  `load_workbook`-only precedent — so a `MemoryError` from a pathological
+  PDF during page iteration stays retryable (a load-dependent condition, not
+  a property of the bytes) instead of being permanently dead-lettered.
+  Review follow-up: `DocumentIngestionWorkflow.run`
+  (`services/inh-ingestion-svc/src/temporal/workflows/document_ingestion.py`)
+  interpolated `str(e)` on the Temporal `ActivityError` wrapping every
+  activity failure — `ActivityError`'s own message is always the generic,
+  hardcoded `"Activity task failed"`; the real cause lives on `.cause` (the
+  same trap `chunk_edit.py` already documents and works around). Every
+  extraction failure's `error_message`, dead-letter row, and completion
+  event read `"Activity task failed"` regardless of this fix, and
+  `_classify_error("Activity task failed")` matches none of its keywords —
+  classifying as `"unknown"` and never surfacing via
+  `GET /dead-letter?error_type=extraction_failed`. Now uses
+  `str(getattr(e, "cause", None) or e)` at all four sites, so the real cause
+  (this fix's non-retryable `ApplicationError`, or any other activity
+  failure) actually reaches the document's `error_message` and classifies
+  correctly. Pattern sweep found the same unwrapped-extractor defect,
+  unfixed, in EPUB, RTF, ODT, and SRT/WebVTT extraction — filed separately
+  as #206 (out of this issue's scope).
 - **MCP upload labelled every source-code file `text/x-python` when
   `content_type` was omitted (#197).** `_default_upload_content_type`
   (`services/inh-public-api-svc/src/mcp_server/server.py`) took

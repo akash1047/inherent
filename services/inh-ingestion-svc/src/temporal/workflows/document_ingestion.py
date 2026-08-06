@@ -605,7 +605,26 @@ class DocumentIngestionWorkflow:
             self._current_step = "failed"
             processing_time_ms = int((workflow.now() - start_time).total_seconds() * 1000)
 
-            workflow.logger.error(f"Workflow failed: {str(e)}")
+            # `workflow.execute_activity` wraps the activity's real exception
+            # in a Temporal `ActivityError` whose OWN message is always the
+            # generic, hardcoded "Activity task failed" -- the SDK puts the
+            # actual cause (e.g. the `ApplicationError` `_extract_pdf_text`
+            # raises, or the `ApplicationError` type name/message any other
+            # activity raises) on `.cause`. Interpolating `e` directly (as
+            # every site below originally did) throws away all diagnostic
+            # content: the document's `error_message`, the dead-letter row,
+            # the completion event, and the workflow result would all read
+            # "Activity task failed" for every failure, indistinguishable
+            # from each other -- and `_classify_error` below matches none of
+            # its keywords against that generic string, so every one of
+            # these failures classified as "unknown" and never surfaced via
+            # `GET /dead-letter?error_type=extraction_failed` (etc). Same
+            # defect, same fix as `chunk_edit.py`'s `cause_message` (see that
+            # module's comment for the fuller trap explanation) -- this
+            # workflow never got the equivalent treatment.
+            cause_message = str(getattr(e, "cause", None) or e)
+
+            workflow.logger.error(f"Workflow failed: {cause_message}")
 
             # Best-effort: mark the document as failed so it isn't stuck
             # in 'processing'. A status-write failure must not mask the
@@ -615,7 +634,7 @@ class DocumentIngestionWorkflow:
                 workspace_id=input.workspace_id,
                 status="failed",
                 workflow_run_id=workflow_run_id,
-                error_message=str(e),
+                error_message=cause_message,
             )
 
             # Best-effort: record the terminal failure in the dead-letter table
@@ -624,21 +643,21 @@ class DocumentIngestionWorkflow:
             await self._record_dead_letter_best_effort(
                 input=input,
                 workflow_run_id=workflow_run_id,
-                error_message=str(e),
+                error_message=cause_message,
             )
 
             # Tell the platform the document failed (#88).
             await self._publish_completion_best_effort(
                 input,
                 success=False,
-                error=str(e),
+                error=cause_message,
                 processing_time_ms=processing_time_ms,
             )
 
             return WorkflowResult(
                 document_id=input.document_id,
                 success=False,
-                error=str(e),
+                error=cause_message,
                 processing_time_ms=processing_time_ms,
             )
 

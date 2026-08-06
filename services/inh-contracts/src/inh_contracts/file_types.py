@@ -203,9 +203,23 @@ class FileTypeSpec:
     # q.sql, s.sh, x.rs all mislabelled identically). None (the default,
     # every spec but "code") means "mime_types[0] IS the answer for every
     # extension this spec declares" -- see `mime_type_for_extension` below,
-    # the one place this field is consulted. Keys are lowercased extensions
-    # WITH the leading dot (e.g. ".go"), matching `extensions` above.
-    mime_type_by_extension: dict[str, str] | None = None
+    # the one place this field is consulted.
+    #
+    # A tuple of (extension, mime) pairs -- NOT a `dict` (review follow-up:
+    # a plain `dict` field breaks this `@dataclass(frozen=True)`'s own
+    # contract two ways at once: `hash(spec)` / `set(FILE_TYPE_REGISTRY)`
+    # raise `TypeError: unhashable type: 'dict'` the moment anything hashes
+    # a spec, and `spec.mime_type_by_extension['.py'] = 'x'` mutates the
+    # process-global registry despite `frozen=True`, since freezing a
+    # dataclass only blocks reassigning its OWN attributes, not mutating a
+    # mutable object one of them points to. `MappingProxyType` fixes the
+    # second problem but not the first -- a proxy of a dict is itself
+    # unhashable. A tuple of pairs is both immutable and hashable, matching
+    # every other field on this class -- see `mime_type_for_extension`'s
+    # linear scan, the only place this is read). Keys are lowercased
+    # extensions WITH the leading dot (e.g. ".go"), matching `extensions`
+    # above.
+    mime_type_by_extension: tuple[tuple[str, str], ...] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -555,29 +569,29 @@ FILE_TYPE_REGISTRY: tuple[FileTypeSpec, ...] = (
         # "canonical" for a given extension when the caller doesn't declare
         # one, replacing the old `mime_types[0]` guess that answered
         # "text/x-python" for every single one of them.
-        mime_type_by_extension={
-            ".py": "text/x-python",
-            ".js": "text/javascript",
-            ".ts": "application/typescript",
-            ".tsx": "application/typescript",
-            ".jsx": "text/javascript",
-            ".go": "text/x-go",
-            ".java": "text/x-java-source",
-            ".rs": "text/x-rustsrc",
-            ".c": "text/x-csrc",
-            ".h": "text/x-chdr",
-            ".cpp": "text/x-c++src",
-            ".cs": "text/x-csharp",
-            ".rb": "text/x-ruby",
-            ".php": "text/x-php",
-            ".swift": "text/x-swift",
-            ".kt": "text/x-kotlin",
-            ".scala": "text/x-scala",
-            ".sh": "application/x-sh",
-            ".sql": "application/sql",
-            ".r": "text/x-r-source",
-            ".lua": "text/x-lua",
-        },
+        mime_type_by_extension=(
+            (".py", "text/x-python"),
+            (".js", "text/javascript"),
+            (".ts", "application/typescript"),
+            (".tsx", "application/typescript"),
+            (".jsx", "text/javascript"),
+            (".go", "text/x-go"),
+            (".java", "text/x-java-source"),
+            (".rs", "text/x-rustsrc"),
+            (".c", "text/x-csrc"),
+            (".h", "text/x-chdr"),
+            (".cpp", "text/x-c++src"),
+            (".cs", "text/x-csharp"),
+            (".rb", "text/x-ruby"),
+            (".php", "text/x-php"),
+            (".swift", "text/x-swift"),
+            (".kt", "text/x-kotlin"),
+            (".scala", "text/x-scala"),
+            (".sh", "application/x-sh"),
+            (".sql", "application/sql"),
+            (".r", "text/x-r-source"),
+            (".lua", "text/x-lua"),
+        ),
     ),
     # -- #127: transcripts (SRT, WebVTT) ----------------------------------
     # Cue numbers and raw per-cue timestamp lines are stripped; cue text is
@@ -745,9 +759,14 @@ def mime_type_for_extension(spec: FileTypeSpec, extension: str) -> str:
     normalized = extension if extension.startswith(".") else f".{extension}"
     normalized = normalized.strip().lower()
     if spec.mime_type_by_extension is not None:
-        override = spec.mime_type_by_extension.get(normalized)
-        if override is not None:
-            return override
+        # A tuple of (extension, mime) pairs, not a dict (see the field's
+        # docstring on FileTypeSpec for why) -- a linear scan over it is
+        # negligible at this size (currently 21 entries, one spec) and keeps
+        # the field itself hashable/immutable, preserving this dataclass's
+        # `frozen=True` contract.
+        for candidate_extension, mime in spec.mime_type_by_extension:
+            if candidate_extension == normalized:
+                return mime
     return spec.mime_types[0]
 
 

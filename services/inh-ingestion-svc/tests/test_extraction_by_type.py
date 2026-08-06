@@ -680,6 +680,51 @@ class TestPdfFailurePaths:
         assert "corrupt" in message
         assert "password-protected" in message
 
+    def test_memory_error_during_construction_propagates_not_wrapped(self, monkeypatch):
+        """Review follow-up: MemoryError is a load-dependent condition, not a
+        property of the input bytes -- a version of this fix that caught it
+        under a blanket `except Exception` would have reclassified it as
+        `non_retryable=True`, permanently dead-lettering a failure a retry
+        (possibly on a less-contended worker) could plausibly resolve. It
+        must propagate completely unconverted -- not even as a differently
+        worded ApplicationError."""
+        import pypdf
+
+        def _raise_memory_error(*args, **kwargs):
+            raise MemoryError("simulated: out of memory parsing xref table")
+
+        monkeypatch.setattr(pypdf, "PdfReader", _raise_memory_error)
+
+        with pytest.raises(MemoryError):
+            _extract_pdf_text(b"%PDF-1.4\nirrelevant, PdfReader is mocked")
+
+    def test_exception_during_page_iteration_propagates_not_wrapped(self, monkeypatch):
+        """Review follow-up: the try/except is scoped to ONLY `PdfReader()`
+        construction -- mirroring `_extract_xlsx_text`'s `load_workbook`-only
+        wrap (that function's own row-iteration loop is likewise NOT wrapped
+        in a broad except; only its explicit cap checks raise). A failure
+        discovered lazily during page access/`extract_text()` (e.g. a
+        per-page content-stream corruption in an otherwise structurally
+        valid PDF, which construction alone cannot detect since pypdf only
+        parses the xref/trailer eagerly) is NOT converted to a non-retryable
+        ApplicationError -- it propagates as whatever pypdf raised, retryable
+        by the default policy. Same accepted tradeoff XLSX/PPTX already make
+        for their own row/shape iteration."""
+        import pypdf
+
+        class _ExplodingReader:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            @property
+            def pages(self):
+                raise pypdf.errors.PdfReadError("simulated: corrupt content stream on page 3")
+
+        monkeypatch.setattr(pypdf, "PdfReader", _ExplodingReader)
+
+        with pytest.raises(pypdf.errors.PdfReadError):
+            _extract_pdf_text(b"%PDF-1.4\nirrelevant, PdfReader is mocked")
+
 
 class TestJsonFailurePaths:
     """#195: `_extract_json_text` called `json.loads` unwrapped -- malformed
