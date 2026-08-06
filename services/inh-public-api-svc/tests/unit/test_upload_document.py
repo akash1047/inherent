@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from httpx import ASGITransport, AsyncClient
+from inh_contracts.file_types import all_mime_types, get_spec_for_mime
 
 from src.main import create_app
 from src.models.api_key import APIKeyInfo
@@ -143,13 +144,37 @@ async def client(app):
 # Helper to build multipart file payload
 # ---------------------------------------------------------------------------
 
+# Content-type "application/pdf" is magic-byte sniffed at intake (#117): the
+# uploaded bytes must start with the PDF signature or intake_document now
+# rejects it as a mismatch BEFORE reaching storage/dedup/MQ. Most tests below
+# only care about the generic upload pipeline (not real PDF parsing), so this
+# default is PDF-signature-prefixed placeholder content rather than arbitrary
+# bytes, keeping every existing `_file_payload()` no-args call passing the
+# sniff exactly like it passed the old (no-sniffing) validation.
+_PDF_BYTES = b"%PDF-1.4\nhello world"
+
 
 def _file_payload(
-    content: bytes = b"hello world",
+    content: bytes = _PDF_BYTES,
     filename: str = "test.pdf",
     content_type: str = "application/pdf",
 ):
     return {"file": (filename, io.BytesIO(content), content_type)}
+
+
+def _content_for_mime(mime: str) -> bytes:
+    """Bytes that pass the #117 magic-byte sniff for `mime`.
+
+    Prefixed with the registry's own signature for `mime` (if it has one) so
+    this helper -- and TestUploadAllowedMimeTypes, which parametrizes over
+    EVERY registered MIME type -- can never drift from the sniffing rule it
+    exercises: a binary type's placeholder content must start with that
+    type's real magic bytes, or intake now rejects it as mismatched before
+    this test gets to assert 201.
+    """
+    spec = get_spec_for_mime(mime)
+    magic = spec.magic if spec and spec.magic else b""
+    return magic + b"sample content for upload test"
 
 
 # ---------------------------------------------------------------------------
@@ -178,7 +203,7 @@ class TestUploadDocumentSuccess:
         assert data["name"] == "test.pdf"
         assert data["workspace_id"] == "test-workspace-id"
         assert data["mime_type"] == "application/pdf"
-        assert data["size_bytes"] == len(b"hello world")
+        assert data["size_bytes"] == len(_PDF_BYTES)
         assert data["status"] == "pending"
         assert "document_id" in data
         assert "storage_url" in data
@@ -418,6 +443,84 @@ class TestUploadDocumentValidation:
         application.dependency_overrides.clear()
 
 
+class TestUploadMagicByteSniffing:
+    """#117: content-type is client-supplied and, before this, was never
+    checked against the actual bytes. Exercised through the real HTTP route
+    (not just the service function) so the REST failure path itself -- 400,
+    no partial state -- is pinned end to end."""
+
+    async def test_png_bytes_declared_as_text_plain_rejected(
+        self, write_key, mock_db, mock_storage, mock_mq
+    ):
+        """The #117 acceptance-criteria scenario verbatim."""
+        application = create_app()
+        application.dependency_overrides[get_api_key_info] = lambda: write_key
+        application.dependency_overrides[get_write_permission] = lambda: write_key
+        application.dependency_overrides[resolve_workspace_write] = lambda: ResolvedAuth(
+            key_info=write_key, workspace_id=write_key.workspace_id
+        )
+        application.dependency_overrides[get_database] = lambda: mock_db
+
+        with (
+            patch.object(document_intake, "get_storage_service", return_value=mock_storage),
+            patch.object(
+                document_intake,
+                "get_mq_service",
+                new_callable=AsyncMock,
+                return_value=mock_mq,
+            ),
+        ):
+            transport = ASGITransport(app=application)
+            async with AsyncClient(transport=transport, base_url="http://test") as ac:
+                response = await ac.post(
+                    "/v1/documents",
+                    files=_file_payload(
+                        content=b"\x89PNG\r\n\x1a\n fake png bytes",
+                        filename="scan.png",
+                        content_type="text/plain",
+                    ),
+                    headers={"X-API-Key": "ink_test_key"},
+                )
+
+        assert response.status_code == 400
+        # No partial state: nothing was stored or persisted for a rejected upload.
+        mock_storage.upload_file.assert_not_awaited()
+        mock_db.create_or_reset_pending_document.assert_not_awaited()
+        application.dependency_overrides.clear()
+
+    async def test_pdf_declared_but_bytes_are_not_pdf_rejected(
+        self, write_key, mock_db, mock_storage, mock_mq
+    ):
+        application = create_app()
+        application.dependency_overrides[get_api_key_info] = lambda: write_key
+        application.dependency_overrides[get_write_permission] = lambda: write_key
+        application.dependency_overrides[resolve_workspace_write] = lambda: ResolvedAuth(
+            key_info=write_key, workspace_id=write_key.workspace_id
+        )
+        application.dependency_overrides[get_database] = lambda: mock_db
+
+        with (
+            patch.object(document_intake, "get_storage_service", return_value=mock_storage),
+            patch.object(
+                document_intake,
+                "get_mq_service",
+                new_callable=AsyncMock,
+                return_value=mock_mq,
+            ),
+        ):
+            transport = ASGITransport(app=application)
+            async with AsyncClient(transport=transport, base_url="http://test") as ac:
+                response = await ac.post(
+                    "/v1/documents",
+                    files=_file_payload(content=b"not really a pdf at all"),
+                    headers={"X-API-Key": "ink_test_key"},
+                )
+
+        assert response.status_code == 400
+        mock_storage.upload_file.assert_not_awaited()
+        application.dependency_overrides.clear()
+
+
 class TestUploadDocumentAuth:
     """Auth-related tests for upload endpoint."""
 
@@ -525,20 +628,17 @@ class TestUploadDocumentServiceFailures:
 
 
 class TestUploadAllowedMimeTypes:
-    """Verify each allowed MIME type is accepted."""
+    """Verify each allowed MIME type is accepted.
 
-    @pytest.mark.parametrize(
-        "mime",
-        [
-            "text/plain",
-            "text/markdown",
-            "text/csv",
-            "text/html",
-            "application/pdf",
-            "application/json",
-            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        ],
-    )
+    Parametrized over ``all_mime_types()`` -- the FILE_TYPE_REGISTRY-derived
+    list (#117) -- instead of a hand-copied literal list. Before #117 this
+    literal list had silently drifted from ALLOWED_MIME_TYPES (it was
+    missing ``image/png``, so PNG's upload path was never actually
+    exercised by "verify every allowed type is accepted"); deriving from the
+    registry means a type can no longer be silently skipped here.
+    """
+
+    @pytest.mark.parametrize("mime", all_mime_types())
     async def test_allowed_mime_types_accepted(
         self, mime, write_key, mock_db, mock_storage, mock_mq
     ):
@@ -563,7 +663,13 @@ class TestUploadAllowedMimeTypes:
             async with AsyncClient(transport=transport, base_url="http://test") as ac:
                 response = await ac.post(
                     "/v1/documents",
-                    files=_file_payload(content_type=mime),
+                    # Extensionless filename (#117): this test is purely about
+                    # "is this MIME type accepted", independent of filename --
+                    # the default "test.pdf" filename would trip the new
+                    # extension-consistency check for every non-PDF mime here.
+                    files=_file_payload(
+                        content=_content_for_mime(mime), filename="upload", content_type=mime
+                    ),
                     headers={"X-API-Key": "ink_test_key"},
                 )
 
@@ -633,7 +739,7 @@ class TestUploadPersistsPendingRow:
         assert kwargs["user_id"] == "test-user-id"
         assert kwargs["original_filename"] == "test.pdf"
         assert kwargs["content_type"] == "application/pdf"
-        assert kwargs["size_bytes"] == len(b"hello world")
+        assert kwargs["size_bytes"] == len(_PDF_BYTES)
         assert kwargs["storage_backend"] == "s3"
         assert kwargs["document_id"] == response.json()["document_id"]
 
@@ -869,12 +975,12 @@ class TestUploadContentDedup:
 
         response = await client.post(
             "/v1/documents",
-            files=_file_payload(content=b"hello world"),
+            files=_file_payload(),
             headers={"X-API-Key": "ink_test_key"},
         )
         assert response.status_code == 201
         kwargs = mock_db.create_or_reset_pending_document.call_args.kwargs
-        assert kwargs["content_hash"] == hashlib.sha256(b"hello world").hexdigest()
+        assert kwargs["content_hash"] == hashlib.sha256(_PDF_BYTES).hexdigest()
 
     async def test_content_hash_checked_before_filename(self, client, mock_db):
         """Content-hash dedup is consulted first; filename lookup is the fallback."""
@@ -929,7 +1035,14 @@ class TestUploadContentDedup:
             async with AsyncClient(transport=transport, base_url="http://test") as ac:
                 response = await ac.post(
                     "/v1/documents",
-                    files=_file_payload(content=b"verbatim", filename="guide-copy.md"),
+                    files=_file_payload(
+                        content=b"verbatim",
+                        filename="guide-copy.md",
+                        # text/markdown, matching the .md filename/text content
+                        # -- content_type has no sniff signature to satisfy, so
+                        # this simply keeps the test's own metadata consistent.
+                        content_type="text/markdown",
+                    ),
                     headers={"X-API-Key": "ink_test_key"},
                 )
 
@@ -994,7 +1107,11 @@ class TestUploadContentDedup:
                 for content, name in docs:
                     resp = await ac.post(
                         "/v1/documents",
-                        files=_file_payload(content=content, filename=name),
+                        # text/markdown, matching the .md filenames/text content
+                        # (see the guide-copy.md test above for why).
+                        files=_file_payload(
+                            content=content, filename=name, content_type="text/markdown"
+                        ),
                         headers={"X-API-Key": "ink_test_key"},
                     )
                     assert resp.status_code == 201
@@ -1060,7 +1177,10 @@ class TestUploadContentDedup:
                 for name in names:
                     resp = await ac.post(
                         "/v1/documents",
-                        files=_file_payload(content=body, filename=name),
+                        # text/markdown, matching the .md filenames/text content.
+                        files=_file_payload(
+                            content=body, filename=name, content_type="text/markdown"
+                        ),
                         headers={"X-API-Key": "ink_test_key"},
                     )
                     assert resp.status_code == 201

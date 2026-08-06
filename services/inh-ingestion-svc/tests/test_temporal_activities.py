@@ -10,6 +10,7 @@ constructing service instances directly.
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
+from temporalio.exceptions import ApplicationError
 
 from src.temporal.models import (
     ExtractTextInput,
@@ -191,7 +192,14 @@ class TestExtractTextActivity:
 
         from src.temporal.activities.extract import extract_text
 
-        with pytest.raises(RuntimeError, match="Unsupported spreadsheet"):
+        # #117: XLSX has no FILE_TYPE_REGISTRY entry, so this is now the
+        # generic "unregistered content type" hard failure (previously a
+        # spreadsheet-specific special case) -- the exact path acceptance
+        # criterion "unregistered type reaching extraction -> failed with a
+        # clear error_message" is written against. Non-retryable
+        # ApplicationError (#117 review item 13): deterministic, retrying
+        # cannot fix it.
+        with pytest.raises(ApplicationError, match="No extractor registered"):
             await extract_text(input_data)
 
         mock_staging.write_text.assert_not_called()
@@ -262,6 +270,100 @@ class TestExtractHelpers:
 # =========================================================================
 # set_document_status activity tests
 # =========================================================================
+
+
+class TestFileTypeRegistryDispatch:
+    """#117: extraction dispatch is driven by inh_contracts.FILE_TYPE_REGISTRY
+    instead of an if/elif content-type chain. Two failure modes the review
+    note calls out explicitly, both now actionable RuntimeErrors instead of
+    a silent lossy decode or a bare KeyError crash.
+    """
+
+    def test_every_registry_extractor_key_is_wired(self):
+        """Every FILE_TYPE_REGISTRY entry's `extractor` key must resolve to a
+        real function in EXTRACTORS -- a registry entry with no extractor
+        wired up is exactly the gap #117 calls out. This is the sibling-issue
+        tripwire: #118 (XLSX) etc. adding a FileTypeSpec without also adding
+        its EXTRACTORS entry fails THIS test, not a confusing prod KeyError.
+        """
+        from inh_contracts.file_types import FILE_TYPE_REGISTRY
+
+        from src.temporal.activities.extract import EXTRACTORS
+
+        missing = [spec.key for spec in FILE_TYPE_REGISTRY if spec.extractor not in EXTRACTORS]
+        assert not missing, f"FILE_TYPE_REGISTRY entries with no EXTRACTORS wiring: {missing}"
+
+    def test_unregistered_content_type_raises_actionable_error(self):
+        """A content type with no FILE_TYPE_REGISTRY entry at all fails with
+        a message naming the offending type and the supported set -- never a
+        silent decode-and-hope. Non-retryable (#117 review item 13): the
+        same content_type fails identically on every retry."""
+        from src.temporal.activities.extract import _resolve_extractor
+
+        with pytest.raises(ApplicationError, match="application/x-made-up") as exc_info:
+            _resolve_extractor("application/x-made-up")
+        assert exc_info.value.non_retryable
+
+    def test_registry_entry_with_unwired_extractor_fails_loudly(self, monkeypatch):
+        """The second failure mode: a VALID registry entry whose `extractor`
+        key has no matching EXTRACTORS function. This must never surface as
+        a bare KeyError (a confusing crash in Temporal's activity worker) --
+        it's a wiring bug, and the message must say so. Non-retryable: a
+        wiring bug cannot be fixed by retrying."""
+        import src.temporal.activities.extract as extract_module
+
+        monkeypatch.setattr(extract_module, "EXTRACTORS", {})  # simulate the gap
+
+        with pytest.raises(ApplicationError, match="wiring") as exc_info:
+            extract_module._resolve_extractor("application/pdf")
+        assert exc_info.value.non_retryable
+
+    def test_correctly_registered_type_resolves(self):
+        from src.temporal.activities.extract import _resolve_extractor
+
+        extractor = _resolve_extractor("application/pdf")
+        assert callable(extractor)
+
+
+class TestDecodeText:
+    """#117: text decode now uses charset-normalizer instead of
+    `errors="ignore"`, which silently DROPPED any byte that wasn't valid
+    UTF-8 -- data loss with no signal. These pin that bytes are never
+    silently vanished anymore.
+    """
+
+    def test_valid_utf8_decodes_unchanged(self):
+        from src.temporal.activities.extract import _decode_text
+
+        assert _decode_text(b"Hello, world!") == "Hello, world!"
+
+    def test_embedded_nul_bytes_preserved(self):
+        """Regression guard: strict UTF-8 (tried first) must keep decoding
+        NUL-containing-but-otherwise-valid-UTF-8 content correctly, so the
+        activity's own downstream NUL-stripping (#84) still has literal
+        \\x00 characters to find and strip."""
+        from src.temporal.activities.extract import _decode_text
+
+        assert _decode_text(b"Hello\x00 world\x00!") == "Hello\x00 world\x00!"
+
+    def test_non_utf8_bytes_never_silently_dropped(self):
+        """The exact regression #117 fixes: compare directly against what
+        the OLD `errors="ignore"` behavior produced. 0xE9 alone is not valid
+        UTF-8 (a continuation byte with no lead byte); `errors="ignore"`
+        silently deleted it. `_decode_text` must not reproduce that byte
+        loss -- it either decodes the byte via charset detection or replaces
+        it with a visible marker, but the surrounding text is never mangled
+        or shortened by a vanished byte."""
+        from src.temporal.activities.extract import _decode_text
+
+        raw = b"caf\xe9 report"
+        silently_dropped = raw.decode("utf-8", errors="ignore")
+        assert silently_dropped == "caf report"  # the old, lossy behavior
+
+        result = _decode_text(raw)
+        assert result != silently_dropped
+        assert "caf" in result
+        assert "report" in result
 
 
 class TestSetDocumentStatusActivity:

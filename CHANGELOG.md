@@ -24,6 +24,23 @@ All notable changes to Inherent are documented here. The format follows
   publisher of this event) always sets `"source": "public-api"`. Memo only —
   no namespace search-attribute registration required; workflow input itself
   is untouched.
+- **File-type support registry — single contract for validation, sniffing,
+  extraction, and docs (#117).** Adding a supported file type used to require
+  coordinated edits across 5+ places (`ALLOWED_MIME_TYPES` in
+  `inh-public-api-svc`, the MCP tool's own text-type subset, ingestion's
+  extraction if/elif chain, three docs pages, and two test files), with
+  nothing enforcing agreement between them. `FILE_TYPE_REGISTRY`
+  (`services/inh-contracts/src/inh_contracts/file_types.py`, imported by both
+  services) is now the one place a type is declared — extensions, MIME
+  types, magic-byte signature, upload surfaces (REST/MCP), extraction
+  dispatch key, and a `chunking_hint` field the upcoming format-aware
+  chunker (#129) will consume. `docs/reference/file-types.md`'s
+  supported-types table is generated from the registry
+  (`scripts/generate_supported_formats.py`) and CI-verified against it
+  (`services/inh-public-api-svc/tests/unit/test_docs_sync.py`) so the table
+  can no longer silently drift from the code, closing the same drift class
+  as #9 and the registry lesson as #100. All 8 existing formats migrated
+  with no behavior change to correctly-labeled uploads.
 
 - **Retrieval-eval hard gate, baseline ratcheting, and trend history (#139).**
   Implements the "v2" items ADR 0003 deferred (run-over-run regression deltas,
@@ -161,6 +178,46 @@ All notable changes to Inherent are documented here. The format follows
   the store and status-write activities depend on the `active_run_id` /
   `active_run_claimed_at` columns existing. No configuration changes
   required.
+- **⚠️ BREAKING (API) — genuinely mislabeled uploads (byte/type or
+  filename/type contradictions) are now rejected at intake; unregistered
+  types reaching extraction hard-fail instead of silently garbling (#117).**
+  No correctly-labeled upload of any of the 8 supported types is newly
+  rejected — that was the bar an internal review held this to, catching and
+  fixing four false-positive rejections before merge (see PR discussion):
+  sibling text/* mislabeling (`README.md` sent as `text/plain`, `data.csv`
+  as `text/plain`, etc. — `text/plain` is a truthful, IANA-valid
+  Content-Type for any text file and is routinely what real clients send),
+  a PDF whose bytes start with a BOM/leading whitespace before `%PDF-`
+  (pypdf parses these fine; the sniff now scans a 1024-byte window instead
+  of requiring the signature at byte 0), and a structural bug that would
+  have made the registry reject EVERY `.docx` upload the moment a sibling
+  OOXML format (#118 XLSX) is registered (shared-signature formats are now
+  explicitly tolerated as "cannot disambiguate, allow both" rather than
+  "reject both"). What IS newly rejected: (1) bytes that contradict the
+  declared type at the binary-signature level (e.g. PNG bytes declared
+  `text/plain`, or a file declared `application/pdf` whose bytes are not a
+  PDF) — `POST /v1/documents` and the MCP `upload_document` tool (sharing
+  the same `intake_document` pipeline) now return `400 Bad Request` before
+  anything is stored, no document row, no S3 object; (2) a filename with a
+  recognized BINARY extension (`.pdf`, `.docx`, `.png`, ...) that contradicts
+  the declared type (e.g. `report.pdf` declared `text/plain`) — a
+  text-format extension never triggers this, only a binary one; (3) a
+  content type accepted at upload but missing from ingestion's extraction
+  dispatch, which fell through to `content.decode("utf-8", errors="ignore")`
+  producing empty/corrupted chunks, now fails the document with a clear
+  `error_message` instead. Also **benign widening**, not a tightening:
+  `Content-Type` matching is now case-insensitive and strips parameters
+  (`TEXT/PLAIN` and `text/plain; charset=utf-8` were both previously
+  rejected by exact string match and are now accepted as `text/plain`) —
+  same 8 supported types, just more of their real-world spellings
+  recognized. Text extraction also switched from `errors="ignore"` (which
+  silently DELETED any non-UTF-8 byte) to `charset-normalizer` encoding
+  detection. **Upgrade note**: a client uploading a file whose declared
+  type, filename, and bytes genuinely disagree with each other — previously
+  silently "working" with garbled or truncated extracted text — now gets a
+  `400` at upload or a `failed` document status instead; this is the
+  intended fix, not a regression. A client sending any consistent,
+  correctly-labeled upload of the 8 supported types is unaffected.
 
 - **Retrieval-eval baseline ratchet silently never ran (#139 follow-up).**
   `eval-baseline-ratchet` pushed its ratchet commit straight to `main`, but

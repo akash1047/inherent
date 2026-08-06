@@ -681,6 +681,19 @@ class TestListChunksTool:
         db.eval_scorecard_counts.assert_not_called()
 
 
+def test_mcp_supported_text_mime_types_matches_registry():
+    """#117: SUPPORTED_TEXT_MIME_TYPES must be exactly the registry's
+    mcp-surfaced MIME types, not a re-derived guess. Before #117 this was a
+    ``.startswith("text/")`` filter over ALLOWED_MIME_TYPES -- correct only
+    by coincidence, since nothing enforced that every text/* type was
+    actually MCP-safe or that no non-text/* type ever should be. Pinning
+    equality here means the registry's explicit `surfaces` field is the only
+    place this can be decided."""
+    from inh_contracts.file_types import mcp_mime_types
+
+    assert mcp_server.SUPPORTED_TEXT_MIME_TYPES == mcp_mime_types()
+
+
 # =========================================================================== #
 # upload_document (#87 API parity Task 3): text-only counterpart of
 # POST /v1/documents. Binary uploads stay REST-only by design — content_type
@@ -754,6 +767,50 @@ class TestUploadDocumentTool:
         assert '"notes.md"' in content[0].text
         mq.publish.assert_awaited_once()
         storage.upload_file.assert_awaited_once()
+
+    @pytest.mark.parametrize(
+        "filename,expected_content_type",
+        [
+            ("notes.txt", "text/plain"),
+            ("data.csv", "text/csv"),
+            ("page.html", "text/html"),
+            ("notes.md", "text/markdown"),
+            ("notes", "text/markdown"),  # no extension -> the historical default
+            ("notes.log", "text/markdown"),  # unrecognized extension -> default
+        ],
+    )
+    async def test_omitted_content_type_derives_from_filename_extension(
+        self, filename, expected_content_type
+    ):
+        """#117 review BLOCKER 2: the schema advertises 'content_type'
+        defaulting to text/markdown, but a flat default broke itself the
+        moment the extension-consistency check landed -- calling
+        upload_document(filename="notes.txt", ...) and omitting the optional
+        content_type (exactly as the schema invites) must NOT self-reject.
+        The default is now derived from the filename's extension, falling
+        back to text/markdown only when the extension is absent/unknown.
+        """
+        db = AsyncMock()
+        db.validate_api_key = AsyncMock(return_value=self._key())
+        db.get_user_workspace_ids = AsyncMock(return_value=["ws-1"])
+        db.get_document_id_by_content_hash = AsyncMock(return_value=None)
+        db.get_document_id_by_filename = AsyncMock(return_value=None)
+        db.create_or_reset_pending_document = AsyncMock(return_value=None)
+
+        storage = self._storage()
+        mq = self._mq()
+        p1, p2 = self._intake_patches(storage, mq)
+
+        with patch.object(mcp_server, "get_database", AsyncMock(return_value=db)), p1, p2:
+            content = await _call_tool(
+                "upload_document",
+                {"api_key": "x", "filename": filename, "content": "some content"},
+            )
+
+        assert not content[0].text.startswith("Error"), content[0].text
+        assert f'"mime_type":"{expected_content_type}"' in content[0].text or (
+            f'"mime_type": "{expected_content_type}"' in content[0].text
+        )
 
     async def test_write_permission_denied(self):
         """A key without 'write' gets the standard permission error and never

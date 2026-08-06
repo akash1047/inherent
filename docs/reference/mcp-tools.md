@@ -55,6 +55,12 @@ All tools require `api_key` (string). Additional parameters below.
 | `delete_document` | `document_id` (required) | Permanently delete document + vectors + chunks + stored bytes | `DELETE /v1/documents/{id}` |
 | `refresh_stale_source` | `document_id` (required) | Re-enqueue an uploaded document to clear staleness; on MQ failure a retried best-effort compensation marks it `failed`, matching REST (see the REST reference for exhaustion behavior) | `POST /v1/documents/{id}/refresh` |
 
+The `upload_document` accepted `content_type` set is the `surfaces` field of
+the [file-type registry](file-types.md) entries that include `mcp` — see that
+page for the full list of REST-only (binary) formats. Omitting
+`content_type` defaults to the type implied by `filename`'s extension when
+recognized, falling back to `text/markdown` otherwise (#117).
+
 ## Notes
 
 - Search tools do not take `include_context` / `context_window` — use

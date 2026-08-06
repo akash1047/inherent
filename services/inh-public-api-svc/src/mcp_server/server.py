@@ -58,11 +58,12 @@ import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
+from inh_contracts.file_types import get_spec_for_extension, mcp_mime_types
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
 
-from src.config.constants import ALLOWED_MIME_TYPES, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE
+from src.config.constants import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE
 from src.models.api_key import APIKeyInfo
 from src.models.evals import FeedbackRequest
 from src.services.auth import describe_workspace_denial, get_authorized_workspace_ids
@@ -85,10 +86,14 @@ logger = get_logger(__name__)
 # A tool handler receives the already-authenticated key and the raw arguments.
 ToolHandler = Callable[["APIKeyInfo", dict], Awaitable[list[TextContent]]]
 
-# The text MIME types upload_document accepts, derived from the shared upload
-# allow-list so the MCP gate can never drift from what intake_document permits.
-# Binary types in ALLOWED_MIME_TYPES (PDF/DOCX/PNG) stay REST-only by design.
-SUPPORTED_TEXT_MIME_TYPES = tuple(sorted(t for t in ALLOWED_MIME_TYPES if t.startswith("text/")))
+# The text MIME types upload_document accepts, derived from the single
+# FILE_TYPE_REGISTRY (#117) instead of a `.startswith("text/")` guess over
+# ALLOWED_MIME_TYPES. The registry's explicit `surfaces` field is what marks
+# a type MCP-eligible, so this can never drift from intake_document's own
+# understanding of the allow-list, and a future type can be text/*-shaped
+# without being (or not being) MCP-safe without the two disagreeing.
+# Binary types (PDF/DOCX/PNG) stay REST-only by design.
+SUPPORTED_TEXT_MIME_TYPES = mcp_mime_types()
 
 
 @dataclass(frozen=True)
@@ -905,6 +910,31 @@ async def _resolve_single_workspace_for_upload(
     return owned[0], None
 
 
+def _default_upload_content_type(filename: str) -> str:
+    """The ``content_type`` ``upload_document`` uses when the caller omits
+    it, exactly as the tool schema's ``"default": "text/markdown"`` invites
+    (#117 review BLOCKER 2).
+
+    Derived from `filename`'s extension when the registry recognizes it AND
+    that type is MCP-eligible (e.g. ``notes.txt`` -> ``text/plain``,
+    ``data.csv`` -> ``text/csv``) -- falls back to ``text/markdown`` only for
+    an unrecognized or absent extension. Before this, the default was a flat
+    ``"text/markdown"`` regardless of filename, which meant the tool's own
+    documented default broke itself the moment #117's extension-consistency
+    check landed: calling ``upload_document(filename="notes.txt", ...)`` and
+    omitting the optional `content_type` -- exactly what the schema invites
+    -- got ``notes.txt`` defaulted to ``text/markdown`` and then rejected as
+    a mismatch against its own ``.txt`` extension.
+    """
+    if "." not in filename:
+        return "text/markdown"
+    extension = "." + filename.rsplit(".", 1)[-1]
+    spec = get_spec_for_extension(extension)
+    if spec is not None and "mcp" in spec.surfaces:
+        return spec.mime_types[0]
+    return "text/markdown"
+
+
 async def _handle_upload_document(key_info: APIKeyInfo, arguments: dict) -> list[TextContent]:
     """Handle upload_document: text-only counterpart of POST /v1/documents (#87).
 
@@ -918,7 +948,7 @@ async def _handle_upload_document(key_info: APIKeyInfo, arguments: dict) -> list
     """
     filename = arguments.get("filename", "")
     content = arguments.get("content", "")
-    content_type = arguments.get("content_type") or "text/markdown"
+    content_type = arguments.get("content_type") or _default_upload_content_type(filename)
 
     if not filename:
         return [TextContent(type="text", text="Error: filename is required")]

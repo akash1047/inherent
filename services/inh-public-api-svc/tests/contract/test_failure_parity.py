@@ -38,6 +38,8 @@ from src.services.auth import (
     ResolvedAuth,
     _resolve_workspace,
     resolve_workspace_read,
+    get_api_key_info,
+    get_write_permission,
     resolve_workspace_write,
 )
 from src.services.database import get_database
@@ -501,3 +503,112 @@ class TestDocumentNotFoundVsPermissionDeniedParity:
         # one's id and the strings must match exactly.
         assert foreign_result[0].text == "Error: Document 'doc-x' not found"
         assert missing_result[0].text == "Error: Document 'doc-does-not-exist' not found"
+# Upload: mislabeled content (magic-byte mismatch) -- both surfaces (#117)
+# ---------------------------------------------------------------------------
+
+
+class TestUploadContentTypeMismatchParity:
+    """#117: REST and MCP share the exact same `intake_document` pipeline, so
+    a magic-byte mismatch must reject identically on both -- no document row,
+    no S3 object, a real error surfaced to the caller. Both surfaces are
+    exercised through their real entry points (HTTP route / MCP dispatcher),
+    not by calling intake_document directly, so this pins the FULL path each
+    surface actually runs in production.
+    """
+
+    async def test_rest_and_mcp_both_reject_a_mismatched_upload_with_no_side_effects(self):
+        # --- REST: PNG bytes declared as text/plain -----------------------
+        rest_db = _mock_db()
+        rest_db.get_document_id_by_content_hash = AsyncMock(return_value=None)
+        rest_db.get_document_id_by_filename = AsyncMock(return_value=None)
+
+        rest_storage = MagicMock()
+        rest_storage.generate_key.return_value = f"{WS}/fake-uuid/scan.png"
+        rest_storage.upload_file = AsyncMock(return_value=f"{WS}/fake-uuid/scan.png")
+        rest_storage.build_storage_url.return_value = f"s3://docs/{WS}/fake-uuid/scan.png"
+        rest_storage._bucket = "docs"
+        rest_mq = AsyncMock()
+        rest_mq.publish = AsyncMock(return_value="1-0")
+
+        write_key = _write_key()
+        application = create_app()
+        application.dependency_overrides[get_api_key_info] = lambda: write_key
+        application.dependency_overrides[get_write_permission] = lambda: write_key
+        application.dependency_overrides[resolve_workspace_write] = lambda: ResolvedAuth(
+            key_info=write_key, workspace_id=WS
+        )
+        application.dependency_overrides[get_database] = lambda: rest_db
+        try:
+            with (
+                patch(
+                    "src.services.document_intake.get_storage_service",
+                    return_value=rest_storage,
+                ),
+                patch(
+                    "src.services.document_intake.get_mq_service",
+                    new_callable=AsyncMock,
+                    return_value=rest_mq,
+                ),
+            ):
+                transport = ASGITransport(app=application)
+                async with AsyncClient(transport=transport, base_url="http://test") as ac:
+                    rest_response = await ac.post(
+                        "/v1/documents",
+                        headers={"X-API-Key": "ink_test_key"},
+                        files={
+                            "file": (
+                                "scan.png",
+                                io.BytesIO(b"\x89PNG\r\n\x1a\n fake png bytes"),
+                                "text/plain",
+                            )
+                        },
+                    )
+        finally:
+            application.dependency_overrides.clear()
+
+        assert rest_response.status_code == 400
+        rest_storage.upload_file.assert_not_awaited()
+        rest_db.create_or_reset_pending_document.assert_not_awaited()
+        rest_mq.publish.assert_not_awaited()
+
+        # --- MCP: text content whose bytes match the PDF signature --------
+        # upload_document only transports text (#87 Task 3), so the only
+        # sniff failure it CAN trigger is "declared text, but the bytes
+        # match a different registered type's signature" -- exactly this.
+        mcp_db = _mock_db()
+        mcp_db.get_document_id_by_content_hash = AsyncMock(return_value=None)
+        mcp_db.get_document_id_by_filename = AsyncMock(return_value=None)
+        mcp_storage = MagicMock()
+        mcp_storage.generate_key.return_value = f"{WS}/fake-uuid/notes.md"
+        mcp_storage.upload_file = AsyncMock(return_value=f"{WS}/fake-uuid/notes.md")
+        mcp_storage.build_storage_url.return_value = f"s3://docs/{WS}/fake-uuid/notes.md"
+        mcp_storage._bucket = "docs"
+        mcp_mq = AsyncMock()
+        mcp_mq.publish = AsyncMock(return_value="1-0")
+
+        with (
+            patch(
+                "src.services.document_intake.get_storage_service",
+                return_value=mcp_storage,
+            ),
+            patch(
+                "src.services.document_intake.get_mq_service",
+                new_callable=AsyncMock,
+                return_value=mcp_mq,
+            ),
+        ):
+            mcp_result = await _call_mcp_tool(
+                "upload_document",
+                {
+                    "api_key": "ink_k",
+                    "filename": "notes.md",
+                    "content": "%PDF-1.4\nthis is text, not a real pdf",
+                    "content_type": "text/plain",
+                },
+                mcp_db,
+            )
+
+        assert "Error" in mcp_result[0].text
+        mcp_storage.upload_file.assert_not_awaited()
+        mcp_db.create_or_reset_pending_document.assert_not_awaited()
+        mcp_mq.publish.assert_not_awaited()

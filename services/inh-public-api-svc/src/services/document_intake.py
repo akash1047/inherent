@@ -12,6 +12,14 @@ import hashlib
 import uuid
 from datetime import datetime, timezone
 
+from inh_contracts.file_types import (
+    ContentTypeMismatchError,
+    ExtensionMismatchError,
+    check_extension_consistency,
+    get_spec_for_mime,
+    sniff_content_type,
+)
+
 from src.config import settings
 from src.config.constants import ALLOWED_MIME_TYPES, MAX_UPLOAD_SIZE_BYTES
 from src.core.exceptions import BadRequestError, ServiceUnavailableError
@@ -36,25 +44,47 @@ async def intake_document(
 ) -> DocumentUploadResponse:
     """Validate, dedup, store and enqueue a document for ingestion.
 
-    Mirrors (byte for byte) the former inline body of POST /v1/documents:
+    Mirrors (byte for byte) the former inline body of POST /v1/documents,
+    plus the #117 validation steps that close real validation holes -- three
+    independent signals describe an upload (declared content type, filename,
+    actual bytes), and any pairwise disagreement among them is now caught:
 
-    1. Validate ``content_type`` against ``ALLOWED_MIME_TYPES``.
-    2. Validate size (non-empty, under ``MAX_UPLOAD_SIZE_BYTES``).
-    3. Dedup: reuse an existing ``document_id`` keyed on (workspace,
+    1. Validate ``content_type`` against ``ALLOWED_MIME_TYPES`` (derived from
+       the FILE_TYPE_REGISTRY single source of truth, see constants.py).
+    2. Cross-check the filename's extension against the declared type
+       (#117). A known BINARY-format extension (e.g. ``.pdf``, ``.docx``,
+       ``.png``) registered to a DIFFERENT type than the one declared is a
+       real disagreement. A text-format extension (``.txt``/``.md``/``.csv``/
+       ``.html``/``.json``) never triggers this -- ``text/plain`` is a
+       truthful, IANA-valid Content-Type for any of those, and real clients
+       routinely send it; an unrecognized or absent extension is likewise
+       not evidence of anything. Only a genuine binary-vs-declared
+       contradiction is rejected.
+    3. Validate size (non-empty, under the type's ``max_size_bytes`` override
+       or the global ``MAX_UPLOAD_SIZE_BYTES`` default).
+    4. Sniff: verify the bytes' magic signature agrees with the declared
+       ``content_type`` (#117). Content-Type is entirely client-supplied and
+       was previously never checked against the actual bytes, so a
+       mislabeled binary (e.g. PNG bytes declared ``text/plain``) passed
+       validation and was garbled downstream instead of rejected.
+    5. Dedup: reuse an existing ``document_id`` keyed on (workspace,
        content_hash) first, then (workspace, filename) — see #75/#60.
-    4. Upload the bytes to S3.
-    5. Persist a durable ``pending`` row before enqueueing (#7).
-    6. Publish the ``document.uploaded`` MQ message; on publish failure mark
+    6. Upload the bytes to S3.
+    7. Persist a durable ``pending`` row before enqueueing (#7).
+    8. Publish the ``document.uploaded`` MQ message; on publish failure mark
        the row ``failed`` and return a ``status="failed"`` response instead of
        raising (the file IS stored, so this is not a request failure).
 
     Raises:
-        BadRequestError: unsupported content type, empty content, or content
-            over ``MAX_UPLOAD_SIZE_BYTES``.
+        BadRequestError: unsupported content type, a filename extension that
+            contradicts the declared type, empty content, content over the
+            size limit, or bytes whose magic signature contradicts the
+            declared content type (#117).
         ServiceUnavailableError: S3 upload or pending-row persistence failed.
     """
     # --- 1. Validate content type -------------------------------------------
-    if content_type not in ALLOWED_MIME_TYPES:
+    spec = get_spec_for_mime(content_type)
+    if spec is None:
         raise BadRequestError(
             detail=(
                 f"Unsupported file type '{content_type}'. "
@@ -62,21 +92,44 @@ async def intake_document(
             ),
         )
 
-    # --- 2. Validate size ----------------------------------------------------
+    # --- 2. Cross-check the filename extension against the declared type ----
+    # (#117). Independent of the byte-level sniff below: this catches a file
+    # named "report.pdf" declared as text/plain even when its bytes ARE
+    # perfectly valid plain text (so the sniff below has nothing to object
+    # to) -- the filename itself is the contradicting signal here.
+    try:
+        check_extension_consistency(filename, spec)
+    except ExtensionMismatchError as exc:
+        raise BadRequestError(detail=str(exc)) from exc
+
+    # --- 3. Validate size ----------------------------------------------------
     size_bytes = len(content_bytes)
 
     if size_bytes == 0:
         raise BadRequestError(detail="Uploaded file is empty.")
 
-    if size_bytes > MAX_UPLOAD_SIZE_BYTES:
-        max_mb = MAX_UPLOAD_SIZE_BYTES // (1024 * 1024)
+    # `is not None` (not `or`) so a hypothetical future override of exactly 0
+    # is still honored rather than silently falling back to the global cap.
+    max_size = spec.max_size_bytes if spec.max_size_bytes is not None else MAX_UPLOAD_SIZE_BYTES
+    if size_bytes > max_size:
+        max_mb = max_size // (1024 * 1024)
         raise BadRequestError(
             detail=f"File size ({size_bytes} bytes) exceeds the {max_mb} MB limit.",
         )
 
+    # --- 4. Sniff magic bytes against the declared type (#117) ---------------
+    # `spec` above already confirmed content_type is registered, so the only
+    # failure this can raise is a mismatch -- an UnknownContentTypeError here
+    # would mean step 1's own lookup was wrong, which is a contract bug, not
+    # a valid runtime outcome for a client to trigger.
+    try:
+        sniff_content_type(content_bytes, content_type)
+    except ContentTypeMismatchError as exc:
+        raise BadRequestError(detail=str(exc)) from exc
+
     content_hash = hashlib.sha256(content_bytes).hexdigest()
 
-    # --- 3. Dedup: reuse document_id rather than flood the workspace --------
+    # --- 5. Dedup: reuse document_id rather than flood the workspace --------
     # Two re-upload shapes must collapse onto an existing document_id so
     # ingestion reindexes it instead of creating a duplicate document (with
     # duplicate chunks + embeddings) that floods top-k search results (#75):
@@ -144,7 +197,7 @@ async def intake_document(
             filename=filename,
         )
 
-    # --- 4. Upload to S3 ----------------------------------------------------
+    # --- 6. Upload to S3 ----------------------------------------------------
     try:
         storage = get_storage_service()
         s3_key = storage.generate_key(workspace_id, filename)
@@ -157,7 +210,7 @@ async def intake_document(
             detail="Failed to store the uploaded file. Please try again later.",
         ) from exc
 
-    # --- 5. Persist a durable 'pending' row BEFORE enqueueing ----------------
+    # --- 7. Persist a durable 'pending' row BEFORE enqueueing ----------------
     # This makes the upload recoverable and lets GET /v1/documents/{id} return
     # the document (status='pending') immediately, instead of 404ing until
     # ingestion finishes. On re-upload of the same document_id, this resets the
@@ -188,7 +241,7 @@ async def intake_document(
             detail="Failed to record the upload. Please try again later.",
         ) from exc
 
-    # --- 6. Publish MQ message ----------------------------------------------
+    # --- 8. Publish MQ message ----------------------------------------------
     now_iso = datetime.now(timezone.utc).isoformat()
     mq_message = {
         "event_type": "document.uploaded",
@@ -255,7 +308,7 @@ async def intake_document(
             ),
         )
 
-    # --- 7. Return response --------------------------------------------------
+    # --- 9. Return response --------------------------------------------------
     logger.info(
         "Document upload accepted",
         document_id=document_id,
