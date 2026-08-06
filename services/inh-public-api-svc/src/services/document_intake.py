@@ -17,7 +17,7 @@ from inh_contracts.file_types import (
     ExtensionMismatchError,
     check_extension_consistency,
     explicitly_unsupported_message_for_mime,
-    get_spec_for_mime,
+    get_spec_for_upload,
     sniff_content_type,
 )
 
@@ -51,7 +51,18 @@ async def intake_document(
     actual bytes), and any pairwise disagreement among them is now caught:
 
     1. Validate ``content_type`` against ``ALLOWED_MIME_TYPES`` (derived from
-       the FILE_TYPE_REGISTRY single source of truth, see constants.py).
+       the FILE_TYPE_REGISTRY single source of truth, see constants.py). A
+       DELIBERATELY-unsupported format with a real replacement (legacy .doc,
+       Outlook .msg -- see ``EXPLICITLY_UNSUPPORTED``) is checked FIRST and
+       rejected with a specific, actionable message naming the replacement
+       (#124/#126) -- before falling through to the generic registry lookup.
+       A GENERIC or absent content type (``application/octet-stream``, the
+       REST route's own fallback for a missing header) additionally
+       consults `filename`'s extension via ``get_spec_for_upload`` (#122) --
+       completing the design ``FileTypeSpec.extensions`` was reserved for at
+       #117. This never widens acceptance of a SPECIFIC-but-unregistered
+       declared type -- see that function's docstring for the security
+       rationale.
     2. Cross-check the filename's extension against the declared type
        (#117). A known BINARY-format extension (e.g. ``.pdf``, ``.docx``,
        ``.png``) registered to a DIFFERENT type than the one declared is a
@@ -98,7 +109,12 @@ async def intake_document(
     if rejection_message is not None:
         raise BadRequestError(detail=rejection_message)
 
-    spec = get_spec_for_mime(content_type)
+    # `get_spec_for_upload` resolves the declared MIME type directly when
+    # it's registered (the common case, filename never inspected); it only
+    # falls back to `filename`'s extension when `content_type` is generic/
+    # absent (#122) -- see that function's docstring for why a SPECIFIC but
+    # unregistered MIME type is deliberately NOT widened by this fallback.
+    spec = get_spec_for_upload(content_type, filename)
     if spec is None:
         raise BadRequestError(
             detail=(
@@ -133,12 +149,17 @@ async def intake_document(
         )
 
     # --- 4. Sniff magic bytes against the declared type (#117) ---------------
-    # `spec` above already confirmed content_type is registered, so the only
-    # failure this can raise is a mismatch -- an UnknownContentTypeError here
-    # would mean step 1's own lookup was wrong, which is a contract bug, not
-    # a valid runtime outcome for a client to trigger.
+    # `spec` above already resolved successfully, so the only failure this
+    # can raise is a mismatch -- an UnknownContentTypeError here would mean
+    # step 1's own lookup was wrong, which is a contract bug, not a valid
+    # runtime outcome for a client to trigger. `resolved_spec=spec` (#122) is
+    # required, not optional, for a GENERIC content type (e.g.
+    # "application/octet-stream"): `sniff_content_type` re-deriving from
+    # `content_type` alone would fail to find it (that's exactly why step 1
+    # needed the extension fallback in the first place), so the already-
+    # resolved spec is threaded through instead of re-looked-up.
     try:
-        sniff_content_type(content_bytes, content_type)
+        sniff_content_type(content_bytes, content_type, resolved_spec=spec)
     except ContentTypeMismatchError as exc:
         raise BadRequestError(detail=str(exc)) from exc
 

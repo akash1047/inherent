@@ -769,6 +769,60 @@ class TestUploadDocumentTool:
         storage.upload_file.assert_awaited_once()
 
     @pytest.mark.parametrize(
+        "filename,content_type,content",
+        [
+            # #121: structured text
+            ("config.yaml", "application/yaml", "service: inherent"),
+            ("config.toml", "application/toml", 'service = "inherent"'),
+            ("config.xml", "application/xml", "<service>inherent</service>"),
+            # #122: source code
+            ("main.py", "text/x-python", "def main():\n    pass\n"),
+            # #127: subtitle transcripts
+            (
+                "talk.srt",
+                "application/x-subrip",
+                "1\n00:00:00,000 --> 00:00:03,000\nHello there.\n",
+            ),
+            (
+                "talk.vtt",
+                "text/vtt",
+                "WEBVTT\n\n00:00:00.000 --> 00:00:03.000\nHello there.\n",
+            ),
+        ],
+    )
+    async def test_new_text_family_types_accepted(self, filename, content_type, content):
+        """#121/#122/#127: all three text-family additions are `rest+mcp` --
+        MCP `upload_document` must accept them, not just REST. Pins the MCP
+        half of each issue's 'MCP upload accepted' acceptance criterion."""
+        db = AsyncMock()
+        db.validate_api_key = AsyncMock(return_value=self._key())
+        db.get_user_workspace_ids = AsyncMock(return_value=["ws-1"])
+        db.get_document_id_by_content_hash = AsyncMock(return_value=None)
+        db.get_document_id_by_filename = AsyncMock(return_value=None)
+        db.create_or_reset_pending_document = AsyncMock(return_value=None)
+
+        storage = self._storage()
+        mq = self._mq()
+        p1, p2 = self._intake_patches(storage, mq)
+
+        with patch.object(mcp_server, "get_database", AsyncMock(return_value=db)), p1, p2:
+            result = await _call_tool(
+                "upload_document",
+                {
+                    "api_key": "x",
+                    "filename": filename,
+                    "content": content,
+                    "content_type": content_type,
+                },
+            )
+
+        assert not result[0].text.startswith(
+            "Error:"
+        ), f"{content_type} should be MCP-accepted, got: {result[0].text}"
+        mq.publish.assert_awaited_once()
+        storage.upload_file.assert_awaited_once()
+
+    @pytest.mark.parametrize(
         "filename,expected_content_type",
         [
             ("notes.txt", "text/plain"),
@@ -941,9 +995,17 @@ class TestUploadDocumentTool:
         db.create_or_reset_pending_document.assert_not_called()
 
     async def test_unsupported_text_content_type_rejected_at_mcp_boundary(self):
-        """A text/* subtype that is NOT in the shared allow-list (e.g. text/xml)
-        is rejected at the MCP gate with the supported-types message — not passed
-        through to intake for a confusing two-step rejection (#87 review S1)."""
+        """A text/* subtype that is NOT in the shared allow-list (e.g.
+        text/rtf) is rejected at the MCP gate with the supported-types
+        message — not passed through to intake for a confusing two-step
+        rejection (#87 review S1).
+
+        text/xml was this test's original example, but #121 registered XML
+        (`application/xml`/`text/xml`) as `rest+mcp` -- it is now a
+        legitimately MCP-eligible type (see
+        TestUploadDocumentTool::test_new_text_family_types_accepted below),
+        so it no longer demonstrates "unsupported". text/rtf remains
+        genuinely unregistered."""
         db = AsyncMock()
         db.validate_api_key = AsyncMock(return_value=self._key())
         db.get_user_workspace_ids = AsyncMock(return_value=["ws-1"])
@@ -954,9 +1016,9 @@ class TestUploadDocumentTool:
                 "upload_document",
                 {
                     "api_key": "x",
-                    "filename": "data.xml",
-                    "content": "<x/>",
-                    "content_type": "text/xml",
+                    "filename": "data.rtf",
+                    "content": "{\\rtf1 hello}",
+                    "content_type": "text/rtf",
                 },
             )
 

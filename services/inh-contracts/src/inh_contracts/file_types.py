@@ -60,7 +60,14 @@ from typing import Literal
 # Strategy family #129's format-aware chunker will branch on. A closed Literal
 # (not a free string) so a typo can't silently mint a new, unhandled hint --
 # it fails at the FileTypeSpec call site instead of at chunk time.
-ChunkingHint = Literal["prose", "tabular", "structured", "media"]
+# "code" added by #122: source files are neither prose nor tabular/structured
+# data -- a future chunker wants to split on function/class boundaries, not
+# sentence boundaries, so it needs its own hint rather than overloading
+# "structured" (configs/JSON) or "prose" (docs). Deliberate, matching the
+# Literal's own purpose (a typo mints a *rejected* value, not a silently new
+# one) -- not consumed by any chunker yet (#129 is still pending), so adding
+# it now cannot change current behavior.
+ChunkingHint = Literal["prose", "tabular", "structured", "media", "code"]
 
 # Which upload surface(s) accept a type. "mcp" additionally exposes it through
 # the MCP `upload_document` tool, which only transports inline UTF-8 TEXT (#87
@@ -110,12 +117,16 @@ class FileTypeSpec:
     mime_types: tuple[str, ...]
 
     # Filename extensions (with leading dot), e.g. (".md", ".markdown").
-    # Reserved as a fallback classifier for a generic/absent content-type
-    # (e.g. "application/octet-stream") -- not yet consulted by the current
-    # REST/MCP upload paths, which trust the declared MIME type outright, but
-    # part of the contract so a future extension-based consumer (e.g. #130's
-    # ZIP member classification) has exactly one place to look instead of
-    # re-deriving its own extension list.
+    # Consulted as a fallback classifier for a generic/absent content-type
+    # (e.g. "application/octet-stream" or no Content-Type at all) by
+    # `get_spec_for_upload` (#122) -- completing the design this field was
+    # originally reserved for (see the #117 PR). A SPECIFIC-but-unregistered
+    # declared MIME type is deliberately NOT widened by this: the fallback
+    # only fires when the content type itself carries no real information,
+    # so an over-broad extension list cannot turn every unknown text file
+    # into an accepted upload (see `get_spec_for_upload`'s docstring). Also
+    # the substrate for a future extension-based consumer (e.g. #130's ZIP
+    # member classification) to share instead of re-deriving its own list.
     extensions: tuple[str, ...]
 
     # Magic-byte signature checked at intake (see `sniff_content_type`).
@@ -410,6 +421,137 @@ FILE_TYPE_REGISTRY: tuple[FileTypeSpec, ...] = (
         extractor="odt",
         chunking_hint="prose",
     ),
+    # -- #121: structured text (YAML, TOML, XML) -------------------------
+    # Ingested as decoded text with NO parse step: malformed YAML is still
+    # searchable rather than rejecting the upload over a syntax error a
+    # human writer made (the same "never lossy, never a hard gate on
+    # correctness" philosophy `_decode_text` already applies -- see
+    # extract.py). RFC 9512 registers "application/yaml"; "text/yaml" is
+    # the long-standing de facto alias most tooling still emits.
+    FileTypeSpec(
+        key="yaml",
+        mime_types=("application/yaml", "text/yaml"),
+        extensions=(".yaml", ".yml"),
+        magic=None,
+        surfaces=frozenset({"rest", "mcp"}),
+        extractor="text_passthrough",
+        chunking_hint="structured",
+    ),
+    FileTypeSpec(
+        key="toml",
+        mime_types=("application/toml",),
+        extensions=(".toml",),
+        magic=None,
+        surfaces=frozenset({"rest", "mcp"}),
+        extractor="text_passthrough",
+        chunking_hint="structured",
+    ),
+    # XML tags are stripped via the same BeautifulSoup `html.parser` path as
+    # HTML (extractor="xml" -> `_extract_html_text` in inh-ingestion-svc) --
+    # deliberately the stdlib `html.parser` backend, not `lxml`'s XML mode:
+    # `html.parser` never resolves DTDs or external entities at all, so it
+    # has no XXE / billion-laughs entity-expansion surface on untrusted
+    # input, unlike a naive `xml.etree.ElementTree.parse`. Trade-off: it is
+    # not a strict/validating XML parser, so malformed XML degrades to
+    # best-effort text extraction instead of raising -- consistent with
+    # YAML/TOML's own "still searchable" policy above. Attribute VALUES are
+    # dropped (only element text content survives `get_text()`), same as
+    # HTML's existing attribute-stripping behavior.
+    FileTypeSpec(
+        key="xml",
+        mime_types=("application/xml", "text/xml"),
+        extensions=(".xml",),
+        magic=None,
+        surfaces=frozenset({"rest", "mcp"}),
+        extractor="xml",
+        chunking_hint="structured",
+    ),
+    # -- #122: source code -- explicit extension contract ----------------
+    # The 20-extension allowlist IS the contract (`extensions` below is the
+    # authoritative source of truth per the issue) -- `mime_types` is an
+    # accepted-alias convenience layer on top of it, not the gate: a client
+    # sending a generic/absent content type (see `get_spec_for_upload`)
+    # falls back to this list. Extraction is a plain decode (chunking_hint
+    # "code" -- see the ChunkingHint comment -- awaits #129's chunker;
+    # "plain decode until then" per the issue).
+    FileTypeSpec(
+        key="code",
+        mime_types=(
+            "text/x-python",
+            "application/javascript",
+            "text/javascript",
+            "application/typescript",
+            "text/x-go",
+            "text/x-java-source",
+            "text/x-rustsrc",
+            "text/x-csrc",
+            "text/x-chdr",
+            "text/x-c++src",
+            "text/x-csharp",
+            "text/x-ruby",
+            "text/x-php",
+            "text/x-swift",
+            "text/x-kotlin",
+            "text/x-scala",
+            "application/x-sh",
+            "text/x-sh",
+            "application/sql",
+            "text/x-sql",
+            "text/x-r-source",
+            "text/x-lua",
+        ),
+        extensions=(
+            ".py",
+            ".js",
+            ".ts",
+            ".tsx",
+            ".jsx",
+            ".go",
+            ".java",
+            ".rs",
+            ".c",
+            ".h",
+            ".cpp",
+            ".cs",
+            ".rb",
+            ".php",
+            ".swift",
+            ".kt",
+            ".scala",
+            ".sh",
+            ".sql",
+            ".r",
+            ".lua",
+        ),
+        magic=None,
+        surfaces=frozenset({"rest", "mcp"}),
+        extractor="text_passthrough",
+        chunking_hint="code",
+    ),
+    # -- #127: transcripts (SRT, WebVTT) ----------------------------------
+    # Cue numbers and raw per-cue timestamp lines are stripped; cue text is
+    # joined into prose with a coarse `[t=MM:SS]` marker reinserted every
+    # few cues so an agent can still cite roughly WHEN something was said
+    # without the sentence-level timestamp noise polluting embeddings (see
+    # `_extract_subtitle_text` in inh-ingestion-svc for the exact policy).
+    FileTypeSpec(
+        key="srt",
+        mime_types=("application/x-subrip",),
+        extensions=(".srt",),
+        magic=None,
+        surfaces=frozenset({"rest", "mcp"}),
+        extractor="srt",
+        chunking_hint="prose",
+    ),
+    FileTypeSpec(
+        key="vtt",
+        mime_types=("text/vtt",),
+        extensions=(".vtt",),
+        magic=None,
+        surfaces=frozenset({"rest", "mcp"}),
+        extractor="vtt",
+        chunking_hint="prose",
+    ),
 )
 
 
@@ -527,6 +669,65 @@ def get_spec_for_extension(extension: str) -> FileTypeSpec | None:
     return None
 
 
+# Content-Type values that carry no real type information -- the "I don't
+# know what this is" signal a client sends when it has nothing better, most
+# commonly `file.content_type or "application/octet-stream"` fallbacks in
+# inh-public-api-svc's own REST route. `get_spec_for_upload` only consults
+# the extension for THESE values, never for a specific-but-unrecognized one
+# (see that function's docstring for why this distinction is load-bearing).
+GENERIC_CONTENT_TYPES = frozenset({"application/octet-stream", ""})
+
+
+def get_spec_for_upload(content_type: str, filename: str) -> FileTypeSpec | None:
+    """Resolve the spec for an upload, consulting the filename extension as
+    a FALLBACK only when `content_type` is generic or absent (#122).
+
+    This completes the design `FileTypeSpec.extensions` was reserved for at
+    #117 ("a fallback classifier for a generic/absent content-type ... not
+    yet consulted") rather than working around it: the extension was always
+    intended to answer "what is this file" when the declared MIME type
+    can't, and this is that consultation, finally wired into the upload
+    path via `get_spec_for_upload`.
+
+    Resolution order:
+    1. `content_type` maps to a registered spec directly -> that spec wins,
+       filename is never even inspected. The common case (a client sending
+       an accurate, specific Content-Type) is unaffected by this function
+       existing at all.
+    2. `content_type` is one of `GENERIC_CONTENT_TYPES` (i.e. genuinely
+       carries no information) AND `filename`'s extension is registered ->
+       fall back to the extension's spec.
+    3. Otherwise -> None, same as `get_spec_for_mime` returning None today.
+
+    SECURITY (#122 review note): step 2 fires ONLY for a generic/absent
+    content type, never for a SPECIFIC-but-unrecognized one (e.g.
+    "application/x-something-made-up"). Falling back on any unrecognized
+    MIME type would turn every unregistered format into an accepted upload
+    the moment its filename happened to carry a known extension -- an
+    over-broad allowlist widening, not the narrow "octet-stream + a listed
+    extension is accepted" contract #122 actually asks for. A client that
+    declares a real, WRONG, specific type is still flatly rejected; only a
+    client that admits it doesn't know gets the extension consulted.
+
+    Callers that also need to sniff the bytes should pass the returned spec
+    into `sniff_content_type`'s `resolved_spec` parameter -- re-deriving a
+    spec from `content_type` alone inside that function would fail for
+    exactly the generic-content-type case this function exists to resolve.
+    """
+    spec = get_spec_for_mime(content_type)
+    if spec is not None:
+        return spec
+
+    normalized = content_type.split(";", 1)[0].strip().lower()
+    if normalized not in GENERIC_CONTENT_TYPES:
+        return None
+
+    if "." not in filename:
+        return None
+    extension = "." + filename.rsplit(".", 1)[-1]
+    return get_spec_for_extension(extension)
+
+
 def get_spec_by_key(key: str) -> FileTypeSpec | None:
     """Look up a registry entry by its short `key` (e.g. "pdf")."""
     for spec in FILE_TYPE_REGISTRY:
@@ -640,7 +841,9 @@ def _magic_families_overlap(a: bytes, b: bytes) -> bool:
     return a.startswith(b) or b.startswith(a)
 
 
-def sniff_content_type(content: bytes, declared_mime: str) -> FileTypeSpec:
+def sniff_content_type(
+    content: bytes, declared_mime: str, *, resolved_spec: FileTypeSpec | None = None
+) -> FileTypeSpec:
     """Validate that `content`'s magic bytes agree with `declared_mime` (#117).
 
     MIME type is entirely client-supplied and, before this function existed,
@@ -666,11 +869,23 @@ def sniff_content_type(content: bytes, declared_mime: str) -> FileTypeSpec:
 
     Returns the resolved ``FileTypeSpec`` for `declared_mime` on success.
 
+    Args:
+        resolved_spec: pass this when the caller already resolved a spec via
+            `get_spec_for_upload` (#122) instead of a plain
+            `get_spec_for_mime` lookup -- e.g. an ``application/octet-stream``
+            upload that resolved through the filename-extension fallback.
+            Re-deriving from `declared_mime` alone inside this function
+            would fail for exactly that case (a generic content type has no
+            direct registry entry by construction), so the already-resolved
+            spec is threaded through rather than recomputed. When omitted,
+            behavior is unchanged: `declared_mime` is looked up directly.
+
     Raises:
-        UnknownContentTypeError: `declared_mime` has no registry entry.
+        UnknownContentTypeError: `declared_mime` has no registry entry (and
+            no `resolved_spec` was supplied).
         ContentTypeMismatchError: the bytes contradict `declared_mime`.
     """
-    spec = get_spec_for_mime(declared_mime)
+    spec = resolved_spec if resolved_spec is not None else get_spec_for_mime(declared_mime)
     if spec is None:
         raise UnknownContentTypeError(declared_mime)
 

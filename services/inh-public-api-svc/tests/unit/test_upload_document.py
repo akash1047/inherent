@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from httpx import ASGITransport, AsyncClient
-from inh_contracts.file_types import all_mime_types, get_spec_for_mime
+from inh_contracts.file_types import all_mime_types, get_spec_by_key, get_spec_for_mime
 
 from src.main import create_app
 from src.models.api_key import APIKeyInfo
@@ -795,6 +795,311 @@ class TestUploadAllowedMimeTypes:
                     headers={"X-API-Key": "ink_test_key"},
                 )
 
+        assert response.status_code == 400
+        application.dependency_overrides.clear()
+
+
+class TestUploadExtensionFallback:
+    """#122: an `application/octet-stream` (or absent) Content-Type falls
+    back to the filename extension -- completing the design
+    `FileTypeSpec.extensions` was reserved for at #117. See
+    `inh_contracts.file_types.get_spec_for_upload`'s docstring for the full
+    resolution order and the security rationale for restricting this to
+    GENERIC content types only.
+    """
+
+    def _app(self, write_key, mock_db, mock_storage, mock_mq):
+        application = create_app()
+        application.dependency_overrides[get_api_key_info] = lambda: write_key
+        application.dependency_overrides[get_write_permission] = lambda: write_key
+        application.dependency_overrides[resolve_workspace_write] = lambda: ResolvedAuth(
+            key_info=write_key, workspace_id=write_key.workspace_id
+        )
+        application.dependency_overrides[get_database] = lambda: mock_db
+        return application
+
+    async def test_py_file_via_explicit_mime_alias_accepted(
+        self, write_key, mock_db, mock_storage, mock_mq
+    ):
+        """#122 acceptance criterion verbatim: 'Upload of main.py as
+        text/x-python succeeds'."""
+        application = self._app(write_key, mock_db, mock_storage, mock_mq)
+        with (
+            patch.object(document_intake, "get_storage_service", return_value=mock_storage),
+            patch.object(
+                document_intake, "get_mq_service", new_callable=AsyncMock, return_value=mock_mq
+            ),
+        ):
+            transport = ASGITransport(app=application)
+            async with AsyncClient(transport=transport, base_url="http://test") as ac:
+                response = await ac.post(
+                    "/v1/documents",
+                    files=_file_payload(
+                        content=b"def main():\n    pass\n",
+                        filename="main.py",
+                        content_type="text/x-python",
+                    ),
+                    headers={"X-API-Key": "ink_test_key"},
+                )
+        assert response.status_code == 201
+        assert response.json()["mime_type"] == "text/x-python"
+        application.dependency_overrides.clear()
+
+    async def test_py_file_via_octet_stream_extension_fallback_accepted(
+        self, write_key, mock_db, mock_storage, mock_mq
+    ):
+        """#122 acceptance criterion verbatim: 'upload as
+        application/octet-stream with .py extension succeeds via
+        fallback'."""
+        application = self._app(write_key, mock_db, mock_storage, mock_mq)
+        with (
+            patch.object(document_intake, "get_storage_service", return_value=mock_storage),
+            patch.object(
+                document_intake, "get_mq_service", new_callable=AsyncMock, return_value=mock_mq
+            ),
+        ):
+            transport = ASGITransport(app=application)
+            async with AsyncClient(transport=transport, base_url="http://test") as ac:
+                response = await ac.post(
+                    "/v1/documents",
+                    files=_file_payload(
+                        content=b"def main():\n    pass\n",
+                        filename="main.py",
+                        content_type="application/octet-stream",
+                    ),
+                    headers={"X-API-Key": "ink_test_key"},
+                )
+        assert response.status_code == 201
+        # The client-sent value is preserved verbatim in stored content_type
+        # (#122) -- the resolved 'code' spec is used only to VALIDATE the
+        # upload, never to rewrite what was declared.
+        assert response.json()["mime_type"] == "application/octet-stream"
+        application.dependency_overrides.clear()
+
+    async def test_yaml_and_xml_also_get_the_octet_stream_fallback(
+        self, write_key, mock_db, mock_storage, mock_mq
+    ):
+        """The fallback is a general registry capability (#117's reserved
+        design, completed by #122), not source-code-specific -- any
+        registered extension qualifies once the content type is generic."""
+        application = self._app(write_key, mock_db, mock_storage, mock_mq)
+        for filename, content in (("config.yaml", b"key: value\n"), ("data.xml", b"<a/>")):
+            with (
+                patch.object(document_intake, "get_storage_service", return_value=mock_storage),
+                patch.object(
+                    document_intake,
+                    "get_mq_service",
+                    new_callable=AsyncMock,
+                    return_value=mock_mq,
+                ),
+            ):
+                transport = ASGITransport(app=application)
+                async with AsyncClient(transport=transport, base_url="http://test") as ac:
+                    response = await ac.post(
+                        "/v1/documents",
+                        files=_file_payload(
+                            content=content,
+                            filename=filename,
+                            content_type="application/octet-stream",
+                        ),
+                        headers={"X-API-Key": "ink_test_key"},
+                    )
+            assert (
+                response.status_code == 201
+            ), f"{filename} should be accepted, got {response.status_code}"
+        application.dependency_overrides.clear()
+
+    async def test_binary_content_with_valid_code_extension_is_rejected(
+        self, write_key, mock_db, mock_storage, mock_mq
+    ):
+        """Failure path: a '.py' file whose BYTES are actually a PNG,
+        declared generically as application/octet-stream. The extension
+        fallback resolves a spec to validate against, but sniffing still
+        catches genuine binary content masquerading behind a text
+        extension -- the fallback is not a validation bypass."""
+        application = self._app(write_key, mock_db, mock_storage, mock_mq)
+        with (
+            patch.object(document_intake, "get_storage_service", return_value=mock_storage),
+            patch.object(
+                document_intake, "get_mq_service", new_callable=AsyncMock, return_value=mock_mq
+            ),
+        ):
+            transport = ASGITransport(app=application)
+            async with AsyncClient(transport=transport, base_url="http://test") as ac:
+                response = await ac.post(
+                    "/v1/documents",
+                    files=_file_payload(
+                        content=b"\x89PNG\r\n\x1a\n fake png bytes pretending to be code",
+                        filename="malicious.py",
+                        content_type="application/octet-stream",
+                    ),
+                    headers={"X-API-Key": "ink_test_key"},
+                )
+        assert response.status_code == 400
+        mock_storage.upload_file.assert_not_awaited()
+        mock_db.create_or_reset_pending_document.assert_not_awaited()
+        application.dependency_overrides.clear()
+
+    async def test_unrecognized_extension_via_octet_stream_still_rejected(
+        self, write_key, mock_db, mock_storage, mock_mq
+    ):
+        """The fallback must not become 'any file is accepted if the client
+        just says octet-stream' -- an extension this registry does not know
+        about is still rejected."""
+        application = self._app(write_key, mock_db, mock_storage, mock_mq)
+        with (
+            patch.object(document_intake, "get_storage_service", return_value=mock_storage),
+            patch.object(
+                document_intake, "get_mq_service", new_callable=AsyncMock, return_value=mock_mq
+            ),
+        ):
+            transport = ASGITransport(app=application)
+            async with AsyncClient(transport=transport, base_url="http://test") as ac:
+                response = await ac.post(
+                    "/v1/documents",
+                    files=_file_payload(
+                        content=b"whatever",
+                        filename="notes.xyz",
+                        content_type="application/octet-stream",
+                    ),
+                    headers={"X-API-Key": "ink_test_key"},
+                )
+        assert response.status_code == 400
+        application.dependency_overrides.clear()
+
+    async def test_specific_unregistered_mime_is_not_widened_by_extension(
+        self, write_key, mock_db, mock_storage, mock_mq
+    ):
+        """SECURITY (#122): the fallback fires ONLY for a GENERIC content
+        type. A client that declares a real, specific, but unregistered
+        MIME type must still be rejected even though the filename carries a
+        recognized extension -- otherwise the extension allowlist would
+        widen acceptance for every unknown text file, not just the narrow
+        'client admits it doesn't know' case."""
+        application = self._app(write_key, mock_db, mock_storage, mock_mq)
+        with (
+            patch.object(document_intake, "get_storage_service", return_value=mock_storage),
+            patch.object(
+                document_intake, "get_mq_service", new_callable=AsyncMock, return_value=mock_mq
+            ),
+        ):
+            transport = ASGITransport(app=application)
+            async with AsyncClient(transport=transport, base_url="http://test") as ac:
+                response = await ac.post(
+                    "/v1/documents",
+                    files=_file_payload(
+                        content=b"def main(): pass",
+                        filename="main.py",
+                        content_type="application/x-something-made-up",
+                    ),
+                    headers={"X-API-Key": "ink_test_key"},
+                )
+        assert response.status_code == 400
+        mock_storage.upload_file.assert_not_awaited()
+        application.dependency_overrides.clear()
+
+    async def test_readme_claim_every_code_extension_ingested_as_text(
+        self, write_key, mock_db, mock_storage, mock_mq
+    ):
+        """Backs the README's 'code files are ingested as text' claim with
+        an enumerated test (#122 acceptance criteria) -- every extension in
+        the registry's 'code' spec is uploadable via the octet-stream
+        fallback, not just '.py'."""
+        application = self._app(write_key, mock_db, mock_storage, mock_mq)
+        code_spec = get_spec_by_key("code")
+        for ext in code_spec.extensions:
+            with (
+                patch.object(document_intake, "get_storage_service", return_value=mock_storage),
+                patch.object(
+                    document_intake,
+                    "get_mq_service",
+                    new_callable=AsyncMock,
+                    return_value=mock_mq,
+                ),
+            ):
+                transport = ASGITransport(app=application)
+                async with AsyncClient(transport=transport, base_url="http://test") as ac:
+                    response = await ac.post(
+                        "/v1/documents",
+                        files=_file_payload(
+                            content=b"source code content for extension test",
+                            filename=f"file{ext}",
+                            content_type="application/octet-stream",
+                        ),
+                        headers={"X-API-Key": "ink_test_key"},
+                    )
+            assert (
+                response.status_code == 201
+            ), f"{ext} should be ingested as text, got {response.status_code}"
+        application.dependency_overrides.clear()
+
+
+class TestUploadStructuredTextFailurePaths:
+    """#121: failure paths specific to YAML/TOML/XML."""
+
+    async def test_png_bytes_declared_as_yaml_rejected(
+        self, write_key, mock_db, mock_storage, mock_mq
+    ):
+        """Mirrors the pre-existing text/plain magic-byte-mismatch test --
+        YAML has no signature of its own but still loses the cross-spec
+        check against a real binary signature."""
+        application = create_app()
+        application.dependency_overrides[get_api_key_info] = lambda: write_key
+        application.dependency_overrides[get_write_permission] = lambda: write_key
+        application.dependency_overrides[resolve_workspace_write] = lambda: ResolvedAuth(
+            key_info=write_key, workspace_id=write_key.workspace_id
+        )
+        application.dependency_overrides[get_database] = lambda: mock_db
+        with (
+            patch.object(document_intake, "get_storage_service", return_value=mock_storage),
+            patch.object(
+                document_intake, "get_mq_service", new_callable=AsyncMock, return_value=mock_mq
+            ),
+        ):
+            transport = ASGITransport(app=application)
+            async with AsyncClient(transport=transport, base_url="http://test") as ac:
+                response = await ac.post(
+                    "/v1/documents",
+                    files=_file_payload(
+                        content=b"\x89PNG\r\n\x1a\n fake png bytes",
+                        filename="config.yaml",
+                        content_type="application/yaml",
+                    ),
+                    headers={"X-API-Key": "ink_test_key"},
+                )
+        assert response.status_code == 400
+        mock_storage.upload_file.assert_not_awaited()
+        application.dependency_overrides.clear()
+
+    async def test_oversized_single_line_yaml_rejected(
+        self, write_key, mock_db, mock_storage, mock_mq
+    ):
+        """A structured-text type gets no size-limit exemption: a 50MB+
+        single-line (no newline-driven chunking assumptions to exploit)
+        YAML file is rejected exactly like any other oversized upload."""
+        application = create_app()
+        application.dependency_overrides[get_api_key_info] = lambda: write_key
+        application.dependency_overrides[get_write_permission] = lambda: write_key
+        application.dependency_overrides[resolve_workspace_write] = lambda: ResolvedAuth(
+            key_info=write_key, workspace_id=write_key.workspace_id
+        )
+        application.dependency_overrides[get_database] = lambda: mock_db
+        big_content = b"key: " + b"x" * (50 * 1024 * 1024 + 1)  # single line, no newlines
+        with (
+            patch.object(document_intake, "get_storage_service", return_value=mock_storage),
+            patch.object(
+                document_intake, "get_mq_service", new_callable=AsyncMock, return_value=mock_mq
+            ),
+        ):
+            transport = ASGITransport(app=application)
+            async with AsyncClient(transport=transport, base_url="http://test") as ac:
+                response = await ac.post(
+                    "/v1/documents",
+                    files=_file_payload(
+                        content=big_content, filename="huge.yaml", content_type="application/yaml"
+                    ),
+                    headers={"X-API-Key": "ink_test_key"},
+                )
         assert response.status_code == 400
         application.dependency_overrides.clear()
 

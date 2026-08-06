@@ -1,9 +1,10 @@
 """Per-file-type extraction tests against the bundled sample documents.
 
 Verifies that each end-to-end supported format (txt, md, csv, json, html, docx,
-pdf, xlsx, pptx) extracts to non-empty, readable text via the production
-extractor helpers. These run offline (no storage/staging/Temporal) by calling
-the extractor helpers directly.
+pdf, xlsx, pptx, yaml, toml, xml [#121], srt, vtt [#127]) extracts to
+non-empty, readable text via the production extractor helpers. These run
+offline (no storage/staging/Temporal) by calling the extractor helpers
+directly.
 
 XLSX (#118) and PPTX (#119) were previously hard-rejected here
 (``test_xlsx_extraction_is_rejected``, now replaced by ``test_extract_xlsx``
@@ -25,7 +26,9 @@ from src.temporal.activities.extract import (
     _extract_html_text,
     _extract_pdf_text,
     _extract_pptx_text,
+    _extract_subtitle_text,
     _extract_xlsx_text,
+    _extract_xml_text,
     _format_xlsx_cell,
 )
 
@@ -117,6 +120,49 @@ def test_extract_xlsx():
     # merge flattened to a value cell followed by unexplained blank cells).
     assert "[merged A1:D1]" in text
     assert "[merged A1:B1]" in text
+
+
+def test_extract_yaml():
+    """#121: decoded as plain text, no parse step."""
+    text = _read("sample.yaml").decode("utf-8", errors="ignore")
+    assert text.strip()
+    assert "service: inherent" in text
+
+
+def test_extract_toml():
+    """#121: decoded as plain text, no parse step."""
+    text = _read("sample.toml").decode("utf-8", errors="ignore")
+    assert text.strip()
+    assert 'name = "inherent"' in text
+
+
+def test_extract_xml():
+    """#121: tags stripped, element text kept, attribute values dropped."""
+    text = _extract_xml_text(_read("sample.xml"))
+    assert text.strip()
+    assert "Backend for turning company knowledge" in text
+    assert "<service" not in text
+    # Attribute-value policy: the `name="inherent"` attribute's VALUE does
+    # not survive tag-stripping, only element text content does.
+    assert "inherent" not in text.lower()
+
+
+def test_extract_srt():
+    """#127: cue numbers/timestamps stripped, prose + coarse markers kept."""
+    text = _extract_subtitle_text(_read("sample.srt"), "sample.srt")
+    assert "Welcome to the Inherent product walkthrough." in text
+    assert "Let's start with how documents get uploaded." in text
+    assert "-->" not in text
+    assert "[t=00:00]" in text
+
+
+def test_extract_vtt():
+    """#127: header stripped, cue numbers/timestamps stripped, prose kept."""
+    text = _extract_subtitle_text(_read("sample.vtt"), "sample.vtt")
+    assert "Welcome to the Inherent product walkthrough." in text
+    assert "Let's start with how documents get uploaded." in text
+    assert "WEBVTT" not in text
+    assert "-->" not in text
 
 
 def test_extract_pptx():
@@ -358,7 +404,9 @@ class TestXlsxFailurePaths:
         worth failing over)."""
         import src.temporal.activities.extract as extract_module
 
-        monkeypatch.setattr(extract_module, "_MAX_MERGE_SCAN_BYTES", 1)  # any real sheet exceeds this
+        monkeypatch.setattr(
+            extract_module, "_MAX_MERGE_SCAN_BYTES", 1
+        )  # any real sheet exceeds this
 
         workbook = openpyxl.Workbook()
         sheet = workbook.active
@@ -408,9 +456,7 @@ class TestXlsxFailurePaths:
         workbook = openpyxl.Workbook()
         sheet = workbook.active
         sheet.append(["Count", "DateOnly", "Stamp"])
-        sheet.append(
-            [42, datetime.date(2026, 1, 15), datetime.datetime(2026, 1, 15, 13, 30, 0)]
-        )
+        sheet.append([42, datetime.date(2026, 1, 15), datetime.datetime(2026, 1, 15, 13, 30, 0)])
         buf = io.BytesIO()
         workbook.save(buf)
 

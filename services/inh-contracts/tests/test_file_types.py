@@ -25,6 +25,7 @@ from inh_contracts.file_types import (
     get_spec_by_key,
     get_spec_for_extension,
     get_spec_for_mime,
+    get_spec_for_upload,
     mcp_mime_types,
     render_markdown_table,
     sniff_content_type,
@@ -75,14 +76,50 @@ class TestRegistryShape:
         registry entries with behavior unchanged')."""
         keys = {spec.key for spec in FILE_TYPE_REGISTRY}
         assert keys == {
-            "txt", "markdown", "csv", "html", "pdf", "json", "docx",
-            "xlsx", "pptx", "png", "eml", "epub", "rtf", "odt",
+            "txt",
+            "markdown",
+            "csv",
+            "html",
+            "pdf",
+            "json",
+            "docx",
+            "xlsx",
+            "pptx",
+            "png",
+            "eml",
+            "epub",
+            "rtf",
+            "odt",
+            "yaml",
+            "toml",
+            "xml",
+            "code",
+            "srt",
+            "vtt",
         }
 
     def test_longtail_formats_present(self):
         """#124/#125/#126: eml, epub, rtf, odt are registered."""
         keys = {spec.key for spec in FILE_TYPE_REGISTRY}
         assert {"eml", "epub", "rtf", "odt"} <= keys
+
+    def test_text_family_formats_present(self):
+        """#121 (YAML/TOML/XML), #122 (source code), #127 (SRT/WebVTT) --
+        the three text-family sibling issues that land together in one
+        workstream (see the FILE_TYPE_REGISTRY module comment)."""
+        keys = {spec.key for spec in FILE_TYPE_REGISTRY}
+        assert {"yaml", "toml", "xml", "code", "srt", "vtt"} <= keys
+
+    def test_extensions_are_globally_unique(self):
+        """Mirrors `test_mime_types_are_globally_unique` -- two specs
+        claiming the same extension would make `get_spec_for_extension`
+        (and therefore the octet-stream extension-fallback #122 relies on)
+        silently pick whichever spec happens to be registered first."""
+        seen: set[str] = set()
+        for spec in FILE_TYPE_REGISTRY:
+            for ext in spec.extensions:
+                assert ext not in seen, f"extension '{ext}' claimed by multiple specs"
+                seen.add(ext)
 
 
 # ---------------------------------------------------------------------------
@@ -125,7 +162,8 @@ class TestLookups:
         The first eight entries preserve byte-for-byte parity with the
         pre-#117 hand-maintained ALLOWED_MIME_TYPES in constants.py, so the
         400 error text's wording is unchanged by that migration; the rest are
-        the formats their own issues appended (#118, #119, #124-#126).
+        the formats their own issues appended (#118, #119, #121, #122,
+        #124-#127).
 
         This was temporarily relaxed to a prefix check while those format
         branches were in flight concurrently, purely to avoid every branch
@@ -146,11 +184,45 @@ class TestLookups:
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             "application/vnd.openxmlformats-officedocument.presentationml.presentation",
             "image/png",
+            # #124/#125/#126: long-tail formats
             "message/rfc822",
             "application/epub+zip",
             "application/rtf",
             "text/rtf",
             "application/vnd.oasis.opendocument.text",
+            # #121: structured text
+            "application/yaml",
+            "text/yaml",
+            "application/toml",
+            "application/xml",
+            "text/xml",
+            # #122: source code (extension allowlist is the source of truth;
+            # these are the accepted MIME aliases on top of it)
+            "text/x-python",
+            "application/javascript",
+            "text/javascript",
+            "application/typescript",
+            "text/x-go",
+            "text/x-java-source",
+            "text/x-rustsrc",
+            "text/x-csrc",
+            "text/x-chdr",
+            "text/x-c++src",
+            "text/x-csharp",
+            "text/x-ruby",
+            "text/x-php",
+            "text/x-swift",
+            "text/x-kotlin",
+            "text/x-scala",
+            "application/x-sh",
+            "text/x-sh",
+            "application/sql",
+            "text/x-sql",
+            "text/x-r-source",
+            "text/x-lua",
+            # #127: subtitle transcripts
+            "application/x-subrip",
+            "text/vtt",
         ]
 
     def test_longtail_mime_types_present(self):
@@ -173,8 +245,45 @@ class TestLookups:
 
     def test_mcp_mime_types_matches_historical_text_subset(self):
         """Pins byte-for-byte parity with the pre-#117
-        SUPPORTED_TEXT_MIME_TYPES (the text/* subset of ALLOWED_MIME_TYPES)."""
-        assert mcp_mime_types() == ("text/csv", "text/html", "text/markdown", "text/plain")
+        SUPPORTED_TEXT_MIME_TYPES (the text/* subset of ALLOWED_MIME_TYPES),
+        plus #121/#122/#127 -- all three text-family additions declare
+        surfaces={"rest", "mcp"} (see each FileTypeSpec's comment), so their
+        MIME types now join the MCP upload_document allow-list too."""
+        assert mcp_mime_types() == (
+            "application/javascript",
+            "application/sql",
+            "application/toml",
+            "application/typescript",
+            "application/x-sh",
+            "application/x-subrip",
+            "application/xml",
+            "application/yaml",
+            "text/csv",
+            "text/html",
+            "text/javascript",
+            "text/markdown",
+            "text/plain",
+            "text/vtt",
+            "text/x-c++src",
+            "text/x-chdr",
+            "text/x-csharp",
+            "text/x-csrc",
+            "text/x-go",
+            "text/x-java-source",
+            "text/x-kotlin",
+            "text/x-lua",
+            "text/x-php",
+            "text/x-python",
+            "text/x-r-source",
+            "text/x-ruby",
+            "text/x-rustsrc",
+            "text/x-scala",
+            "text/x-sh",
+            "text/x-sql",
+            "text/x-swift",
+            "text/xml",
+            "text/yaml",
+        )
 
     def test_json_is_rest_only(self):
         """JSON is textual but was never MCP-exposed pre-#117 -- the
@@ -220,6 +329,212 @@ class TestLookups:
 
 
 # ---------------------------------------------------------------------------
+# #121: structured text (YAML, TOML, XML) -- decoded as plain text, no parse
+# step, so malformed input is still searchable rather than rejected. Both
+# are `rest + mcp`, `chunking_hint="structured"` per the issue.
+# ---------------------------------------------------------------------------
+
+
+class TestStructuredTextSpecs:
+    @pytest.mark.parametrize(
+        "mime,key",
+        [
+            ("application/yaml", "yaml"),
+            ("text/yaml", "yaml"),
+            ("application/toml", "toml"),
+            ("application/xml", "xml"),
+            ("text/xml", "xml"),
+        ],
+    )
+    def test_declared_mime_resolves(self, mime, key):
+        spec = get_spec_for_mime(mime)
+        assert spec is not None
+        assert spec.key == key
+
+    @pytest.mark.parametrize(
+        "ext,key",
+        [(".yaml", "yaml"), (".yml", "yaml"), (".toml", "toml"), (".xml", "xml")],
+    )
+    def test_extension_resolves(self, ext, key):
+        spec = get_spec_for_extension(ext)
+        assert spec is not None
+        assert spec.key == key
+
+    @pytest.mark.parametrize("key", ["yaml", "toml", "xml"])
+    def test_chunking_hint_is_structured(self, key):
+        """Configs/specs/API payloads are structured data, not prose --
+        #129's future format-aware chunker branches on this."""
+        assert get_spec_by_key(key).chunking_hint == "structured"
+
+    @pytest.mark.parametrize("key", ["yaml", "toml", "xml"])
+    def test_mcp_eligible(self, key):
+        """rest+mcp per #121: agents relabeling configs as text/plain to get
+        them past upload should no longer need to."""
+        assert "mcp" in get_spec_by_key(key).surfaces
+
+    @pytest.mark.parametrize("key", ["yaml", "toml", "xml"])
+    def test_no_magic_signature(self, key):
+        """Free-form text formats have nothing to sniff for -- same as every
+        other text/* entry (see FileTypeSpec.magic's docstring)."""
+        assert get_spec_by_key(key).magic is None
+
+
+# ---------------------------------------------------------------------------
+# #122: source code -- extension allowlist is the source of truth; MIME
+# aliases are an accepted convenience layer on top of it, and the client's
+# declared value is preserved verbatim in stored content_type (asserted in
+# inh-public-api-svc's test_upload_document.py, which controls storage).
+# ---------------------------------------------------------------------------
+
+
+class TestSourceCodeSpec:
+    # The exact 20-extension allowlist named in #122's proposed contract.
+    EXTENSIONS = (
+        ".py",
+        ".js",
+        ".ts",
+        ".tsx",
+        ".jsx",
+        ".go",
+        ".java",
+        ".rs",
+        ".c",
+        ".h",
+        ".cpp",
+        ".cs",
+        ".rb",
+        ".php",
+        ".swift",
+        ".kt",
+        ".scala",
+        ".sh",
+        ".sql",
+        ".r",
+        ".lua",
+    )
+
+    def test_every_listed_extension_is_registered(self):
+        """Backs the README's 'code files are ingested as text' claim (#122)
+        with an actual, enumerated test instead of an accidental
+        text/plain-sniffing side effect."""
+        for ext in self.EXTENSIONS:
+            spec = get_spec_for_extension(ext)
+            assert spec is not None, f"{ext} not registered"
+            assert spec.key == "code"
+
+    def test_extension_tuple_matches_the_proposed_contract_exactly(self):
+        spec = get_spec_by_key("code")
+        assert spec.extensions == self.EXTENSIONS
+
+    @pytest.mark.parametrize(
+        "mime",
+        ["text/x-python", "application/javascript", "application/x-sh", "application/sql"],
+    )
+    def test_explicit_mime_aliases_from_the_issue_resolve(self, mime):
+        spec = get_spec_for_mime(mime)
+        assert spec is not None
+        assert spec.key == "code"
+
+    def test_mcp_eligible(self):
+        assert "mcp" in get_spec_by_key("code").surfaces
+
+    def test_no_magic_signature(self):
+        assert get_spec_by_key("code").magic is None
+
+
+# ---------------------------------------------------------------------------
+# #122: the octet-stream extension-fallback contract this issue asks for --
+# completing the design `extensions` was RESERVED for (see the field's
+# docstring in file_types.py before this change): "reserved as a fallback
+# classifier for a generic/absent content-type ... not yet consulted".
+# `get_spec_for_upload` is that consultation, finally wired in.
+# ---------------------------------------------------------------------------
+
+
+class TestGetSpecForUpload:
+    def test_explicit_registered_mime_resolves_without_touching_the_extension(self):
+        """The common case: a real, registered MIME type is authoritative on
+        its own -- the filename is irrelevant."""
+        spec = get_spec_for_upload("text/x-python", "anything.xyz")
+        assert spec is not None
+        assert spec.key == "code"
+
+    def test_octet_stream_plus_known_extension_falls_back(self):
+        """The #122 acceptance criterion verbatim: 'upload as
+        application/octet-stream with .py extension succeeds via fallback'."""
+        spec = get_spec_for_upload("application/octet-stream", "main.py")
+        assert spec is not None
+        assert spec.key == "code"
+
+    def test_empty_content_type_plus_known_extension_falls_back(self):
+        """An absent Content-Type is as generic as octet-stream -- the other
+        half of 'generic/absent' named in the `extensions` field docstring."""
+        spec = get_spec_for_upload("", "main.py")
+        assert spec is not None
+        assert spec.key == "code"
+
+    def test_octet_stream_with_unrecognized_extension_stays_none(self):
+        """The fallback does not swallow content_type validation: an
+        extension this registry does not know about is not evidence of
+        anything, so it must still be rejected upstream."""
+        assert get_spec_for_upload("application/octet-stream", "notes.xyz") is None
+
+    def test_octet_stream_with_no_extension_stays_none(self):
+        assert get_spec_for_upload("application/octet-stream", "README") is None
+
+    def test_octet_stream_with_extension_of_an_mcp_ineligible_type_still_falls_back(self):
+        """The fallback is generic across the registry, not source-code-
+        specific -- any registered extension qualifies, e.g. PDF's (a
+        BINARY format, included here to show the fallback is not itself the
+        gate that decides binary-vs-text; sniffing/size/etc downstream still
+        apply exactly as they do for an explicitly-declared 'application/pdf')."""
+        spec = get_spec_for_upload("application/octet-stream", "report.pdf")
+        assert spec is not None
+        assert spec.key == "pdf"
+
+    def test_unrecognized_specific_mime_is_not_widened_by_extension(self):
+        """SECURITY: the fallback applies ONLY to a generic/absent
+        content-type, never to a SPECIFIC-but-unregistered one. Otherwise
+        every unknown text file could sneak past validation just by having a
+        registered-looking extension -- the exact over-broad-allowlist risk
+        this contract must not introduce. A client that declares a real,
+        wrong, specific MIME type is still flatly rejected."""
+        assert get_spec_for_upload("application/x-something-made-up", "main.py") is None
+
+    def test_no_extension_and_generic_content_type_stays_none(self):
+        assert get_spec_for_upload("application/octet-stream", "unnamed") is None
+
+
+# ---------------------------------------------------------------------------
+# #127: SRT / WebVTT subtitle transcripts.
+# ---------------------------------------------------------------------------
+
+
+class TestSubtitleSpecs:
+    def test_srt_resolves(self):
+        spec = get_spec_for_mime("application/x-subrip")
+        assert spec is not None
+        assert spec.key == "srt"
+        assert spec.extensions == (".srt",)
+
+    def test_vtt_resolves(self):
+        spec = get_spec_for_mime("text/vtt")
+        assert spec is not None
+        assert spec.key == "vtt"
+        assert spec.extensions == (".vtt",)
+
+    @pytest.mark.parametrize("key", ["srt", "vtt"])
+    def test_chunking_hint_is_prose(self, key):
+        """Per #127: cue text becomes prose after extraction, so it takes
+        the default chunking treatment like txt/markdown/html."""
+        assert get_spec_by_key(key).chunking_hint == "prose"
+
+    @pytest.mark.parametrize("key", ["srt", "vtt"])
+    def test_mcp_eligible(self, key):
+        assert "mcp" in get_spec_by_key(key).surfaces
+
+
+# ---------------------------------------------------------------------------
 # sniff_content_type -- the hole #117 closes
 # ---------------------------------------------------------------------------
 
@@ -254,6 +569,39 @@ class TestSniffContentType:
         png_magic = b"\x89PNG\r\n\x1a\n" + b"rest of a fake png"
         with pytest.raises(ContentTypeMismatchError):
             sniff_content_type(png_magic, "application/pdf")
+
+    @pytest.mark.parametrize("mime", ["application/yaml", "application/toml", "application/xml"])
+    def test_png_bytes_declared_as_structured_text_are_rejected(self, mime):
+        """#121 failure path: PNG bytes declared as YAML/TOML/XML must be
+        rejected exactly like the pre-existing text/plain case above --
+        these formats have no magic signature of their own (free-form text),
+        but still lose the cross-spec check against a REAL binary
+        signature."""
+        png_magic = b"\x89PNG\r\n\x1a\n" + b"rest of a fake png"
+        with pytest.raises(ContentTypeMismatchError) as exc_info:
+            sniff_content_type(png_magic, mime)
+        assert "png" in str(exc_info.value)
+
+    def test_resolved_spec_param_skips_the_internal_mime_lookup(self):
+        """#122: the octet-stream extension-fallback path already resolved a
+        spec via `get_spec_for_upload` (declared_mime alone would not
+        resolve -- it's generic). Passing that spec in via `resolved_spec`
+        must be honored instead of re-deriving (and failing to find) one
+        from `declared_mime`."""
+        spec = get_spec_for_upload("application/octet-stream", "main.py")
+        assert spec is not None
+        result = sniff_content_type(b"print('hi')", "application/octet-stream", resolved_spec=spec)
+        assert result.key == "code"
+
+    def test_resolved_spec_param_still_catches_a_real_binary_mismatch(self):
+        """The fallback path must not become a validation bypass: content
+        whose bytes match a DIFFERENT registered binary signature is still
+        rejected even when `resolved_spec` was supplied via the extension
+        fallback."""
+        spec = get_spec_for_upload("application/octet-stream", "main.py")
+        png_magic = b"\x89PNG\r\n\x1a\n" + b"rest of a fake png"
+        with pytest.raises(ContentTypeMismatchError):
+            sniff_content_type(png_magic, "application/octet-stream", resolved_spec=spec)
 
     def test_short_content_shorter_than_magic_is_rejected_not_crashed(self):
         """A 2-byte upload declared as PDF must not raise IndexError/etc --
@@ -656,7 +1004,9 @@ class TestOOXMLSiblingsFromBatch3:
         assert docx_spec is not None
 
         # Genuine XLSX bytes (same ZIP signature), declared as the DOCX mime.
-        result = sniff_content_type(b"PK\x03\x04 an actual xlsx workbook's bytes", docx_spec.mime_types[0])
+        result = sniff_content_type(
+            b"PK\x03\x04 an actual xlsx workbook's bytes", docx_spec.mime_types[0]
+        )
         # Resolves to the DECLARED type -- sniff_content_type's contract is
         # "do the bytes CONTRADICT the declared type", not "identify the
         # true type". They don't contradict (same family), so it resolves
@@ -689,7 +1039,9 @@ class TestOOXMLSiblingsFromBatch3:
         )
         assert sniff_result.key == "docx"  # passes -- resolves to the DECLARED type
 
-        check_extension_consistency("report.docx", docx_spec)  # must not raise -- ".docx" IS docx's own extension
+        check_extension_consistency(
+            "report.docx", docx_spec
+        )  # must not raise -- ".docx" IS docx's own extension
 
         # The mirror case: genuine DOCX bytes, uploaded as "sheet.xlsx",
         # declared as xlsx -- same two-check pass, same underlying gap.
