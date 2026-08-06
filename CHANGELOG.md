@@ -356,6 +356,22 @@ All notable changes to Inherent are documented here. The format follows
 
 ### Fixed
 
+- **MCP `upload_document` tool schema described a stale, false
+  `content_type` contract (#193).** The `_TOOLS["upload_document"]`
+  description and its `content_type` schema property both hardcoded
+  "must be one of text/plain, text/markdown (default), text/csv, text/html"
+  and "must be text/*" — stale since #121/#122/#127 added YAML/TOML/XML,
+  source code, and SRT/WebVTT: ~30 types are accepted today, several not
+  `text/*`-prefixed (`application/typescript`, `application/x-sh`,
+  `application/sql`, `application/yaml`), and the default is derived from
+  the filename's extension, not a flat `text/markdown`. This is the surface
+  an MCP agent reads via `list_tools` before ever opening `docs/`. Both
+  strings are now built from `SUPPORTED_TEXT_MIME_TYPES`
+  (`inh_contracts.file_types.mcp_mime_types()`) at module load, so they
+  cannot restate a stale subset again. The module docstring's matching
+  stale list was also corrected to describe the mechanism instead of a
+  literal type enumeration.
+
 - **PDF and JSON extractors retried deterministic (unfixable) failures 3x
   (#195).** `_extract_pdf_text`/`_extract_json_text`
   (`services/inh-ingestion-svc/src/temporal/activities/extract.py`) left

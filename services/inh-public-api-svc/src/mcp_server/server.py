@@ -46,10 +46,18 @@ Upload parity (#87 Task 3)
 ---------------------------
 ``upload_document`` is the MCP counterpart of POST /v1/documents, but TEXT
 content only: the tool accepts ``content`` as a UTF-8 string (not raw bytes),
-so ``content_type`` must be one of the supported text types
-(``text/plain``, ``text/markdown`` [default], ``text/csv``, ``text/html``).
-Binary uploads (PDF, DOCX, PNG, ...) remain REST-only by design — the tool
-rejects an unsupported ``content_type`` with a message pointing the caller at
+so ``content_type`` must be one of the MCP-eligible types in
+``inh_contracts.file_types.FILE_TYPE_REGISTRY`` — every spec whose
+``surfaces`` includes ``"mcp"`` (see ``SUPPORTED_TEXT_MIME_TYPES`` below for
+the live set derived from it; #193 review: do not hardcode a type list here
+again — several of the eligible types are not ``text/*`` MIME types at all,
+e.g. ``application/typescript``, ``application/x-sh``, ``application/sql``,
+``application/yaml``, so "TEXT content" describes the wire transport, not the
+declared MIME type). Omitting ``content_type`` derives it from ``filename``'s
+extension when recognized as MCP-eligible, falling back to
+``text/markdown`` otherwise (see ``_default_upload_content_type``). Binary
+uploads (PDF, DOCX, PNG, ...) remain REST-only by design — the tool rejects
+an unsupported ``content_type`` with a message pointing the caller at
 POST /v1/documents. Both surfaces share the exact same
 validate/dedup/store/enqueue pipeline via ``src.services.document_intake``.
 """
@@ -100,6 +108,16 @@ ToolHandler = Callable[["APIKeyInfo", dict], Awaitable[list[TextContent]]]
 # without being (or not being) MCP-safe without the two disagreeing.
 # Binary types (PDF/DOCX/PNG) stay REST-only by design.
 SUPPORTED_TEXT_MIME_TYPES = mcp_mime_types()
+
+# Human-readable rendering of the same list, shared by the tool description
+# and the `content_type` schema property below (#193) -- previously both were
+# a hand-typed "text/plain, text/markdown (default), text/csv, text/html"
+# string that stopped matching SUPPORTED_TEXT_MIME_TYPES the moment #121/#122/
+# #127 added YAML/TOML/XML/code/SRT/VTT (30 types today, several of them not
+# text/*-prefixed at all -- e.g. application/typescript, application/x-sh).
+# `list_tools` is the surface an MCP agent actually reads before ever opening
+# docs/, so this string must be regenerated from the registry, not restated.
+_SUPPORTED_TEXT_MIME_TYPES_TEXT = ", ".join(SUPPORTED_TEXT_MIME_TYPES)
 
 
 @dataclass(frozen=True)
@@ -1247,8 +1265,11 @@ _TOOLS: dict[str, ToolDef] = {
     "upload_document": ToolDef(
         description="Upload TEXT content for ingestion (same pipeline as POST "
         "/v1/documents, minus binary files — PDF/DOCX/PNG uploads are REST-only by "
-        "design). Content is UTF-8 text; content_type must be one of text/plain, "
-        "text/markdown (default), text/csv, text/html. Requires 'write' permission.",
+        "design). Content is UTF-8 text; content_type must be one of the "
+        f"{len(SUPPORTED_TEXT_MIME_TYPES)} MCP-eligible types (not all are "
+        f"text/*-prefixed): {_SUPPORTED_TEXT_MIME_TYPES_TEXT}. If omitted, it is "
+        "derived from filename's extension when recognized, else defaults to "
+        "text/markdown. Requires 'write' permission.",
         input_schema={
             "type": "object",
             "properties": {
@@ -1263,9 +1284,11 @@ _TOOLS: dict[str, ToolDef] = {
                 },
                 "content_type": {
                     "type": "string",
-                    "description": "MIME type of the content; must be text/* "
-                    "(default text/markdown). Binary types are rejected — use "
-                    "POST /v1/documents for binary uploads.",
+                    "description": "MIME type of the content. Must be one of the "
+                    f"MCP-eligible types: {_SUPPORTED_TEXT_MIME_TYPES_TEXT}. Binary "
+                    "types are rejected — use POST /v1/documents for binary uploads. "
+                    "If omitted, derived from filename's extension when recognized, "
+                    "else falls back to the default below.",
                     "default": "text/markdown",
                 },
                 "workspace_id": {
