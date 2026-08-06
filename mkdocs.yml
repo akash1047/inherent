@@ -86,6 +86,7 @@ nav:
       - 0001 — Agent memory substrate: adr/0001-agent-memory-substrate.md
       - 0002 — Weaviate multi-tenancy scale: adr/0002-weaviate-multi-tenancy-scale.md
       - 0003 — Traffic-mined retrieval evals: adr/0003-traffic-mined-retrieval-evals.md
+      - 0005 — ZIP archive expansion fan-out: adr/0005-zip-archive-fanout.md
       - Threat model — RAG poisoning: threat-models/rag-poisoning-injection.md
   - Community:
       - Contributing: community/contributing.md
