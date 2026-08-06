@@ -32,6 +32,10 @@ the build if this table and the registry ever disagree.
 | json | `.json` | `application/json` | rest | structured | — |
 | docx | `.docx` | `application/vnd.openxmlformats-officedocument.wordprocessingml.document` | rest | prose | — |
 | png | `.png` | `image/png` | rest | media | `ocr` |
+| eml | `.eml` | `message/rfc822` | rest | prose | — |
+| epub | `.epub` | `application/epub+zip` | rest | prose | — |
+| rtf | `.rtf` | `application/rtf`, `text/rtf` | rest | prose | — |
+| odt | `.odt` | `application/vnd.oasis.opendocument.text` | rest | prose | — |
 
 <!-- END GENERATED FILE TYPES TABLE -->
 

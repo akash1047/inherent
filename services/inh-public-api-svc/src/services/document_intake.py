@@ -32,6 +32,26 @@ from src.utils import get_logger
 
 logger = get_logger(__name__)
 
+# Formats intentionally NOT in FILE_TYPE_REGISTRY that get a SPECIFIC,
+# actionable rejection message instead of the generic "Unsupported file
+# type" text (#124/#126). Both are deliberate non-goals with a real
+# supported replacement -- "explicit 400, never accept-then-garble" per
+# both issues -- so the message points the caller at that replacement
+# instead of leaving them to guess from an allow-list dump. Keyed by the
+# MIME type normalized the same way `get_spec_for_mime` normalizes the
+# registry (strip Content-Type parameters, lowercase, strip whitespace).
+_EXPLICITLY_REJECTED_TYPES: dict[str, str] = {
+    "application/msword": "Legacy .doc files are not supported. Convert the file to .docx and re-upload.",
+    "application/vnd.ms-outlook": "Outlook .msg files are not supported. Export the message to .eml and re-upload.",
+}
+
+
+def _rejection_message_for(content_type: str) -> str | None:
+    """The explicit rejection message for `content_type`, or None if it
+    isn't one of the specifically-called-out unsupported formats above."""
+    normalized = content_type.split(";", 1)[0].strip().lower()
+    return _EXPLICITLY_REJECTED_TYPES.get(normalized)
+
 
 async def intake_document(
     *,
@@ -83,6 +103,15 @@ async def intake_document(
         ServiceUnavailableError: S3 upload or pending-row persistence failed.
     """
     # --- 1. Validate content type -------------------------------------------
+    # Checked BEFORE the generic registry lookup below (#124/#126): a format
+    # that is deliberately unsupported but has a real replacement (legacy
+    # .doc -> .docx, Outlook .msg -> .eml) gets a message naming that
+    # replacement, not the generic allow-list dump every other unrecognized
+    # type gets -- "explicit 400, never accept-then-garble" per both issues.
+    rejection_message = _rejection_message_for(content_type)
+    if rejection_message is not None:
+        raise BadRequestError(detail=rejection_message)
+
     spec = get_spec_for_mime(content_type)
     if spec is None:
         raise BadRequestError(

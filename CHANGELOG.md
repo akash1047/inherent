@@ -42,6 +42,28 @@ All notable changes to Inherent are documented here. The format follows
   as #9 and the registry lesson as #100. All 8 existing formats migrated
   with no behavior change to correctly-labeled uploads.
 
+- **Email, EPUB, RTF, and ODT upload support (#124, #125, #126).** Four new
+  `FILE_TYPE_REGISTRY` entries, REST-only: `.eml` (`message/rfc822`, stdlib
+  `email` — headers From/To/Cc/Date/Subject always extracted, body prefers
+  text/plain and falls back to text/html through the existing HTML
+  extractor, attachments are not extracted but their filenames and count
+  are recorded in a clearly labeled section so an agent knows content was
+  elided, nested `message/rfc822` parts inspected one level only);
+  `.epub` (`application/epub+zip`, stdlib `zipfile` — chapters extracted
+  in `content.opf` **spine order** and run through the existing HTML
+  extractor rather than a second parser, nav/cover items skipped, DRM/
+  encrypted EPUBs fail with a clear `error_message` instead of crashing);
+  `.rtf` (`application/rtf` + `text/rtf` alias, new core dependency
+  `striprtf`); `.odt` (`application/vnd.oasis.opendocument.text`, stdlib
+  `zipfile` + the same HTML tag-strip path over `content.xml`, no `odfpy`
+  needed). EPUB and ODT share the ZIP `PK\x03\x04` signature with DOCX —
+  verified DOCX uploads still validate correctly with both registered
+  (`test_docx_still_validates_with_epub_and_odt_registered`). Legacy
+  `.doc` (`application/msword`) and Outlook `.msg`
+  (`application/vnd.ms-outlook`) are explicitly rejected with `400` and an
+  actionable "convert to .docx" / "export to .eml" message rather than
+  accepted and garbled.
+
 - **Retrieval-eval hard gate, baseline ratcheting, and trend history (#139).**
   Implements the "v2" items ADR 0003 deferred (run-over-run regression deltas,
   a CLI/CI gate). The compose retrieval-eval baseline diff

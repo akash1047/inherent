@@ -71,7 +71,12 @@ class TestRegistryShape:
         loss (acceptance criterion: 'All 8 current formats migrate to
         registry entries with behavior unchanged')."""
         keys = {spec.key for spec in FILE_TYPE_REGISTRY}
-        assert keys == {"txt", "markdown", "csv", "html", "json", "pdf", "docx", "png"}
+        assert {"txt", "markdown", "csv", "html", "json", "pdf", "docx", "png"} <= keys
+
+    def test_longtail_formats_present(self):
+        """#124/#125/#126: eml, epub, rtf, odt are registered."""
+        keys = {spec.key for spec in FILE_TYPE_REGISTRY}
+        assert {"eml", "epub", "rtf", "odt"} <= keys
 
 
 # ---------------------------------------------------------------------------
@@ -107,8 +112,16 @@ class TestLookups:
     def test_all_mime_types_matches_historical_allowed_list(self):
         """Pins byte-for-byte parity (SET *and* ORDER) with the pre-#117
         hand-maintained ALLOWED_MIME_TYPES list in constants.py, so the 400
-        error text's exact wording is unchanged by this migration."""
-        assert all_mime_types() == [
+        error text's exact wording is unchanged by this migration.
+
+        Only the first 8 entries (the pre-#117 formats) are pinned by exact
+        prefix -- sibling format issues (#118 XLSX, #119 PPTX, #124-#126,
+        #130 ZIP, ...) append further entries concurrently in their own
+        worktrees, so asserting the FULL list here would make every one of
+        those branches conflict with every other on this single test.
+        """
+        mimes = all_mime_types()
+        assert mimes[:8] == [
             "text/plain",
             "text/markdown",
             "text/csv",
@@ -118,6 +131,17 @@ class TestLookups:
             "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             "image/png",
         ]
+
+    def test_longtail_mime_types_present(self):
+        """#124/#125/#126: the four new long-tail MIME types are registered
+        (order-independent -- see the prefix-only rationale above)."""
+        assert set(all_mime_types()) >= {
+            "message/rfc822",
+            "application/epub+zip",
+            "application/rtf",
+            "text/rtf",
+            "application/vnd.oasis.opendocument.text",
+        }
 
     def test_get_spec_for_mime_strips_content_type_parameters(self):
         """The most common real-world Content-Type variation -- a browser or
@@ -137,6 +161,41 @@ class TestLookups:
         must preserve that."""
         spec = get_spec_for_mime("application/json")
         assert spec.surfaces == frozenset({"rest"})
+
+    # -- #124/#125/#126: long-tail formats. All REST-only (binary or,
+    # for EML, raw-bytes-with-non-UTF-8-transfer-encodings) -- none of
+    # these were ever MCP-eligible (mcp upload_document is inline UTF-8 text
+    # only, #87 Task 3).
+
+    def test_eml_registered_rest_only(self):
+        spec = get_spec_for_mime("message/rfc822")
+        assert spec is not None
+        assert spec.key == "eml"
+        assert spec.surfaces == frozenset({"rest"})
+        assert spec.magic is None  # RFC 822 has no binary signature
+
+    def test_epub_registered_with_zip_magic(self):
+        spec = get_spec_for_mime("application/epub+zip")
+        assert spec is not None
+        assert spec.key == "epub"
+        assert spec.surfaces == frozenset({"rest"})
+        assert spec.magic == b"PK\x03\x04"
+
+    def test_rtf_registered_with_both_mime_aliases(self):
+        """application/rtf is canonical; text/rtf is the common alias -- both
+        must resolve to the same spec (#126)."""
+        canonical = get_spec_for_mime("application/rtf")
+        alias = get_spec_for_mime("text/rtf")
+        assert canonical is not None
+        assert canonical.key == "rtf"
+        assert alias is canonical
+
+    def test_odt_registered_with_zip_magic(self):
+        spec = get_spec_for_mime("application/vnd.oasis.opendocument.text")
+        assert spec is not None
+        assert spec.key == "odt"
+        assert spec.surfaces == frozenset({"rest"})
+        assert spec.magic == b"PK\x03\x04"
 
 
 # ---------------------------------------------------------------------------
@@ -246,6 +305,31 @@ class TestSniffContentType:
 
         xlsx_result = ft.sniff_content_type(b"PK\x03\x04 real xlsx bytes", xlsx_spec.mime_types[0])
         assert xlsx_result.key == "xlsx"
+
+    # -- #124/#125/#126 SPECIFIC ASK: verify by hand that registering the
+    # real EPUB and ODT specs (both PK\x03\x04, same family as docx) does
+    # NOT break DOCX validation -- the exact regression #117's shared-magic
+    # fix (test_shared_magic_family_does_not_mutually_reject above) exists
+    # to prevent, exercised here against the REAL registry (not a synthetic
+    # monkeypatched sibling) now that epub/odt actually landed.
+
+    def test_docx_still_validates_with_epub_and_odt_registered(self):
+        """DOCX, EPUB, and ODT all share the PK\\x03\\x04 ZIP signature.
+        Registering epub/odt must not make docx-declared uploads start
+        failing -- each of the three still sniffs clean as itself."""
+        docx = sniff_content_type(
+            b"PK\x03\x04 real docx bytes",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        )
+        assert docx.key == "docx"
+
+        epub = sniff_content_type(b"PK\x03\x04 real epub bytes", "application/epub+zip")
+        assert epub.key == "epub"
+
+        odt = sniff_content_type(
+            b"PK\x03\x04 real odt bytes", "application/vnd.oasis.opendocument.text"
+        )
+        assert odt.key == "odt"
 
     def test_shared_magic_family_still_rejects_a_genuinely_different_binary(self, monkeypatch):
         """The overlap tolerance is family-scoped, not "PDF/PNG can now claim

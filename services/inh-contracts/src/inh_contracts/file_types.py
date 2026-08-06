@@ -255,6 +255,75 @@ FILE_TYPE_REGISTRY: tuple[FileTypeSpec, ...] = (
         optional_extra="ocr",
         degradation="placeholder",
     ),
+    # -- Long-tail formats (#124/#125/#126) -- the low-dependency group: EML
+    # needs only the stdlib `email` package, EPUB needs stdlib `zipfile` plus
+    # the bs4 already a core dep, RTF needs one tiny pure-Python dep
+    # (striprtf), and ODT is a zip of XML read through the same tag-strip
+    # path as HTML/EPUB. All REST-only: EML transports raw, possibly
+    # non-UTF-8-encoded bytes and the other three are binary containers, none
+    # of which can cross the MCP upload_document tool's inline-UTF-8-text-only
+    # boundary (#87 Task 3).
+    FileTypeSpec(
+        key="eml",
+        mime_types=("message/rfc822",),
+        extensions=(".eml",),
+        # RFC 822 messages have no binary file signature -- like every other
+        # text/* entry above, this relies entirely on sniff_content_type's
+        # cross-check against OTHER specs' signatures (e.g. real PNG bytes
+        # declared message/rfc822 are still caught).
+        magic=None,
+        surfaces=frozenset({"rest"}),
+        extractor="eml",
+        chunking_hint="prose",
+    ),
+    FileTypeSpec(
+        key="epub",
+        mime_types=("application/epub+zip",),
+        extensions=(".epub",),
+        # EPUB is a ZIP container (OCF) -- shares the identical PK\x03\x04
+        # signature with docx/xlsx/pptx/odt/zip. See the `docx` entry's
+        # comment and `_magic_families_overlap`: this is a "same family,
+        # cannot disambiguate at this level" case, not a conflict -- both
+        # docx and epub still validate correctly (pinned by
+        # test_docx_still_validates_with_epub_and_odt_registered in
+        # inh-contracts' test suite).
+        magic=b"PK\x03\x04",
+        surfaces=frozenset({"rest"}),
+        extractor="epub",
+        # The closed ChunkingHint vocabulary (#129) has no dedicated
+        # "chapter-segmented" value yet; "prose" is the closest existing fit
+        # for long-form chapter text. The extractor's own "## Chapter N"
+        # markers (spine order) are what give a future format-aware chunker
+        # the actual chapter boundaries to split on.
+        chunking_hint="prose",
+    ),
+    FileTypeSpec(
+        key="rtf",
+        # application/rtf is the canonical/registered IANA type; text/rtf is
+        # the alias many real-world clients (older Word exports, macOS
+        # TextEdit) send instead -- both must be accepted (#126).
+        mime_types=("application/rtf", "text/rtf"),
+        extensions=(".rtf",),
+        # Real RTF files begin with the literal control word "{\rtf1..." --
+        # a distinct signature from every other family registered here (not
+        # the shared ZIP PK\x03\x04 prefix), so this one gets a real,
+        # disambiguating magic check rather than a same-family pass-through.
+        magic=b"{\\rtf",
+        surfaces=frozenset({"rest"}),
+        extractor="rtf",
+        chunking_hint="prose",
+    ),
+    FileTypeSpec(
+        key="odt",
+        mime_types=("application/vnd.oasis.opendocument.text",),
+        extensions=(".odt",),
+        # ODT is also a ZIP container (ODF) -- same PK\x03\x04 family as
+        # docx/epub above; see the epub entry's comment for why this is safe.
+        magic=b"PK\x03\x04",
+        surfaces=frozenset({"rest"}),
+        extractor="odt",
+        chunking_hint="prose",
+    ),
 )
 
 
