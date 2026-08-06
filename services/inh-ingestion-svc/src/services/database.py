@@ -1364,21 +1364,40 @@ class DatabaseService:
 
             return [dict(row._mapping) for row in results]
 
-    async def delete_document(self, document_id: str) -> bool:
-        """Delete a document and its chunks (CASCADE)."""
+    async def delete_document(self, document_id: str, workspace_id: str | None = None) -> bool:
+        """Delete a document and its chunks (CASCADE).
+
+        Args:
+            document_id: The document to delete.
+            workspace_id: Optional workspace scope (#175). Callers that have
+                already resolved ownership via
+                ``src.api.ownership.resolve_owned_document`` should always
+                pass the *resolved* workspace_id here -- it scopes the
+                DELETE's own WHERE clause so a TOCTOU race between the
+                ownership check and this call (e.g. the document somehow
+                changing workspace in between) can never delete a document
+                out from under a workspace that no longer owns it. Optional
+                (defaults to unscoped) so existing internal callers that
+                have no workspace context (e.g. admin/cleanup tooling) are
+                unaffected.
+        """
         if not self.engine:
             raise RuntimeError("Database not connected")
 
         with self.get_session() as session:
-            result = session.execute(
-                self.processed_documents.delete().where(
-                    self.processed_documents.c.document_id == document_id
-                )
-            )
+            conditions = [self.processed_documents.c.document_id == document_id]
+            if workspace_id is not None:
+                conditions.append(self.processed_documents.c.workspace_id == workspace_id)
+
+            result = session.execute(self.processed_documents.delete().where(*conditions))
 
             deleted = bool(result.rowcount > 0)  # type: ignore[return-value]
             if deleted:
-                logger.info("Deleted document (cascade)", document_id=document_id)
+                logger.info(
+                    "Deleted document (cascade)",
+                    document_id=document_id,
+                    workspace_id=workspace_id,
+                )
 
             return deleted
 

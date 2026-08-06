@@ -726,10 +726,12 @@ Returns **409** if a workflow is already running for this `document_id`, **503**
 
 ## 8. Get Ingestion Status
 
-Query the real-time progress of a running (or recently completed) ingestion workflow.
+Query the real-time progress of a running (or recently completed) ingestion workflow. The
+`workspace_id` query param is **required** and must be the workspace that actually owns
+`document_id` (#177).
 
 ```bash
-curl -s "$INGEST_BASE/ingest/$DOC_ID/status" \
+curl -s "$INGEST_BASE/ingest/$DOC_ID/status?workspace_id=$WORKSPACE_ID" \
   -H "X-API-Key: $INGEST_KEY" \
   | jq .
 ```
@@ -746,7 +748,9 @@ curl -s "$INGEST_BASE/ingest/$DOC_ID/status" \
 }
 ```
 
-Returns **404** if no workflow exists for the document (or it is no longer queryable).
+Returns **404** if `document_id` isn't found in `workspace_id` (also returned when the document
+exists but belongs to a different workspace — no cross-tenant existence leak), if no workflow
+exists for the document, or if it is no longer queryable.
 
 ---
 
@@ -806,10 +810,11 @@ header/heading text. See `chunk.py`'s module docstring for the full design.
 ## 10. Document Lineage
 
 Get the ordered list of ingestion pipeline events for a document — what happened, step by step,
-during its ingestion.
+during its ingestion. The `workspace_id` query param is **required** and must be the workspace
+that actually owns `document_id` (#177).
 
 ```bash
-curl -s "$INGEST_BASE/lineage/$DOC_ID" \
+curl -s "$INGEST_BASE/lineage/$DOC_ID?workspace_id=$WORKSPACE_ID" \
   -H "X-API-Key: $INGEST_KEY" \
   | jq .
 ```
@@ -846,14 +851,20 @@ curl -s "$INGEST_BASE/lineage/$DOC_ID" \
 }
 ```
 
+Returns **404** if `document_id` isn't found in `workspace_id` (also returned when the document
+exists but belongs to a different workspace — no cross-tenant existence leak, #177).
+
 ---
 
 ## 11. Delete a Document
 
 > **Destructive.** Removes the document from PostgreSQL and its chunks from Weaviate.
 
-Both `workspace_id` and `user_id` query params are **required**. Weaviate cleanup is best-effort:
-if it fails, the PostgreSQL delete still succeeds and `weaviate_cleaned` is `false`.
+Both `workspace_id` and `user_id` query params are **required**. `workspace_id` must be the
+workspace that actually owns `document_id` (#175) — `user_id` is accepted for backward-compatible
+request shape but is otherwise ignored; the resolved document's own `user_id` always drives the
+Weaviate tenant lookup. Weaviate cleanup is best-effort: if it fails, the PostgreSQL delete still
+succeeds and `weaviate_cleaned` is `false`.
 
 ```bash
 curl -s -X DELETE \
@@ -872,7 +883,8 @@ curl -s -X DELETE \
 }
 ```
 
-Returns **404** if the document is not found in PostgreSQL.
+Returns **404** if `document_id` isn't found in `workspace_id` (also returned when the document
+exists but belongs to a different workspace — no cross-tenant existence leak, #175).
 
 ---
 
@@ -883,10 +895,13 @@ endpoints live on the ingestion service (write/admin plane) and use `$INGEST_KEY
 
 ### List dead-letter jobs
 
-Optional filters: `workspace_id`, `status` (default `pending`), `limit` (1–200, default 50).
+`workspace_id` is **required** (#177 — it used to be an optional filter, which meant omitting it
+returned every workspace's dead-letter rows, including a genuine `document_id` pair a caller could
+then present to `PATCH /chunks/{document_id}/{chunk_index}`). Optional: `status` (default
+`pending`), `limit` (1–200, default 50).
 
 ```bash
-curl -s "$INGEST_BASE/dead-letter?status=pending&limit=50" \
+curl -s "$INGEST_BASE/dead-letter?workspace_id=$WORKSPACE_ID&status=pending&limit=50" \
   -H "X-API-Key: $INGEST_KEY" \
   | jq .
 ```
@@ -917,20 +932,25 @@ curl -s "$INGEST_BASE/dead-letter?status=pending&limit=50" \
 
 ### Get a single job
 
+`workspace_id` is **required** and must be the workspace that actually owns `job_id` (#177).
+
 ```bash
-curl -s "$INGEST_BASE/dead-letter/1" \
+curl -s "$INGEST_BASE/dead-letter/1?workspace_id=$WORKSPACE_ID" \
   -H "X-API-Key: $INGEST_KEY" \
   | jq .
 ```
 
-Returns **404** if job `1` does not exist.
+Returns **404** if job `1` does not exist, or exists but isn't owned by `workspace_id` (no
+cross-tenant existence leak).
 
 ### Retry a job
 
-Re-publishes the job's original message. Only jobs with status `pending` or `retrying` can be retried.
+Re-publishes the job's original message. Only jobs with status `pending` or `retrying` can be
+retried. `workspace_id` is **required** and must be the workspace that actually owns `job_id`
+(#177).
 
 ```bash
-curl -s -X POST "$INGEST_BASE/dead-letter/1/retry" \
+curl -s -X POST "$INGEST_BASE/dead-letter/1/retry?workspace_id=$WORKSPACE_ID" \
   -H "X-API-Key: $INGEST_KEY" \
   | jq .
 ```
@@ -945,14 +965,16 @@ curl -s -X POST "$INGEST_BASE/dead-letter/1/retry" \
 }
 ```
 
-Returns **409** if the job is not in a retriable status, **404** if missing, **500** if the re-trigger fails.
+Returns **409** if the job is not in a retriable status, **404** if missing or not owned by
+`workspace_id`, **500** if the re-trigger fails.
 
 ### Abandon a job
 
-Mark a job as permanently abandoned (no further retries).
+Mark a job as permanently abandoned (no further retries). `workspace_id` is **required** and must
+be the workspace that actually owns `job_id` (#177).
 
 ```bash
-curl -s -X POST "$INGEST_BASE/dead-letter/1/abandon" \
+curl -s -X POST "$INGEST_BASE/dead-letter/1/abandon?workspace_id=$WORKSPACE_ID" \
   -H "X-API-Key: $INGEST_KEY" \
   | jq .
 ```
@@ -965,6 +987,8 @@ curl -s -X POST "$INGEST_BASE/dead-letter/1/abandon" \
   "job_id": 1
 }
 ```
+
+Returns **404** if missing or not owned by `workspace_id`.
 
 ---
 
@@ -979,7 +1003,7 @@ curl -s -X POST "$INGEST_BASE/dead-letter/1/abandon" \
 | 401 | Both | Missing API key | Set `X-API-Key` header |
 | 403 | Both | Invalid key / lacks required permission | Use a valid key with the needed permission (ingestion: match `INGESTION_API_KEY`) |
 | 404 | Public API | Document not found in workspace | Check document ID and workspace |
-| 404 | Ingestion | Document not in PostgreSQL (delete), no queryable workflow (status), or dead-letter job not found | Check the document ID / job ID; for status, ensure a workflow has run |
+| 404 | Ingestion | Document/job not owned by the claimed `workspace_id` (status, lineage, delete, dead-letter get/retry/abandon -- #134/#175/#177), or no queryable workflow (status) | Check `workspace_id` matches the document/job's actual owner, and the document ID / job ID; for status, ensure a workflow has run |
 | 409 | Ingestion | Workflow or chunk edit already running, or dead-letter job not in a retriable status | Wait for the in-flight workflow to finish, or check the job status, then retry |
 | 429 | Public API | Rate limit exceeded | Wait and retry; check `Retry-After` header |
 | 503 | Both | Backing service unavailable (Public API: PostgreSQL/Weaviate; Ingestion: Temporal) | Check `GET /health/ready` (public) or `GET /health` (ingestion) |

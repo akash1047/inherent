@@ -22,6 +22,7 @@ from temporalio.exceptions import TerminatedError, WorkflowAlreadyStartedError
 from temporalio.service import RPCError
 
 from src.api.auth import verify_api_key
+from src.api.ownership import resolve_owned_dead_letter_job, resolve_owned_document
 from src.config.settings import Settings
 from src.services.metrics import get_metrics
 from src.temporal.models import (
@@ -368,11 +369,40 @@ def create_app(settings: Settings) -> FastAPI:
     @router.get(
         "/{document_id}/status",
         response_model=WorkflowStatusResponse,
+        responses={404: {"description": "Document not found in the given workspace"}},
     )
-    async def get_ingestion_status(document_id: str, request: Request):
-        """Query the real-time progress of a running ingestion workflow."""
+    async def get_ingestion_status(
+        document_id: str,
+        request: Request,
+        workspace_id: str = Query(..., description="Workspace that must own document_id"),
+    ):
+        """Query the real-time progress of a running ingestion workflow.
+
+        Security (#177): gated only by ``verify_api_key`` before this fix,
+        with no check that the caller's claimed workspace actually owns
+        ``document_id`` -- any caller holding the one shared
+        ``INGESTION_API_KEY`` could poll any other tenant's ingestion
+        progress (step, percent complete, chunk counts) by guessing/
+        enumerating document ids. Mirrors #134's guard: resolve
+        ``document_id`` against PostgreSQL first and 404 unless its stored
+        ``workspace_id`` matches, same response for "no such document" and
+        "wrong workspace" so existence doesn't leak.
+
+        Note: ``processed_documents`` is claimed by the workflow's own first
+        activity (``create_pending_document``), not by this endpoint or by
+        ``POST /ingest`` itself -- so there is an unavoidable, normally
+        sub-second window right after a fresh ``POST /ingest`` where this
+        endpoint can 404 even though the workflow really did start. That is
+        the accepted cost of not being able to answer "who owns
+        document_id" from Temporal alone.
+        """
+        from src.temporal import shared_services
+
         client: Client = request.app.state.temporal_client
         workflow_id = f"ingest-{document_id}"
+
+        db_svc = shared_services.get_db_service()
+        await resolve_owned_document(db_svc, document_id, workspace_id)
 
         try:
             handle = client.get_workflow_handle(workflow_id)
@@ -436,9 +466,13 @@ def create_app(settings: Settings) -> FastAPI:
         stays entirely caller-asserted: this check only rejects a caller
         that gets the pairing wrong, not one that already knows a valid
         (document_id, workspace_id) pair for a workspace it doesn't own --
-        e.g. by reading one out of GET /dead-letter, which returns rows
-        across all workspaces. That gap is tracked separately (#177) and
-        intentionally not folded into this endpoint-level fix.
+        e.g. by reading one out of GET /dead-letter, which used to return
+        rows across all workspaces. #177 closed that specific hole (GET
+        /dead-letter now requires and enforces workspace_id, and the
+        single-job dead-letter routes gained the same ownership guard this
+        endpoint uses), but this endpoint's own check remains consistency-
+        only, not caller entitlement -- see src/api/ownership.py's module
+        docstring for the full picture.
         """
         from src.temporal import shared_services
 
@@ -446,23 +480,16 @@ def create_app(settings: Settings) -> FastAPI:
         settings: Settings = request.app.state.settings
 
         db_svc = shared_services.get_db_service()
-        document = await db_svc.get_document_status(document_id)
-
-        # OWNERSHIP GUARD -- must run, and must keep returning exactly this
-        # response, before ANY other check on `document` (including the
-        # chunk_count check right below). Same response for "no such
-        # document" and "exists in a workspace you don't own" -- a
-        # distinguishable error would leak cross-tenant existence of the
-        # document_id. Do not reorder the chunk_count check above this one:
-        # it also 404s and it also reads from `document`, so swapping the
-        # order would let an attacker distinguish "wrong workspace" from
-        # "chunk_index out of range" for a document it doesn't own --
-        # reintroducing the #134 existence leak this guard exists to close.
-        if document is None or document.get("workspace_id") != workspace_id:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Document {document_id} not found in workspace {workspace_id}.",
-            )
+        # OWNERSHIP GUARD -- must run, and must keep returning exactly the
+        # same 404 for both cases (see resolve_owned_document's docstring),
+        # before ANY other check on `document` (including the chunk_count
+        # check right below). Do not reorder the chunk_count check above
+        # this one: it also 404s and it also reads from `document`, so
+        # swapping the order would let an attacker distinguish "wrong
+        # workspace" from "chunk_index out of range" for a document it
+        # doesn't own -- reintroducing the #134 existence leak this guard
+        # exists to close.
+        document = await resolve_owned_document(db_svc, document_id, workspace_id)
 
         # Reject an out-of-range chunk_index before doing any more work
         # (#134 follow-up item 8): get_document_status already returned
@@ -537,28 +564,55 @@ def create_app(settings: Settings) -> FastAPI:
     @documents_router.delete(
         "/{document_id}",
         response_model=DeleteDocumentResponse,
+        responses={404: {"description": "Document not found in the given workspace"}},
     )
     async def delete_document(
         document_id: str,
         request: Request,
-        workspace_id: str = Query(..., description="Workspace ID"),
-        user_id: str = Query(..., description="User ID"),
+        workspace_id: str = Query(..., description="Workspace that must own document_id"),
+        user_id: str = Query(
+            ...,
+            description=(
+                "Ignored for authorization (kept for backward-compatible request "
+                "shape) -- the resolved document's own user_id is always used."
+            ),
+        ),
     ):
         """Delete a document from PostgreSQL and its chunks from Weaviate.
+
+        Security (#175): same missing-ownership-check pattern as #134.
+        Before this fix, workspace_id/user_id were caller-supplied and used
+        UNVERIFIED: the Weaviate cleanup call picked its collection/tenant
+        from them directly, and the PostgreSQL delete matched on
+        document_id alone -- a caller that knew (or guessed/enumerated) a
+        document_id could delete it from PostgreSQL and attempt Weaviate
+        cleanup under ANY workspace_id/user_id it supplied, including a
+        foreign tenant's. Mirrors #134's guard: document_id is resolved
+        against PostgreSQL and 404s unless its stored workspace_id matches
+        the caller's claim (same response for "no such document" and
+        "wrong workspace", so existence doesn't leak). Only the *resolved*
+        workspace_id/user_id -- never the caller-supplied ones -- drive the
+        Weaviate tenant lookup and scope the PostgreSQL delete's own WHERE
+        clause.
 
         Weaviate cleanup is best-effort: if it fails, the PG delete still
         succeeds and the response indicates ``weaviate_cleaned=false``.
         """
         from src.temporal import shared_services
 
+        db_svc = shared_services.get_db_service()
+        document = await resolve_owned_document(db_svc, document_id, workspace_id)
+        resolved_workspace_id: str = document["workspace_id"]
+        resolved_user_id: str = document["user_id"]
+
         # --- Weaviate cleanup (best-effort, before PG delete) ---
         weaviate_cleaned = False
         weaviate_svc = shared_services.get_weaviate_service()
         if weaviate_svc is not None:
             weaviate_cleaned, _ = await weaviate_svc.delete_document_chunks_graceful(
-                workspace_id=workspace_id,
+                workspace_id=resolved_workspace_id,
                 document_id=document_id,
-                user_id=user_id,
+                user_id=resolved_user_id,
             )
         else:
             logger.warning(
@@ -567,8 +621,13 @@ def create_app(settings: Settings) -> FastAPI:
             )
 
         # --- PostgreSQL delete ---
-        db_svc = shared_services.get_db_service()
-        deleted = await db_svc.delete_document(document_id)
+        # Scoped to resolved_workspace_id as defense-in-depth against a
+        # TOCTOU race between the ownership check above and this delete
+        # (see DatabaseService.delete_document's docstring) -- the normal
+        # not-found/wrong-workspace case is already caught by
+        # resolve_owned_document above, so `not deleted` here means the
+        # row vanished in between, not a routine miss.
+        deleted = await db_svc.delete_document(document_id, workspace_id=resolved_workspace_id)
 
         if not deleted:
             raise HTTPException(
@@ -579,8 +638,8 @@ def create_app(settings: Settings) -> FastAPI:
         logger.info(
             "Document deleted",
             document_id=document_id,
-            workspace_id=workspace_id,
-            user_id=user_id,
+            workspace_id=resolved_workspace_id,
+            user_id=resolved_user_id,
             weaviate_cleaned=weaviate_cleaned,
         )
 
@@ -602,16 +661,32 @@ def create_app(settings: Settings) -> FastAPI:
         dependencies=[Depends(verify_api_key)],
     )
 
-    @lineage_router.get("/{document_id}")
-    async def get_lineage(document_id: str):
+    @lineage_router.get(
+        "/{document_id}",
+        responses={404: {"description": "Document not found in the given workspace"}},
+    )
+    async def get_lineage(
+        document_id: str,
+        workspace_id: str = Query(..., description="Workspace that must own document_id"),
+    ):
         """Get data lineage (ingestion events) for a document.
 
         Returns an ordered list of pipeline step events showing what
         happened during ingestion of the given document.
+
+        Security (#177): gated only by ``verify_api_key`` before this fix,
+        with no check that the caller's claimed workspace actually owns
+        ``document_id`` -- any caller holding the shared
+        ``INGESTION_API_KEY`` could read any other tenant's ingestion
+        pipeline events (including error messages, which can carry
+        sensitive detail). Mirrors #134's guard: see
+        ``src.api.ownership.resolve_owned_document``.
         """
         from src.temporal import shared_services
 
         db_svc = shared_services.get_db_service()
+        await resolve_owned_document(db_svc, document_id, workspace_id)
+
         events = await db_svc.get_ingestion_events(document_id)
 
         # Convert datetime objects to ISO strings for JSON serialization
@@ -641,11 +716,27 @@ def create_app(settings: Settings) -> FastAPI:
 
     @dl_router.get("")
     async def list_dead_letter_jobs(
-        workspace_id: str | None = Query(None),
+        workspace_id: str = Query(
+            ..., description="Workspace to list dead-letter jobs for (required, #177)"
+        ),
         status: str | None = Query("pending"),
         limit: int = Query(50, ge=1, le=200),
     ):
-        """List dead-letter jobs with optional filtering."""
+        """List dead-letter jobs, scoped to a workspace.
+
+        Security (#177): ``workspace_id`` was an OPTIONAL filter -- omitting
+        it returned dead-letter rows across EVERY workspace, each carrying a
+        genuine ``(document_id, workspace_id, user_id)`` triple. That is the
+        sharpest edge in the #177 escalation chain: a caller holding only
+        the shared ``INGESTION_API_KEY`` could harvest a real cross-tenant
+        pair here, then present it to ``PATCH /chunks/{document_id}/{chunk_index}``
+        -- #134's ownership guard checks (document_id, workspace_id)
+        CONSISTENCY, which this harvested pair genuinely satisfies, so it
+        would pass. ``workspace_id`` is now REQUIRED and always enforced as
+        a DB-level filter (``DatabaseService.get_dead_letter_jobs``), never
+        an optional one -- this endpoint can no longer be the source of a
+        genuine cross-tenant pair.
+        """
         from src.temporal import shared_services
 
         db_svc = shared_services.get_db_service()
@@ -667,15 +758,28 @@ def create_app(settings: Settings) -> FastAPI:
 
         return {"jobs": serialized, "total": len(serialized)}
 
-    @dl_router.get("/{job_id}")
-    async def get_dead_letter_job(job_id: int):
-        """Get a single dead-letter job by ID."""
+    @dl_router.get(
+        "/{job_id}",
+        responses={404: {"description": "Job not found in the given workspace"}},
+    )
+    async def get_dead_letter_job(
+        job_id: int,
+        workspace_id: str = Query(..., description="Workspace that must own job_id"),
+    ):
+        """Get a single dead-letter job by ID.
+
+        Security (#177): gated only by ``verify_api_key`` before this fix,
+        with no check that the caller's claimed workspace actually owns
+        ``job_id`` -- any caller holding the shared ``INGESTION_API_KEY``
+        could enumerate small integer job ids and read any tenant's
+        dead-letter row (including its ``original_message`` payload).
+        Mirrors #134's guard, applied to ``dead_letter_jobs``: see
+        ``src.api.ownership.resolve_owned_dead_letter_job``.
+        """
         from src.temporal import shared_services
 
         db_svc = shared_services.get_db_service()
-        job = await db_svc.get_dead_letter_job(job_id)
-        if not job:
-            raise HTTPException(status_code=404, detail=f"Dead-letter job {job_id} not found")
+        job = await resolve_owned_dead_letter_job(db_svc, job_id, workspace_id)
 
         row = {}
         for key, value in job.items():
@@ -685,15 +789,27 @@ def create_app(settings: Settings) -> FastAPI:
                 row[key] = value
         return row
 
-    @dl_router.post("/{job_id}/retry")
-    async def retry_dead_letter_job(job_id: int, request: Request):
-        """Retry a dead-letter job by re-publishing its original message."""
+    @dl_router.post(
+        "/{job_id}/retry",
+        responses={404: {"description": "Job not found in the given workspace"}},
+    )
+    async def retry_dead_letter_job(
+        job_id: int,
+        request: Request,
+        workspace_id: str = Query(..., description="Workspace that must own job_id"),
+    ):
+        """Retry a dead-letter job by re-publishing its original message.
+
+        Security (#177): a write, gated only by ``verify_api_key`` before
+        this fix -- any caller holding the shared ``INGESTION_API_KEY``
+        could re-trigger ingestion for any tenant's failed job by
+        enumerating job ids, with no check it owned the job. Mirrors #134's
+        guard: see ``src.api.ownership.resolve_owned_dead_letter_job``.
+        """
         from src.temporal import shared_services
 
         db_svc = shared_services.get_db_service()
-        job = await db_svc.get_dead_letter_job(job_id)
-        if not job:
-            raise HTTPException(status_code=404, detail=f"Dead-letter job {job_id} not found")
+        job = await resolve_owned_dead_letter_job(db_svc, job_id, workspace_id)
 
         if job.get("status") not in ("pending", "retrying"):
             raise HTTPException(
@@ -724,15 +840,27 @@ def create_app(settings: Settings) -> FastAPI:
             await db_svc.update_dead_letter_status(job_id, "pending")
             raise HTTPException(status_code=500, detail=f"Retry failed: {e}") from e
 
-    @dl_router.post("/{job_id}/abandon")
-    async def abandon_dead_letter_job(job_id: int):
-        """Mark a dead-letter job as permanently abandoned."""
+    @dl_router.post(
+        "/{job_id}/abandon",
+        responses={404: {"description": "Job not found in the given workspace"}},
+    )
+    async def abandon_dead_letter_job(
+        job_id: int,
+        workspace_id: str = Query(..., description="Workspace that must own job_id"),
+    ):
+        """Mark a dead-letter job as permanently abandoned.
+
+        Security (#177): a write, gated only by ``verify_api_key`` before
+        this fix -- any caller holding the shared ``INGESTION_API_KEY``
+        could abandon any tenant's failed job (silently suppressing its
+        recovery) by enumerating job ids, with no check it owned the job.
+        Mirrors #134's guard: see
+        ``src.api.ownership.resolve_owned_dead_letter_job``.
+        """
         from src.temporal import shared_services
 
         db_svc = shared_services.get_db_service()
-        job = await db_svc.get_dead_letter_job(job_id)
-        if not job:
-            raise HTTPException(status_code=404, detail=f"Dead-letter job {job_id} not found")
+        await resolve_owned_dead_letter_job(db_svc, job_id, workspace_id)
 
         await db_svc.update_dead_letter_status(job_id, "abandoned")
         return {"abandoned": True, "job_id": job_id}

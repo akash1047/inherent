@@ -285,13 +285,26 @@ class TestIngestTrigger:
 
 
 class TestIngestStatus:
-    """GET /ingest/{document_id}/status endpoint."""
+    """GET /ingest/{document_id}/status endpoint.
+
+    Security (#177): the endpoint now requires workspace_id and verifies
+    ownership against PostgreSQL (mirrors #134) before ever touching
+    Temporal -- see tests/test_ingestion_ownership.py for the full
+    owner-allowed / non-owner-denied / lookup-failure-denies matrix. These
+    two tests just confirm the pre-existing happy-path and Temporal-404
+    behavior still work once a legitimate owner is proven.
+    """
 
     def test_returns_workflow_status(self, client: TestClient):
-        resp = client.get(
-            "/ingest/doc_001/status",
-            headers={"X-API-Key": VALID_API_KEY},
+        mock_db = MagicMock()
+        mock_db.get_document_status = AsyncMock(
+            return_value={"document_id": "doc_001", "workspace_id": "ws_001", "user_id": "u1"}
         )
+        with patch("src.temporal.shared_services.get_db_service", return_value=mock_db):
+            resp = client.get(
+                "/ingest/doc_001/status?workspace_id=ws_001",
+                headers={"X-API-Key": VALID_API_KEY},
+            )
         assert resp.status_code == 200
         data = resp.json()
         assert data["workflow_id"] == "ingest-doc_001"
@@ -311,10 +324,15 @@ class TestIngestStatus:
         )
         client._mock_temporal_client.get_workflow_handle = MagicMock(return_value=mock_handle)
 
-        resp = client.get(
-            "/ingest/nonexistent/status",
-            headers={"X-API-Key": VALID_API_KEY},
+        mock_db = MagicMock()
+        mock_db.get_document_status = AsyncMock(
+            return_value={"document_id": "nonexistent", "workspace_id": "ws_001", "user_id": "u1"}
         )
+        with patch("src.temporal.shared_services.get_db_service", return_value=mock_db):
+            resp = client.get(
+                "/ingest/nonexistent/status?workspace_id=ws_001",
+                headers={"X-API-Key": VALID_API_KEY},
+            )
         assert resp.status_code == 404
 
 
@@ -366,6 +384,7 @@ class TestDeadLetterRetrySupersedePolicy:
                 return_value={
                     "id": 1,
                     "status": "pending",
+                    "workspace_id": "ws_001",
                     "original_message": _DEAD_LETTER_ORIGINAL_MESSAGE,
                 }
             )
@@ -373,7 +392,10 @@ class TestDeadLetterRetrySupersedePolicy:
             mock_db.update_dead_letter_status = AsyncMock()
             mock_get_db.return_value = mock_db
 
-            resp = client.post("/dead-letter/1/retry", headers={"X-API-Key": VALID_API_KEY})
+            resp = client.post(
+                "/dead-letter/1/retry?workspace_id=ws_001",
+                headers={"X-API-Key": VALID_API_KEY},
+            )
 
         assert resp.status_code == 200
         fake_trigger.trigger_workflow_async.assert_awaited_once()
@@ -413,6 +435,7 @@ class TestDeadLetterRetrySupersedePolicy:
                     return_value={
                         "id": 1,
                         "status": "pending",
+                        "workspace_id": "ws_001",
                         "original_message": _DEAD_LETTER_ORIGINAL_MESSAGE,
                     }
                 )
@@ -420,7 +443,10 @@ class TestDeadLetterRetrySupersedePolicy:
                 mock_db.update_dead_letter_status = AsyncMock()
                 mock_get_db.return_value = mock_db
 
-                resp = client.post("/dead-letter/1/retry", headers={"X-API-Key": VALID_API_KEY})
+                resp = client.post(
+                    "/dead-letter/1/retry?workspace_id=ws_001",
+                    headers={"X-API-Key": VALID_API_KEY},
+                )
 
             assert resp.status_code == 500
             mock_db.update_dead_letter_status.assert_awaited_once_with(1, "pending")

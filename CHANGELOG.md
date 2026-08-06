@@ -537,6 +537,43 @@ All notable changes to Inherent are documented here. The format follows
 
 ### Security
 
+- **Seven more inh-ingestion-svc endpoints trusted a caller-supplied
+  `workspace_id`/`document_id`/`job_id` with no ownership check, closing the
+  `GET /dead-letter` → `PATCH /chunks` escalation chain #134 flagged as
+  unresolved.** `DELETE /documents/{document_id}` (#175) and six more routes
+  (#177) — `GET /ingest/{document_id}/status`, `GET /lineage/{document_id}`,
+  `GET /dead-letter`, `GET /dead-letter/{job_id}`,
+  `POST /dead-letter/{job_id}/retry`, `POST /dead-letter/{job_id}/abandon` —
+  were gated only by `verify_api_key`. `DELETE /documents` additionally used
+  the caller-supplied `workspace_id`/`user_id` UNVERIFIED to pick the
+  Weaviate tenant to delete from and never scoped the PostgreSQL delete at
+  all. `GET /dead-letter` was the sharpest edge: `workspace_id` was an
+  *optional* filter, so omitting it returned dead-letter rows — each
+  carrying a genuine `(document_id, workspace_id, user_id)` triple — across
+  every tenant. A caller holding only the shared `INGESTION_API_KEY` could
+  harvest a real cross-tenant pair there and present it to
+  `PATCH /chunks/{document_id}/{chunk_index}`: #134's guard checks
+  `(document_id, workspace_id)` *consistency*, which a harvested pair
+  genuinely satisfies, so it would pass and let the caller overwrite (and
+  re-embed) a victim's chunk. All seven routes now mirror #134's
+  match-or-404 guard (`src/api/ownership.py`, shared by both
+  `resolve_owned_document` and `resolve_owned_dead_letter_job`): resolve the
+  row against PostgreSQL first, 404 unless its stored `workspace_id` matches
+  the caller's claim (same response for missing vs. foreign-workspace, so
+  existence doesn't leak), and use only the *resolved* workspace_id/user_id
+  downstream — never the caller-supplied ones. `GET /dead-letter` also makes
+  `workspace_id` a *required*, always-enforced filter instead of an optional
+  one. A PostgreSQL failure during any of these lookups propagates as a 5xx;
+  none of them fail open. (#175, #177)
+- **⚠️ BREAKING (API) — `workspace_id` is now a required query param on six
+  more inh-ingestion-svc routes, and on `DELETE /documents/{document_id}` it
+  is now verified, not just accepted.** Required by the fix above; a request
+  omitting `workspace_id` on `GET /ingest/{document_id}/status`,
+  `GET /lineage/{document_id}`, `GET /dead-letter`, `GET /dead-letter/{job_id}`,
+  `POST /dead-letter/{job_id}/retry`, or `POST /dead-letter/{job_id}/abandon`
+  now gets **422** instead of the previous (unscoped) behavior. Every
+  existing caller of these inh-ingestion-svc-internal endpoints must add
+  `?workspace_id=<ws>`. (#175, #177)
 - **`edit_chunk` wrote to Weaviate with no workspace scoping.**
   `PATCH /chunks/{document_id}/{chunk_index}` (inh-ingestion-svc) was gated
   only by `verify_api_key`, with `workspace_id`/`user_id` left unset on
@@ -550,10 +587,11 @@ All notable changes to Inherent are documented here. The format follows
   `verify_api_key` is one shared secret with no key->workspace binding
   (unlike the public API's `resolve_workspace_read`), so a caller that
   already holds a valid `(document_id, workspace_id)` pair for a workspace
-  it doesn't own is still not stopped by this fix — five more
-  inh-ingestion-svc endpoints share that gap, including a
-  `GET /dead-letter` → `PATCH /chunks` escalation chain, tracked separately
-  and not yet fixed (#177, #175). (#134)
+  it doesn't own is still not stopped by this fix on its own — seven more
+  inh-ingestion-svc endpoints shared that gap, including a
+  `GET /dead-letter` → `PATCH /chunks` escalation chain; see the (#175,
+  #177) entry above, which closes it by making `GET /dead-letter` unable to
+  hand out a genuine cross-tenant pair in the first place. (#134)
 - **⚠️ BREAKING (API) — `workspace_id` is now a required query param on
   `PATCH /chunks/{document_id}/{chunk_index}`.** Required by the fix above;
   a request omitting it now gets **422** instead of editing the chunk. Every
