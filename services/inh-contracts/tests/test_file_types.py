@@ -71,7 +71,9 @@ class TestRegistryShape:
                 )
 
     def test_current_registered_formats_are_exactly_these(self):
-        """Pins the eight formats that existed pre-#117 migrated with no
+        """Pins the full registered format set (20 as of #121/#122/#127).
+
+        The eight pre-#117 formats migrated with no
         loss (acceptance criterion: 'All 8 current formats migrate to
         registry entries with behavior unchanged')."""
         keys = {spec.key for spec in FILE_TYPE_REGISTRY}
@@ -388,7 +390,7 @@ class TestStructuredTextSpecs:
 
 
 class TestSourceCodeSpec:
-    # The exact 20-extension allowlist named in #122's proposed contract.
+    # The exact 21-extension allowlist named in #122's proposed contract.
     EXTENSIONS = (
         ".py",
         ".js",

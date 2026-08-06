@@ -48,7 +48,7 @@ All notable changes to Inherent are documented here. The format follows
   rejecting the upload. XML tags are stripped via the same BeautifulSoup
   `html.parser` path as HTML — a deliberate, XXE-safe choice (no DTD/entity
   resolution); attribute values are dropped, only element text survives.
-- **Source code: explicit extension contract (#122).** A 20-extension
+- **Source code: explicit extension contract (#122).** A 21-extension
   allowlist (`.py .js .ts .tsx .jsx .go .java .rs .c .h .cpp .cs .rb .php
   .swift .kt .scala .sh .sql .r .lua`) plus accepted MIME aliases
   (`text/x-python`, `application/javascript`, `application/x-sh`,

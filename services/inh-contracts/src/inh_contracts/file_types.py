@@ -467,7 +467,7 @@ FILE_TYPE_REGISTRY: tuple[FileTypeSpec, ...] = (
         chunking_hint="structured",
     ),
     # -- #122: source code -- explicit extension contract ----------------
-    # The 20-extension allowlist IS the contract (`extensions` below is the
+    # The 21-extension allowlist IS the contract (`extensions` below is the
     # authoritative source of truth per the issue) -- `mime_types` is an
     # accepted-alias convenience layer on top of it, not the gate: a client
     # sending a generic/absent content type (see `get_spec_for_upload`)
@@ -955,7 +955,7 @@ def check_extension_consistency(filename: str, declared_spec: FileTypeSpec) -> N
     was declared) and broke working callers.
 
     Deliberately permissive when the extension is NOT one this registry
-    recognizes at all (e.g. ``.log``, ``.yaml`` -- formats #117 doesn't cover
+    recognizes at all (e.g. ``.log``, ``.rst`` -- formats the registry doesn't cover
     yet, or no extension at all, e.g. the REST route's ``"unnamed"``
     fallback): content type remains the authoritative signal, and an
     unrecognized extension is not evidence of anything.
