@@ -18,6 +18,17 @@ and the per-route dependencies). A key missing the required permission gets a
 clear ``Error: ...`` response and the tool body NEVER runs — exactly like the
 REST 403 path. Each tool's permission lives on its ``_TOOLS`` entry.
 
+Expiry parity (#180)
+---------------------
+``call_tool`` calls ``key_info.is_expired()`` itself, immediately after
+``validate_api_key`` returns and before any registry/permission lookup —
+mirroring REST's ``require_api_key`` (``src/services/auth.py``), which
+likewise re-checks expiry rather than trusting the DB layer alone. Do not
+remove this check on the assumption that "the DB query already filters
+``expires_at``" — that is true of the current Postgres-backed
+``DatabaseService`` but is not a contract every implementation is guaranteed
+to uphold, and REST does not make that assumption either.
+
 Search-feature parity (#14)
 ---------------------------
 ``search_documents`` / ``search_memory`` expose the same knobs as POST
@@ -224,6 +235,20 @@ def create_mcp_server() -> Server:
 
             if not key_info:
                 return [TextContent(type="text", text="Error: Invalid or expired API key")]
+
+            # Expiry parity with REST (#180): require_api_key
+            # (src/services/auth.py) calls key_info.is_expired() itself after
+            # validate_api_key returns, rather than trusting the DB layer
+            # alone to have filtered an expired row. The real Postgres-backed
+            # DatabaseService.validate_api_key happens to filter expiry too
+            # (so this was not exploitable through it), but MCP's dispatcher
+            # previously had no check of its own — any alternate
+            # DatabaseService implementation that returned an already-expired
+            # key_info would be silently accepted here while REST rejected
+            # the identical key. Checked before the registry lookup so an
+            # expired key never reaches permission checks or a tool handler.
+            if key_info.is_expired():
+                return [TextContent(type="text", text="Error: API key has expired")]
 
             # Registry lookup (#100): advertisement, permission, and dispatch
             # all come from the same ToolDef, so they cannot disagree.

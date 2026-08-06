@@ -22,7 +22,7 @@ compensating mark-failed path on EVERY surface that runs it.
 from __future__ import annotations
 
 import io
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -981,3 +981,82 @@ class TestUploadCodeContentTypeLabelParity:
         # The pin: both surfaces land on the exact same label for the exact
         # same file.
         assert mcp_stored_content_type == rest_stored_content_type
+
+
+# ---------------------------------------------------------------------------
+# Auth: an expired key must be rejected on both surfaces, INDEPENDENT of
+# whether the DatabaseService implementation itself filters expiry (#180)
+# ---------------------------------------------------------------------------
+
+
+class TestExpiredKeyDispatcherParity:
+    """REST's ``require_api_key`` (src/services/auth.py) calls
+    ``key_info.is_expired()`` itself, AFTER ``validate_api_key`` returns —
+    see tests/security/test_auth_regression.py::test_expired_key_is_unauthorized,
+    which proves this by making the mocked ``database.validate_api_key`` return
+    an already-expired ``APIKeyInfo`` directly (bypassing the real Postgres
+    implementation's own ``expires_at`` filter) and asserting ``require_api_key``
+    STILL 401s. That is the load-bearing half of the contract: REST does not
+    trust the DB layer alone to enforce expiry.
+
+    Before #180, MCP's ``call_tool`` dispatcher had no equivalent check — it
+    dispatched straight to the tool handler once ``database.validate_api_key``
+    returned a non-None ``key_info``, trusting that EVERY ``DatabaseService``
+    implementation (present and future) independently re-checks
+    ``expires_at``. The real Postgres-backed implementation happens to do
+    this, so the gap was not exploitable through it — but the dispatcher
+    itself carried no such guarantee, which is exactly the "primary path
+    correct, failure path next to it wrong" shape CLAUDE.md's parity rule
+    exists to catch.
+
+    This test drives the SAME scenario as the REST regression test above
+    (``database.validate_api_key`` returns an expired key_info directly, not
+    filtered by any real DB query) through the real MCP dispatcher, and pins
+    that it now refuses to dispatch — mirroring REST's own
+    "don't trust the DB layer alone" posture, not just its current outcome.
+    """
+
+    def _expired_key(self) -> APIKeyInfo:
+        return APIKeyInfo(
+            key_id="key-expired",
+            user_id="user-1",
+            workspace_id=None,
+            permissions=["read", "search", "write"],  # type: ignore[arg-type]
+            rate_limit=100,
+            expires_at=datetime.now(timezone.utc) - timedelta(days=1),
+            status="active",
+        )
+
+    async def test_mcp_dispatcher_rejects_expired_key_even_when_db_layer_does_not_filter_it(self):
+        db = _mock_db()
+        # Simulates a DatabaseService implementation that does NOT filter
+        # expired rows itself (unlike the real Postgres-backed one) —
+        # exactly the alternate-backend scenario #180 describes.
+        db.validate_api_key = AsyncMock(return_value=self._expired_key())
+
+        result = await _call_mcp_tool(
+            "list_documents", {"api_key": "ink_expired"}, db
+        )
+
+        # Byte-for-byte the same wording REST's require_api_key raises for an
+        # expired key (src/services/auth.py), just "Error: "-prefixed per the
+        # MCP text convention — so the two surfaces don't merely reject, they
+        # describe the SAME rejection the same way.
+        assert result[0].text == "Error: API key has expired"
+        # The tool body must never run: no workspace lookup, no document
+        # listing — proving the check happens in the dispatcher itself,
+        # before any handler is reached.
+        db.get_user_workspace_ids.assert_not_awaited()
+        db.get_documents_multi_workspace.assert_not_awaited()
+
+    async def test_mcp_dispatcher_still_allows_a_non_expired_key(self):
+        """Sanity: the new check is not over-broad — a key with no expiry
+        (or a future one) still dispatches normally."""
+        db = _mock_db()
+        db.get_documents_multi_workspace = AsyncMock(return_value=([], 0))
+
+        result = await _call_mcp_tool(
+            "list_documents", {"api_key": "ink_k"}, db
+        )
+
+        assert "Error" not in result[0].text
