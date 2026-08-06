@@ -7,6 +7,59 @@ All notable changes to Inherent are documented here. The format follows
 
 ### Added
 
+- **⚠️ BREAKING (behavior) — format-aware chunking driven by the registry
+  `chunking_hint` (#129).** `chunk_text` previously resolved
+  sentences/paragraphs/tokens purely from config — the same rule for a
+  one-page memo and a 10,000-row XLSX. Measured cost: a 10,000-row XLSX
+  (510,258 extracted chars) chunked with the old default (`tokens`, max
+  1000, overlap 200) produced 644 chunks, of which only 240 carried both the
+  sheet heading and the column header row (#118's periodic 50-row
+  re-emission is a partial mitigation, not a fix); a synthetic `.eml`
+  produced 12 chunks, of which exactly 1 carried both `From:` and
+  `Subject:`. `chunk_text` now resolves its strategy by precedence:
+  per-document override > registry `chunking_hint`
+  (`inh_contracts.FILE_TYPE_REGISTRY`, #117) > global `CHUNKING_STRATEGY`.
+  Every one of the 14 currently-registered formats has a hint, so
+  **`CHUNKING_STRATEGY` no longer governs chunking for any of them** —
+  it is now consulted only for a content type with no registry entry
+  (already a rare, near-error path since #117 hard-fails unregistered types
+  at extraction). A deployment that set `CHUNKING_STRATEGY` to something
+  other than the default `sentences` to get a specific behavior across every
+  format will see that setting stop taking effect on upgrade. **Upgrade:**
+  pass the desired strategy as a per-document override
+  (`chunking_strategy` on upload) if you need one strategy forced uniformly;
+  `CHUNKING_STRATEGY` remains the correct lever only for genuinely
+  unregistered content types. Hint dispatch: `tabular` (csv, xlsx)
+  row-based chunking that never splits a row and carries the table header
+  (+ XLSX sheet heading) into every chunk; `structured` (json, pptx)
+  section-based chunking split at the extractor's own `## ` markers,
+  degrading to size-based chunking when none exist; `prose` (txt, markdown,
+  docx, eml, epub, rtf, odt, pdf, html) unchanged sentence chunking unless
+  the text opens with a `Key: value` header block (an email's
+  From/To/Cc/Date/Subject), in which case that block is carried into every
+  chunk instead of only the one positionally containing it; `media` (png)
+  unchanged size-based chunking. Measured after: the same XLSX produces 601
+  chunks, 601/601 (100%) self-describing, at **15.7% fewer** total content
+  chars/tokens overall (row-based packing has no overlap duplication, unlike
+  the old `tokens` strategy's 200-char overlap); the same `.eml` produces
+  12/12 (100%) self-describing chunks at **+11% chars / +6% tokens** (the
+  injected header cost). Every chunk now records the strategy that produced
+  it in `metadata.chunking_strategy` (`rows` / `sections` / `prose_header` /
+  `sentences` / `paragraphs` / `tokens`) for eval attribution, persisted in
+  Postgres `document_chunks` metadata JSONB and as a new Weaviate
+  `chunking_strategy` TEXT property (added to `_get_chunk_properties`;
+  existing collections pick it up via the existing
+  `_reconcile_collection_properties` add-missing-property path — additive,
+  no manual migration needed). Surfacing it through `inh-public-api-svc`'s
+  search response is tracked separately (#196) — that service's GraphQL
+  query has an explicit field list that doesn't select it yet. See
+  `docs/reference/configuration.md`'s new "Format-aware chunking" subsection
+  and the module docstring in
+  `services/inh-ingestion-svc/src/temporal/activities/chunk.py`.
+  **Existing indexed documents are unaffected by this release** — they keep
+  their old chunk boundaries until re-ingested/refreshed; there is no
+  migration or backfill in this change, so search results mix old- and
+  new-style chunks until a workspace's documents are re-ingested.
 - **XLSX and PPTX upload/extraction support (#118, #119).** Both are now
   `FILE_TYPE_REGISTRY` entries (#117): XLSX
   (`application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`,

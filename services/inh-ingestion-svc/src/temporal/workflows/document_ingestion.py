@@ -422,6 +422,10 @@ class DocumentIngestionWorkflow:
                     max_chunk_size=input.max_chunk_size,
                     chunk_overlap=input.chunk_overlap,
                     workspace_id=input.workspace_id,
+                    # Format-aware chunking (#129): lets the activity resolve
+                    # the registry chunking_hint when no explicit per-document
+                    # strategy override was given.
+                    content_type=input.content_type,
                 ),
                 start_to_close_timeout=timedelta(minutes=2),
                 retry_policy=RetryPolicy(

@@ -194,6 +194,14 @@ class ChunkData:
     # Defaults keep older staged chunks valid; the chunk activity always sets them.
     content_risk: str = "none"
     content_risk_reasons: list[str] = field(default_factory=list)
+    # Which chunking strategy actually produced this chunk (#129), e.g.
+    # "rows" | "sections" | "prose_header" | "sentences" | "paragraphs" |
+    # "tokens". Populated by the chunk activity's dispatch, never by the
+    # individual _chunk_by_* helpers themselves (single place to keep it
+    # consistent with what was actually dispatched -- see _chunk_text_inner).
+    # Defaults to "" so a chunk built without going through the activity
+    # (unit tests constructing ChunkData directly) stays valid.
+    chunking_strategy: str = ""
 
 
 @dataclass
@@ -211,6 +219,13 @@ class ChunkTextInput:
     max_chunk_size: int | None = None
     chunk_overlap: int | None = None
     workspace_id: str | None = None
+    # The document's declared content type (#129). Used to resolve the
+    # registry's chunking_hint (services/inh-contracts/src/inh_contracts/
+    # file_types.py) when `strategy` above is not an explicit per-document
+    # override. Optional/nullable so an older caller that doesn't pass it
+    # (or a content type with no registry entry) degrades to the pre-#129
+    # global-config dispatch instead of crashing -- see _chunk_text_inner.
+    content_type: str | None = None
 
 
 @dataclass

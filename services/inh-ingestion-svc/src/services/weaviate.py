@@ -158,6 +158,13 @@ class WeaviateService:
             # content_risk_reasons holds the matched reason codes.
             Property(name="content_risk", data_type=DataType.TEXT),
             Property(name="content_risk_reasons", data_type=DataType.TEXT_ARRAY),
+            # Format-aware chunking attribution (#129): which strategy
+            # ("rows" | "sections" | "prose_header" | "sentences" |
+            # "paragraphs" | "tokens") actually produced this chunk, so the
+            # #34 eval suite can measure retrieval quality per strategy, not
+            # just per file type. Same promote-from-chunk-metadata pattern
+            # as content_risk above.
+            Property(name="chunking_strategy", data_type=DataType.TEXT),
         ]
 
     def _reconcile_collection_properties(self, collection_name: str) -> None:
@@ -489,6 +496,12 @@ class WeaviateService:
                     chunk_meta = chunk.metadata or {}
                     content_risk = chunk_meta.get("content_risk") or "none"
                     content_risk_reasons = list(chunk_meta.get("content_risk_reasons") or [])
+                    # Format-aware chunking attribution (#129): same
+                    # promote-from-metadata pattern as content_risk above.
+                    # Empty string (not None) for a chunk staged before this
+                    # field existed, so the property is always a real TEXT
+                    # value Weaviate can filter/aggregate on.
+                    chunking_strategy = chunk_meta.get("chunking_strategy") or ""
 
                     properties = {
                         "document_id": document_id,
@@ -511,6 +524,7 @@ class WeaviateService:
                         # Risk signal (#44): additive, NON-BLOCKING.
                         "content_risk": content_risk,
                         "content_risk_reasons": content_risk_reasons,
+                        "chunking_strategy": chunking_strategy,
                     }
 
                     # Generate deterministic UUID
