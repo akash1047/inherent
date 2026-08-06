@@ -189,6 +189,38 @@ class FileTypeSpec:
     # contradiction that must stay caught.
     extension_check_exempt: bool = False
 
+    # Per-extension override resolving to a SPECIFIC canonical MIME type,
+    # needed only by a spec whose `mime_types` pools MULTIPLE distinct
+    # sub-formats under one registry entry (#197; currently only "code" --
+    # #122's 21 extensions sharing one extractor). `mime_types[0]` is a fine
+    # stand-in for "the" MIME type when a spec describes exactly ONE format
+    # (every other current entry) -- it is NOT a stand-in for a SPECIFIC
+    # extension when `mime_types` is actually a pool of aliases spanning many
+    # distinct languages: before this field existed, every code file
+    # uploaded over MCP with `content_type` omitted resolved to
+    # `mime_types[0]` == "text/x-python" regardless of whether it was a .go,
+    # .java, or .sql file (verified in #197: app.js, lib.go, Main.java,
+    # q.sql, s.sh, x.rs all mislabelled identically). None (the default,
+    # every spec but "code") means "mime_types[0] IS the answer for every
+    # extension this spec declares" -- see `mime_type_for_extension` below,
+    # the one place this field is consulted.
+    #
+    # A tuple of (extension, mime) pairs -- NOT a `dict` (review follow-up:
+    # a plain `dict` field breaks this `@dataclass(frozen=True)`'s own
+    # contract two ways at once: `hash(spec)` / `set(FILE_TYPE_REGISTRY)`
+    # raise `TypeError: unhashable type: 'dict'` the moment anything hashes
+    # a spec, and `spec.mime_type_by_extension['.py'] = 'x'` mutates the
+    # process-global registry despite `frozen=True`, since freezing a
+    # dataclass only blocks reassigning its OWN attributes, not mutating a
+    # mutable object one of them points to. `MappingProxyType` fixes the
+    # second problem but not the first -- a proxy of a dict is itself
+    # unhashable. A tuple of pairs is both immutable and hashable, matching
+    # every other field on this class -- see `mime_type_for_extension`'s
+    # linear scan, the only place this is read). Keys are lowercased
+    # extensions WITH the leading dot (e.g. ".go"), matching `extensions`
+    # above.
+    mime_type_by_extension: tuple[tuple[str, str], ...] | None = None
+
 
 # ---------------------------------------------------------------------------
 # The registry
@@ -527,6 +559,39 @@ FILE_TYPE_REGISTRY: tuple[FileTypeSpec, ...] = (
         surfaces=frozenset({"rest", "mcp"}),
         extractor="text_passthrough",
         chunking_hint="code",
+        # #197 fix: `mime_types` above is a POOL of 22 accepted aliases for
+        # 21 extensions -- not a positional, one-per-extension mapping (.js,
+        # .sh, and .sql each legitimately have two accepted aliases; .ts/
+        # .tsx/.jsx share no dedicated IANA-registered type at all). Every
+        # value here is still a member of `mime_types` above (so declaring it
+        # explicitly on either surface keeps working exactly as before) --
+        # this map only decides which ONE of the accepted aliases is
+        # "canonical" for a given extension when the caller doesn't declare
+        # one, replacing the old `mime_types[0]` guess that answered
+        # "text/x-python" for every single one of them.
+        mime_type_by_extension=(
+            (".py", "text/x-python"),
+            (".js", "text/javascript"),
+            (".ts", "application/typescript"),
+            (".tsx", "application/typescript"),
+            (".jsx", "text/javascript"),
+            (".go", "text/x-go"),
+            (".java", "text/x-java-source"),
+            (".rs", "text/x-rustsrc"),
+            (".c", "text/x-csrc"),
+            (".h", "text/x-chdr"),
+            (".cpp", "text/x-c++src"),
+            (".cs", "text/x-csharp"),
+            (".rb", "text/x-ruby"),
+            (".php", "text/x-php"),
+            (".swift", "text/x-swift"),
+            (".kt", "text/x-kotlin"),
+            (".scala", "text/x-scala"),
+            (".sh", "application/x-sh"),
+            (".sql", "application/sql"),
+            (".r", "text/x-r-source"),
+            (".lua", "text/x-lua"),
+        ),
     ),
     # -- #127: transcripts (SRT, WebVTT) ----------------------------------
     # Cue numbers and raw per-cue timestamp lines are stripped; cue text is
@@ -667,6 +732,42 @@ def get_spec_for_extension(extension: str) -> FileTypeSpec | None:
         if normalized in spec.extensions:
             return spec
     return None
+
+
+def mime_type_for_extension(spec: FileTypeSpec, extension: str) -> str:
+    """The single best, SPECIFIC MIME type `spec` resolves `extension` to
+    (#197).
+
+    `mime_types[0]` is "the" canonical MIME type ONLY for a spec describing
+    ONE format -- true of every current spec except "code", whose
+    `mime_types` pools 22 aliases across 21 distinct languages sharing one
+    extractor. Blindly taking index 0 there answered "text/x-python" for
+    every code file regardless of its real extension (a Go, Java, or SQL
+    file all mislabelled identically -- the exact bug this function exists
+    to close). This consults `spec.mime_type_by_extension` (see that field's
+    docstring) when present; a spec with no override (`None`) keeps the
+    original `mime_types[0]` behaviour unchanged, and an extension present
+    in `spec.extensions` but missing from the override map (should not
+    happen -- see the "every code extension has an override" test) degrades
+    to the same safe fallback rather than raising.
+
+    Args:
+        spec: an already-resolved spec, e.g. from `get_spec_for_extension`.
+        extension: with or without the leading dot, case-insensitively --
+            same tolerance as `get_spec_for_extension`.
+    """
+    normalized = extension if extension.startswith(".") else f".{extension}"
+    normalized = normalized.strip().lower()
+    if spec.mime_type_by_extension is not None:
+        # A tuple of (extension, mime) pairs, not a dict (see the field's
+        # docstring on FileTypeSpec for why) -- a linear scan over it is
+        # negligible at this size (currently 21 entries, one spec) and keeps
+        # the field itself hashable/immutable, preserving this dataclass's
+        # `frozen=True` contract.
+        for candidate_extension, mime in spec.mime_type_by_extension:
+            if candidate_extension == normalized:
+                return mime
+    return spec.mime_types[0]
 
 
 # Content-Type values that carry no real type information -- the "I don't

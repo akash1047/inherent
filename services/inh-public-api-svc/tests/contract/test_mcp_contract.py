@@ -831,6 +831,16 @@ class TestUploadDocumentTool:
             ("notes.md", "text/markdown"),
             ("notes", "text/markdown"),  # no extension -> the historical default
             ("notes.log", "text/markdown"),  # unrecognized extension -> default
+            # #197: the "code" spec pools 22 MIME aliases across 21 distinct
+            # languages under ONE registry entry -- `mime_types[0]` used to
+            # answer "text/x-python" for every one of these regardless of
+            # the real language (the issue's own verified repro list).
+            ("app.js", "text/javascript"),
+            ("lib.go", "text/x-go"),
+            ("Main.java", "text/x-java-source"),
+            ("q.sql", "application/sql"),
+            ("s.sh", "application/x-sh"),
+            ("x.rs", "text/x-rustsrc"),
         ],
     )
     async def test_omitted_content_type_derives_from_filename_extension(
@@ -843,6 +853,12 @@ class TestUploadDocumentTool:
         content_type (exactly as the schema invites) must NOT self-reject.
         The default is now derived from the filename's extension, falling
         back to text/markdown only when the extension is absent/unknown.
+
+        Extended for #197 (review of #121/#122/#127): the "code" spec's
+        added multi-MIME shape broke the "one MIME type per spec" assumption
+        this default derivation previously relied on -- see
+        `_default_upload_content_type` and
+        `inh_contracts.file_types.mime_type_for_extension`.
         """
         db = AsyncMock()
         db.validate_api_key = AsyncMock(return_value=self._key())
@@ -865,6 +881,37 @@ class TestUploadDocumentTool:
         assert f'"mime_type":"{expected_content_type}"' in content[0].text or (
             f'"mime_type": "{expected_content_type}"' in content[0].text
         )
+
+    async def test_go_file_with_omitted_content_type_is_not_labelled_python(self):
+        """#197 regression, asserted directly against the value persisted to
+        storage/DB (not just the JSON response body): a .go file with
+        `content_type` omitted must resolve to 'text/x-go', never
+        'text/x-python' -- the exact defect the issue reports. Checked at
+        `create_or_reset_pending_document`'s `content_type` kwarg (what
+        actually lands in the document's stored metadata and the MQ message
+        `extract_text` reads `content_type` from) so this can't pass on a
+        response-body coincidence alone."""
+        db = AsyncMock()
+        db.validate_api_key = AsyncMock(return_value=self._key())
+        db.get_user_workspace_ids = AsyncMock(return_value=["ws-1"])
+        db.get_document_id_by_content_hash = AsyncMock(return_value=None)
+        db.get_document_id_by_filename = AsyncMock(return_value=None)
+        db.create_or_reset_pending_document = AsyncMock(return_value=None)
+
+        storage = self._storage()
+        mq = self._mq()
+        p1, p2 = self._intake_patches(storage, mq)
+
+        with patch.object(mcp_server, "get_database", AsyncMock(return_value=db)), p1, p2:
+            content = await _call_tool(
+                "upload_document",
+                {"api_key": "x", "filename": "lib.go", "content": "package main\n"},
+            )
+
+        assert not content[0].text.startswith("Error"), content[0].text
+        stored_content_type = db.create_or_reset_pending_document.call_args.kwargs["content_type"]
+        assert stored_content_type == "text/x-go"
+        assert stored_content_type != "text/x-python"
 
     async def test_legacy_doc_rejected_with_explicit_content_type(self):
         """#124/#126 review blocker 3: application/msword must get the same

@@ -63,6 +63,7 @@ from inh_contracts.file_types import (
     explicitly_unsupported_message_for_mime,
     get_spec_for_extension,
     mcp_mime_types,
+    mime_type_for_extension,
 )
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
@@ -930,13 +931,27 @@ def _default_upload_content_type(filename: str) -> str:
     omitting the optional `content_type` -- exactly what the schema invites
     -- got ``notes.txt`` defaulted to ``text/markdown`` and then rejected as
     a mismatch against its own ``.txt`` extension.
+
+    #197 fix: resolving the spec's ``mime_types[0]`` unconditionally was
+    correct only by accident, because every spec registered at the time
+    described exactly ONE format. The "code" spec (#122) pools 22 MIME
+    aliases across 21 distinct languages under one registry entry sharing an
+    extractor -- ``mime_types[0]`` for THAT spec is just "text/x-python",
+    the first entry in the pool, not a stand-in for "whichever language this
+    file actually is". Every code file uploaded with `content_type` omitted
+    was therefore mislabelled identically regardless of its real extension
+    (a .go file stored as "text/x-python"). ``mime_type_for_extension``
+    (inh_contracts) consults the spec's per-extension override when one
+    exists and only falls back to ``mime_types[0]`` when it doesn't -- for
+    every pre-#197 spec (one override-free format each), behavior is
+    unchanged.
     """
     if "." not in filename:
         return "text/markdown"
     extension = "." + filename.rsplit(".", 1)[-1]
     spec = get_spec_for_extension(extension)
     if spec is not None and "mcp" in spec.surfaces:
-        return spec.mime_types[0]
+        return mime_type_for_extension(spec, extension)
     return "text/markdown"
 
 

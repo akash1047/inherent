@@ -24,6 +24,7 @@ from temporalio.exceptions import ApplicationError
 from src.temporal.activities.extract import (
     _extract_docx_text,
     _extract_html_text,
+    _extract_json_text,
     _extract_pdf_text,
     _extract_pptx_text,
     _extract_subtitle_text,
@@ -73,9 +74,12 @@ def test_extract_csv():
 
 
 def test_extract_json():
-    data = json.loads(_read("sample.json").decode("utf-8"))
-    pretty = json.dumps(data, indent=2)
-    assert pretty.strip()
+    """Calls the real production extractor (`_extract_json_text`) rather than
+    re-deriving the same json.loads/dumps inline -- so this test actually
+    exercises the function #195's failure-path tests below wrap."""
+    text = _extract_json_text(_read("sample.json"))
+    assert text.strip()
+    data = json.loads(text)
     assert isinstance(data, (dict, list))
 
 
@@ -608,6 +612,155 @@ class TestPptxFailurePaths:
         from inh_contracts.file_types import get_spec_for_mime
 
         assert get_spec_for_mime("application/vnd.ms-powerpoint") is None
+
+
+class TestPdfFailurePaths:
+    """#195: `_extract_pdf_text` was completely unwrapped -- a corrupt/
+    truncated/password-protected PDF raised pypdf's raw exception type
+    directly, and Temporal's default 3-attempt RetryPolicy retried it 3x
+    before giving up, even though the SAME bytes can never succeed on retry
+    (deterministic given fixed content). Same reasoning, same fix shape as
+    XLSX/PPTX/DOCX above: catch, wrap as a non-retryable ApplicationError
+    that names the likely cause, never leak the raw pypdf exception message
+    unwrapped into the document's `error_message` / dead-letter row."""
+
+    def test_corrupt_truncated_bytes_raise_non_retryable(self):
+        """A `%PDF-` header prefix followed by garbage (corrupt or truncated
+        upload) must fail loudly -- pypdf's own PdfReadError/PdfStreamError
+        is caught and re-raised as an actionable, NON-RETRYABLE
+        ApplicationError, mirroring XLSX/PPTX/DOCX's existing contract."""
+        with pytest.raises(ApplicationError, match="PDF extraction failed") as exc_info:
+            _extract_pdf_text(b"%PDF-1.4\n" + b"garbage, not a real xref table or pages tree")
+        assert exc_info.value.non_retryable
+
+    def test_not_a_pdf_at_all_raises_non_retryable(self):
+        """Bytes with no PDF header at all (a mislabeled upload reaching
+        this extractor, e.g. via the extension fallback) -- pypdf raises
+        immediately at `PdfReader()` construction; must still be
+        non-retryable, not a bare crash."""
+        with pytest.raises(ApplicationError, match="PDF extraction failed") as exc_info:
+            _extract_pdf_text(b"this is not a pdf at all, just plain text bytes")
+        assert exc_info.value.non_retryable
+
+    def test_missing_dependency_raises_non_retryable(self, monkeypatch):
+        """Neither pypdf nor PyPDF2 being installed is itself deterministic
+        (retrying the same worker process, or any worker built from the same
+        image, can never succeed) -- non-retryable, same reasoning as every
+        other missing-extraction-library case in this module. Previously a
+        bare RuntimeError here (see the module's pre-#195 history) was
+        retried 3x for no reason, exactly like the two failure modes above."""
+        import builtins
+
+        real_import = builtins.__import__
+
+        def _blocking_import(name, *args, **kwargs):
+            if name in ("pypdf", "PyPDF2"):
+                raise ImportError(f"simulated: {name} not installed")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", _blocking_import)
+
+        with pytest.raises(ApplicationError, match="PDF extraction libraries not available") as (
+            exc_info
+        ):
+            _extract_pdf_text(b"irrelevant")
+        assert exc_info.value.non_retryable
+
+    def test_raw_pypdf_exception_message_never_leaks_unwrapped(self):
+        """The actionable ApplicationError message must be constructed by
+        this module, not just pypdf's raw exception re-raised verbatim --
+        pins that the wrapping actually happened (a regression that removed
+        the try/except but kept a differently-worded message would still
+        satisfy `match="PDF extraction failed"` above; this checks the
+        specific corrupt/truncated/password-protected/wrong-format guidance
+        is present, the same actionable shape XLSX/PPTX/DOCX give)."""
+        with pytest.raises(ApplicationError) as exc_info:
+            _extract_pdf_text(b"%PDF-1.4\n" + b"garbage, not a real xref table or pages tree")
+        message = str(exc_info.value)
+        assert "corrupt" in message
+        assert "password-protected" in message
+
+    def test_memory_error_during_construction_propagates_not_wrapped(self, monkeypatch):
+        """Review follow-up: MemoryError is a load-dependent condition, not a
+        property of the input bytes -- a version of this fix that caught it
+        under a blanket `except Exception` would have reclassified it as
+        `non_retryable=True`, permanently dead-lettering a failure a retry
+        (possibly on a less-contended worker) could plausibly resolve. It
+        must propagate completely unconverted -- not even as a differently
+        worded ApplicationError."""
+        import pypdf
+
+        def _raise_memory_error(*args, **kwargs):
+            raise MemoryError("simulated: out of memory parsing xref table")
+
+        monkeypatch.setattr(pypdf, "PdfReader", _raise_memory_error)
+
+        with pytest.raises(MemoryError):
+            _extract_pdf_text(b"%PDF-1.4\nirrelevant, PdfReader is mocked")
+
+    def test_exception_during_page_iteration_propagates_not_wrapped(self, monkeypatch):
+        """Review follow-up: the try/except is scoped to ONLY `PdfReader()`
+        construction -- mirroring `_extract_xlsx_text`'s `load_workbook`-only
+        wrap (that function's own row-iteration loop is likewise NOT wrapped
+        in a broad except; only its explicit cap checks raise). A failure
+        discovered lazily during page access/`extract_text()` (e.g. a
+        per-page content-stream corruption in an otherwise structurally
+        valid PDF, which construction alone cannot detect since pypdf only
+        parses the xref/trailer eagerly) is NOT converted to a non-retryable
+        ApplicationError -- it propagates as whatever pypdf raised, retryable
+        by the default policy. Same accepted tradeoff XLSX/PPTX already make
+        for their own row/shape iteration."""
+        import pypdf
+
+        class _ExplodingReader:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            @property
+            def pages(self):
+                raise pypdf.errors.PdfReadError("simulated: corrupt content stream on page 3")
+
+        monkeypatch.setattr(pypdf, "PdfReader", _ExplodingReader)
+
+        with pytest.raises(pypdf.errors.PdfReadError):
+            _extract_pdf_text(b"%PDF-1.4\nirrelevant, PdfReader is mocked")
+
+
+class TestJsonFailurePaths:
+    """#195: `_extract_json_text` called `json.loads` unwrapped -- malformed
+    JSON raised `json.JSONDecodeError` directly, retried 3x by Temporal's
+    default RetryPolicy for a deterministic, unfixable-by-retry failure.
+    Lower severity than PDF per the issue (JSON corruption is rarer/cheaper
+    to retry), but the same defect class -- same fix shape."""
+
+    def test_malformed_json_raises_non_retryable(self):
+        with pytest.raises(ApplicationError, match="JSON extraction failed") as exc_info:
+            _extract_json_text(b'{"key": "value", "unterminated": ')
+        assert exc_info.value.non_retryable
+
+    def test_not_json_at_all_raises_non_retryable(self):
+        """Plain-text bytes reaching this extractor (a mislabeled upload)
+        must fail the same actionable, non-retryable way, not a bare
+        JSONDecodeError."""
+        with pytest.raises(ApplicationError, match="JSON extraction failed") as exc_info:
+            _extract_json_text(b"just some plain text, not json at all")
+        assert exc_info.value.non_retryable
+
+    def test_empty_bytes_raise_non_retryable(self):
+        with pytest.raises(ApplicationError, match="JSON extraction failed") as exc_info:
+            _extract_json_text(b"")
+        assert exc_info.value.non_retryable
+
+    def test_raw_json_decode_error_message_never_leaks_unwrapped(self):
+        """`json.JSONDecodeError`'s own message is already clean (no heap
+        addresses, unlike python-docx's) -- but the wrapping ApplicationError
+        must still name the likely cause, not just echo the raw message
+        verbatim, matching the actionable shape every other extractor in
+        this module gives."""
+        with pytest.raises(ApplicationError) as exc_info:
+            _extract_json_text(b'{"key": "value", "unterminated": ')
+        message = str(exc_info.value)
+        assert "corrupt" in message or "not actually" in message
 
 
 def test_genuine_xlsx_fed_to_docx_extractor_fails_loudly_not_silently():

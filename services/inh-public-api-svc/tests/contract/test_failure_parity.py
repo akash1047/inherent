@@ -850,3 +850,134 @@ class TestNewTypeUploadContentTypeMismatchParity:
         mcp_storage.upload_file.assert_not_awaited()
         mcp_db.create_or_reset_pending_document.assert_not_awaited()
         mcp_mq.publish.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Upload: the stored content_type label for a multi-MIME spec -- both
+# surfaces (#197)
+# ---------------------------------------------------------------------------
+
+
+class TestUploadCodeContentTypeLabelParity:
+    """#197: the "code" spec (#122) pools 22 MIME aliases across 21 distinct
+    languages under one registry entry. REST never mislabels a code upload —
+    it either forwards the client's own declared ``Content-Type`` verbatim,
+    or (a generic/absent header) resolves via the honest ``.go``-extension
+    fallback while still storing whatever the client actually declared. MCP
+    is the surface that GUESSES a `content_type` when the caller omits it
+    (REST has no equivalent guess — its route has no schema-advertised
+    default the way the MCP tool does), and that guess used to be wrong for
+    every code file (``mime_types[0]`` == "text/x-python" always). This pins
+    that MCP's guess now agrees with what an accurate REST declaration for
+    the SAME file would store — both surfaces end up with the identical,
+    correct ``text/x-go`` label for a ``.go`` upload, through their real
+    entry points (HTTP route / MCP dispatcher), asserted against the exact
+    kwarg persisted to storage (``create_or_reset_pending_document``'s
+    ``content_type``) so this can't pass on a response-body coincidence.
+    """
+
+    async def test_rest_declared_and_mcp_defaulted_go_upload_store_the_same_mime(self):
+        # --- REST: client declares the correct, specific Content-Type -----
+        # (the realistic REST shape: REST has no schema-advertised default
+        # to fall back on the way MCP's optional `content_type` arg does, so
+        # a REST client either declares accurately or sends octet-stream —
+        # this exercises the "declares accurately" half, which is what MCP's
+        # now-fixed default must agree with.)
+        rest_db = _mock_db()
+        rest_db.get_document_id_by_content_hash = AsyncMock(return_value=None)
+        rest_db.get_document_id_by_filename = AsyncMock(return_value=None)
+
+        rest_storage = MagicMock()
+        rest_storage.generate_key.return_value = f"{WS}/fake-uuid/lib.go"
+        rest_storage.upload_file = AsyncMock(return_value=f"{WS}/fake-uuid/lib.go")
+        rest_storage.build_storage_url.return_value = f"s3://docs/{WS}/fake-uuid/lib.go"
+        rest_storage._bucket = "docs"
+        rest_mq = AsyncMock()
+        rest_mq.publish = AsyncMock(return_value="1-0")
+
+        write_key = _write_key()
+        application = create_app()
+        application.dependency_overrides[get_api_key_info] = lambda: write_key
+        application.dependency_overrides[get_write_permission] = lambda: write_key
+        application.dependency_overrides[resolve_workspace_write] = lambda: ResolvedAuth(
+            key_info=write_key, workspace_id=WS
+        )
+        application.dependency_overrides[get_database] = lambda: rest_db
+        try:
+            with (
+                patch(
+                    "src.services.document_intake.get_storage_service",
+                    return_value=rest_storage,
+                ),
+                patch(
+                    "src.services.document_intake.get_mq_service",
+                    new_callable=AsyncMock,
+                    return_value=rest_mq,
+                ),
+            ):
+                transport = ASGITransport(app=application)
+                async with AsyncClient(transport=transport, base_url="http://test") as ac:
+                    rest_response = await ac.post(
+                        "/v1/documents",
+                        headers={"X-API-Key": "ink_test_key"},
+                        files={
+                            "file": (
+                                "lib.go",
+                                io.BytesIO(b"package main\n"),
+                                "text/x-go",
+                            )
+                        },
+                    )
+        finally:
+            application.dependency_overrides.clear()
+
+        assert rest_response.status_code == 201
+        rest_stored_content_type = rest_db.create_or_reset_pending_document.call_args.kwargs[
+            "content_type"
+        ]
+        assert rest_stored_content_type == "text/x-go"
+
+        # --- MCP: content_type OMITTED -- must now resolve to the SAME
+        # specific label, not the pre-#197 "text/x-python" guess. ----------
+        mcp_db = _mock_db()
+        mcp_db.get_document_id_by_content_hash = AsyncMock(return_value=None)
+        mcp_db.get_document_id_by_filename = AsyncMock(return_value=None)
+        mcp_storage = MagicMock()
+        mcp_storage.generate_key.return_value = f"{WS}/fake-uuid/lib.go"
+        mcp_storage.upload_file = AsyncMock(return_value=f"{WS}/fake-uuid/lib.go")
+        mcp_storage.build_storage_url.return_value = f"s3://docs/{WS}/fake-uuid/lib.go"
+        mcp_storage._bucket = "docs"
+        mcp_mq = AsyncMock()
+        mcp_mq.publish = AsyncMock(return_value="1-0")
+
+        with (
+            patch(
+                "src.services.document_intake.get_storage_service",
+                return_value=mcp_storage,
+            ),
+            patch(
+                "src.services.document_intake.get_mq_service",
+                new_callable=AsyncMock,
+                return_value=mcp_mq,
+            ),
+        ):
+            mcp_result = await _call_mcp_tool(
+                "upload_document",
+                {
+                    "api_key": "ink_k",
+                    "filename": "lib.go",
+                    "content": "package main\n",
+                    # content_type deliberately omitted -- the #197 gap.
+                },
+                mcp_db,
+            )
+
+        assert "Error" not in mcp_result[0].text, mcp_result[0].text
+        mcp_stored_content_type = mcp_db.create_or_reset_pending_document.call_args.kwargs[
+            "content_type"
+        ]
+        assert mcp_stored_content_type == "text/x-go"
+        assert mcp_stored_content_type != "text/x-python"
+        # The pin: both surfaces land on the exact same label for the exact
+        # same file.
+        assert mcp_stored_content_type == rest_stored_content_type

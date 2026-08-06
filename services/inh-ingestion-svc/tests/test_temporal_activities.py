@@ -232,6 +232,72 @@ class TestExtractTextActivity:
 
         mock_staging.write_text.assert_not_called()
 
+    @patch("src.temporal.shared_services.get_staging_service")
+    @patch("src.temporal.shared_services.get_storage_service")
+    @pytest.mark.asyncio
+    async def test_extract_text_pdf_corrupt_bytes_raises(self, mock_get_storage, mock_get_staging):
+        """#195: `_extract_pdf_text` was completely unwrapped -- a corrupt
+        PDF raised pypdf's raw exception type directly, and Temporal's
+        default 3-attempt RetryPolicy retried it 3x for a deterministic,
+        unfixable-by-retry failure. Now wrapped as an actionable,
+        non-retryable ApplicationError, same shape as the XLSX/PPTX cases
+        above (see test_extraction_by_type.py::TestPdfFailurePaths for the
+        extractor unit test this pins end-to-end through the activity)."""
+        mock_storage = MagicMock()
+        mock_storage.read_file.return_value = b"%PDF-1.4\ngarbage, not a real pdf body"
+        mock_get_storage.return_value = mock_storage
+
+        mock_staging = MagicMock()
+        mock_get_staging.return_value = mock_staging
+
+        input_data = ExtractTextInput(
+            workflow_run_id="wf_pdf",
+            storage_backend="local",
+            storage_path="doc.pdf",
+            content_type="application/pdf",
+            original_filename="doc.pdf",
+        )
+
+        from src.temporal.activities.extract import extract_text
+
+        with pytest.raises(ApplicationError, match="PDF extraction failed") as exc_info:
+            await extract_text(input_data)
+        assert exc_info.value.non_retryable
+
+        mock_staging.write_text.assert_not_called()
+
+    @patch("src.temporal.shared_services.get_staging_service")
+    @patch("src.temporal.shared_services.get_storage_service")
+    @pytest.mark.asyncio
+    async def test_extract_text_json_malformed_bytes_raises(
+        self, mock_get_storage, mock_get_staging
+    ):
+        """#195: `_extract_json_text` called `json.loads` unwrapped -- same
+        defect class as PDF above, lower severity (JSON corruption is
+        rarer/cheaper to retry) but the same fix shape."""
+        mock_storage = MagicMock()
+        mock_storage.read_file.return_value = b'{"key": "value", "unterminated": '
+        mock_get_storage.return_value = mock_storage
+
+        mock_staging = MagicMock()
+        mock_get_staging.return_value = mock_staging
+
+        input_data = ExtractTextInput(
+            workflow_run_id="wf_json_bad",
+            storage_backend="local",
+            storage_path="data.json",
+            content_type="application/json",
+            original_filename="data.json",
+        )
+
+        from src.temporal.activities.extract import extract_text
+
+        with pytest.raises(ApplicationError, match="JSON extraction failed") as exc_info:
+            await extract_text(input_data)
+        assert exc_info.value.non_retryable
+
+        mock_staging.write_text.assert_not_called()
+
     def test_xlsx_and_pptx_and_docx_failures_classify_as_extraction_failed(self):
         """Review follow-up: `DocumentIngestionWorkflow._classify_error`
         matches on the SUBSTRING "extract" in the lower-cased error message.
@@ -241,7 +307,8 @@ class TestExtractTextActivity:
         "unknown", which means the dead-letter API's error_type filter would
         never surface an OOXML extraction failure. Every new failure message
         now explicitly says "extraction failed" by construction, not by
-        accident -- this pins that against the real classifier."""
+        accident -- this pins that against the real classifier. Extended for
+        #195's PDF/JSON messages, which follow the identical convention."""
         from src.temporal.workflows.document_ingestion import DocumentIngestionWorkflow
 
         messages = [
@@ -252,6 +319,8 @@ class TestExtractTextActivity:
             "PPTX extraction failed: slide cap (5000) exceeded.",
             "PPTX extraction failed: extracted text exceeds the 5000000-character cap.",
             "DOCX extraction failed (report.docx): could not read the document (wrong OOXML content type (...)).",
+            "PDF extraction failed: could not read the document (PdfStreamError: Stream has ended unexpectedly).",
+            "JSON extraction failed: could not parse the document (Expecting value: line 1 column 1 (char 0)).",
         ]
         for message in messages:
             assert (
