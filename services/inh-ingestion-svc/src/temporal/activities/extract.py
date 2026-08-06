@@ -27,6 +27,7 @@ import io
 import zipfile
 from collections.abc import Callable
 from email import policy
+from urllib.parse import unquote
 from xml.etree import ElementTree as ET
 
 import charset_normalizer
@@ -597,32 +598,93 @@ def _extract_epub_text(content: bytes, filename: str) -> str:
     # Resolve manifest hrefs relative to content.opf's own directory.
     opf_dir = opf_path.rsplit("/", 1)[0] + "/" if "/" in opf_path else ""
 
-    chapters = []
-    for itemref in spine_items:
-        item = manifest.get(itemref.attrib.get("idref", ""))
+    # Chapters are keyed by their SPINE POSITION (1-based), not by how many
+    # have been successfully extracted so far (#125 review blocker 1): a
+    # skipped chapter must leave a gap, never shift every later chapter's
+    # number down. Renumbering by success-count silently mislabels every
+    # chapter after the first miss -- content loss reported as success, with
+    # every downstream citation for the rest of the book pointing at the
+    # wrong chapter.
+    chapters: list[tuple[int, str]] = []
+    for position, itemref in enumerate(spine_items, start=1):
+        idref = itemref.attrib.get("idref", "")
+        item = manifest.get(idref)
         if item is None:
-            continue  # spine references an id the manifest doesn't have -- skip, don't crash
+            logger.warning(
+                "EPUB spine references a manifest id that does not exist -- "
+                "skipping this chapter, not renumbering the rest",
+                filename=filename,
+                idref=idref,
+                spine_position=position,
+            )
+            continue
         properties = item.get("properties", "").split()
         if "nav" in properties or "cover-image" in properties:
-            continue  # nav/cover items skipped per #125
+            continue  # nav/cover items skipped per #125 -- not a loss, no warning needed
         if item.get("media-type") not in ("application/xhtml+xml", "text/html"):
             continue  # spine can reference non-markup resources; only chapters are extracted
+
+        # Manifest hrefs are URL references (EPUB OPF spec): spaces and
+        # non-ASCII characters are percent-encoded (e.g. "chapter%201.xhtml"
+        # for a zip member literally named "chapter 1.xhtml"). Without
+        # unquoting, zf.read() misses the real member and this chapter is
+        # silently dropped (#125 review blocker 1).
+        href = unquote(item.get("href", ""))
         try:
-            chapter_bytes = zf.read(opf_dir + item["href"])
+            chapter_bytes = zf.read(opf_dir + href)
         except KeyError:
-            continue  # manifest references a missing zip member -- skip, don't crash
+            logger.warning(
+                "EPUB manifest references a zip member that does not exist -- "
+                "skipping this chapter, not renumbering the rest",
+                filename=filename,
+                href=href,
+                spine_position=position,
+            )
+            continue
 
         chapter_text = _extract_html_text(chapter_bytes).strip()
-        if chapter_text:
-            chapters.append(chapter_text)
+        if not chapter_text:
+            logger.warning(
+                "EPUB chapter produced no extractable text -- skipping",
+                filename=filename,
+                href=href,
+                spine_position=position,
+            )
+            continue
+
+        heading = _epub_chapter_heading(chapter_bytes) or f"Chapter {position}"
+        chapters.append((position, f"## {heading}\n\n{chapter_text}"))
 
     if not chapters:
         raise RuntimeError(f"'{filename}' has a spine but no chapter produced any extractable text")
 
-    # "## " per spine item (#125 serialization contract): gives #129's
-    # future format-aware chunker (`chunking_hint`) explicit chapter
-    # boundaries to split on, in true reading order.
-    return "\n\n".join(f"## Chapter {i}\n\n{text}" for i, text in enumerate(chapters, start=1))
+    # `chapters` is already in spine (reading) order because the loop above
+    # walks `spine_items` in order and only ever appends -- no re-sort
+    # needed. The tuple's position element exists for the log lines above,
+    # not for reordering here.
+    return "\n\n".join(text for _position, text in chapters)
+
+
+def _epub_chapter_heading(chapter_bytes: bytes) -> str | None:
+    """The chapter's own `<title>` or first `<h1>` text, if present --
+    preferred over a generic "Chapter N" label so the markdown heading
+    carries real information (#125 review blocker 1). Returns None if
+    neither exists (or bs4 is unavailable), letting the caller fall back to
+    the chapter's spine position.
+    """
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        return None
+
+    soup = BeautifulSoup(chapter_bytes, "html.parser")
+    for tag_name in ("title", "h1"):
+        tag = soup.find(tag_name)
+        if tag is not None:
+            text = tag.get_text(strip=True)
+            if text:
+                return text
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -642,8 +704,8 @@ def _extract_rtf_text(content: bytes, filename: str) -> str:
     """
     try:
         from striprtf.striprtf import rtf_to_text
-    except ImportError:
-        raise RuntimeError("striprtf not available for RTF extraction")
+    except ImportError as e:
+        raise RuntimeError("striprtf not available for RTF extraction") from e
 
     # RTF is a control-word format where non-ASCII text is escaped inline
     # (\'hh hex escapes, \uNNNN unicode control words) rather than encoded
@@ -667,17 +729,87 @@ def _extract_rtf_text(content: bytes, filename: str) -> str:
     return text
 
 
+# ODF (OpenDocument Format) namespaces used by content.xml.
+_ODF_OFFICE_NS = "urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+_ODF_TEXT_NS = "urn:oasis:names:tc:opendocument:xmlns:text:1.0"
+
+# Subtrees whose text must NOT be indexed as current document content
+# (#126 review blocker 2). content.xml is NOT "just another XML dialect
+# with human text inside element bodies" -- it is a real, structured format
+# with constructs that carry text an agent must never see as-is:
+#   - text:tracked-changes holds DELETED text kept for revision history,
+#     not the document's current content.
+#   - office:annotation is a PRIVATE reviewer comment (and its dc:creator
+#     child is the reviewer's NAME) attached inline to the body, not part
+#     of the document itself.
+# Indexing either indistinguishably from real content lets a retrieval
+# agent cite retracted text as current fact, or surface a private review
+# comment (and who wrote it) to anyone with read access to the chunk.
+_ODF_EXCLUDED_TAGS = frozenset(
+    {
+        f"{{{_ODF_TEXT_NS}}}tracked-changes",
+        f"{{{_ODF_OFFICE_NS}}}annotation",
+    }
+)
+
+# Paragraph-level tags: text after one of these ends a line in the
+# extracted output, mirroring how a word processor renders them.
+_ODF_PARAGRAPH_TAGS = frozenset({f"{{{_ODF_TEXT_NS}}}p", f"{{{_ODF_TEXT_NS}}}h"})
+
+# ODF represents runs of literal spaces/tabs as dedicated elements instead
+# of raw whitespace in the XML text (which XML would otherwise collapse) --
+# text:s optionally repeats via a text:c count attribute, text:tab is a
+# single tab stop. Stripping these tags without substituting real
+# whitespace merges adjacent words together; naively treating every tag
+# boundary as a newline (the previous bs4-based approach) instead SPLIT one
+# paragraph's words across several lines (#126 review blocker 2 secondary
+# defect: "Word with spacing" indexed as three lines).
+_ODF_SPACE_TAG = f"{{{_ODF_TEXT_NS}}}s"
+_ODF_TAB_TAG = f"{{{_ODF_TEXT_NS}}}tab"
+
+
+def _odf_extract_text(element: ET.Element) -> list[str]:
+    """Recursively collect real body text fragments from an ODF element
+    tree, in document order -- excluding `_ODF_EXCLUDED_TAGS` subtrees
+    entirely and translating whitespace elements to literal whitespace
+    (#126 review blocker 2). A paragraph/heading element's fragments end
+    with a newline; everything else concatenates inline.
+    """
+    if element.tag in _ODF_EXCLUDED_TAGS:
+        return []  # skip the whole subtree -- tracked changes / annotations
+
+    if element.tag == _ODF_SPACE_TAG:
+        # text:c (the repeat count) is itself namespaced -- prefixed XML
+        # attributes carry their prefix's namespace, unlike unprefixed ones.
+        count = int(element.get(f"{{{_ODF_TEXT_NS}}}c", "1") or "1")
+        return [" " * count]
+    if element.tag == _ODF_TAB_TAG:
+        return ["\t"]
+
+    fragments: list[str] = []
+    if element.text:
+        fragments.append(element.text)
+    for child in element:
+        fragments.extend(_odf_extract_text(child))
+        if child.tail:
+            fragments.append(child.tail)
+    if element.tag in _ODF_PARAGRAPH_TAGS:
+        fragments.append("\n")
+    return fragments
+
+
 def _extract_odt_text(content: bytes, filename: str) -> str:
     """Extract text from an ODT (OpenDocument Text) `content.xml` (#126).
 
     ODT is a ZIP container like DOCX/EPUB, but text extraction only needs
-    its `content.xml` member -- read via stdlib `zipfile`, then run through
-    the SAME BeautifulSoup tag-strip path `_extract_html_text` uses for
-    HTML/EPUB, since `content.xml` is just another XML dialect with human
-    text inside element bodies (no odfpy dependency needed, per the #126
-    contract). Kept in its own function (not sharing code with
-    `_extract_rtf_text` above) so ODT's zip/XML handling and RTF's
-    control-word parsing never bleed together.
+    its `content.xml` member -- read via stdlib `zipfile`, then walked with
+    stdlib `ElementTree` (no odfpy dependency needed, per the #126
+    contract), ODF-STRUCTURE-AWARE rather than a generic tag-strip: real
+    ODF documents carry revision-history and reviewer-comment text that must
+    never be indexed as current content (see `_odf_extract_text`). Kept in
+    its own function (not sharing code with `_extract_rtf_text` above) so
+    ODT's zip/XML handling and RTF's control-word parsing never bleed
+    together.
     """
     try:
         zf = zipfile.ZipFile(io.BytesIO(content))
@@ -701,20 +833,23 @@ def _extract_odt_text(content: bytes, filename: str) -> str:
             f"'{filename}' is not a valid ODT (corrupt zip central directory): {e}"
         ) from e
 
-    # `_extract_html_text` uses bs4's "html.parser", which is intentionally
-    # being pointed at XML here (the #126 contract: "content.xml through the
-    # XML tag-strip path" -- no odfpy needed). bs4 warns about that
-    # (XMLParsedAsHTMLWarning) even though it's a deliberate, working choice
-    # for this generic tag-strip use case, not a mistake -- suppressed here
-    # rather than globally so a genuine XML-parser-misuse warning elsewhere
-    # in the service is still surfaced.
-    import warnings
+    try:
+        root = ET.fromstring(content_xml)
+    except ET.ParseError as e:
+        raise RuntimeError(f"'{filename}' has an unparseable content.xml: {e}") from e
 
-    from bs4 import XMLParsedAsHTMLWarning
+    body = root.find(f".//{{{_ODF_OFFICE_NS}}}body/{{{_ODF_OFFICE_NS}}}text")
+    if body is None:
+        raise RuntimeError(
+            f"'{filename}' is not a valid ODT: no office:body/office:text found in content.xml"
+        )
 
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", category=XMLParsedAsHTMLWarning)
-        text = _extract_html_text(content_xml).strip()
+    raw = "".join(_odf_extract_text(body))
+    # Collapse to one non-empty, stripped line per paragraph/heading (mirrors
+    # the previous get_text(separator="\n", strip=True) shape callers rely
+    # on) -- text:s/text:tab whitespace inserted mid-line above survives
+    # this since it isn't a newline.
+    text = "\n".join(line.strip() for line in raw.splitlines() if line.strip())
 
     if not text:
         raise RuntimeError(f"'{filename}' produced no extractable text from content.xml")

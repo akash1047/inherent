@@ -503,6 +503,8 @@ class TestDocumentNotFoundVsPermissionDeniedParity:
         # one's id and the strings must match exactly.
         assert foreign_result[0].text == "Error: Document 'doc-x' not found"
         assert missing_result[0].text == "Error: Document 'doc-does-not-exist' not found"
+
+
 # Upload: mislabeled content (magic-byte mismatch) -- both surfaces (#117)
 # ---------------------------------------------------------------------------
 
@@ -609,6 +611,125 @@ class TestUploadContentTypeMismatchParity:
             )
 
         assert "Error" in mcp_result[0].text
+        mcp_storage.upload_file.assert_not_awaited()
+        mcp_db.create_or_reset_pending_document.assert_not_awaited()
+        mcp_mq.publish.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Upload: explicitly-unsupported legacy formats (#124/#126 review blocker 3)
+# ---------------------------------------------------------------------------
+
+
+class TestUploadLegacyFormatRejectionParity:
+    """#124/#126: legacy .doc (application/msword) is deliberately NOT in
+    FILE_TYPE_REGISTRY and must be rejected on BOTH surfaces with no side
+    effects -- no S3 object, no document row, no MQ publish.
+
+    This is the exact pair a review caught missing: REST's own local
+    rejection table meant MCP's `upload_document` never learned about it,
+    and MCP's content_type default (derived from the filename extension
+    when the caller omits it) fell through to a generic MCP-eligible type
+    for "report.doc" -- silently ACCEPTING the format both issues say must
+    be rejected. Both are now sourced from the shared
+    `inh_contracts.EXPLICITLY_UNSUPPORTED` table; this test is the pin.
+    """
+
+    async def test_rest_and_mcp_both_reject_legacy_doc_with_no_side_effects(self):
+        # --- REST: declared application/msword -----------------------------
+        rest_db = _mock_db()
+        rest_db.get_document_id_by_content_hash = AsyncMock(return_value=None)
+        rest_db.get_document_id_by_filename = AsyncMock(return_value=None)
+
+        rest_storage = MagicMock()
+        rest_storage.generate_key.return_value = f"{WS}/fake-uuid/report.doc"
+        rest_storage.upload_file = AsyncMock(return_value=f"{WS}/fake-uuid/report.doc")
+        rest_storage.build_storage_url.return_value = f"s3://docs/{WS}/fake-uuid/report.doc"
+        rest_storage._bucket = "docs"
+        rest_mq = AsyncMock()
+        rest_mq.publish = AsyncMock(return_value="1-0")
+
+        write_key = _write_key()
+        application = create_app()
+        application.dependency_overrides[get_api_key_info] = lambda: write_key
+        application.dependency_overrides[get_write_permission] = lambda: write_key
+        application.dependency_overrides[resolve_workspace_write] = lambda: ResolvedAuth(
+            key_info=write_key, workspace_id=WS
+        )
+        application.dependency_overrides[get_database] = lambda: rest_db
+        try:
+            with (
+                patch(
+                    "src.services.document_intake.get_storage_service",
+                    return_value=rest_storage,
+                ),
+                patch(
+                    "src.services.document_intake.get_mq_service",
+                    new_callable=AsyncMock,
+                    return_value=rest_mq,
+                ),
+            ):
+                transport = ASGITransport(app=application)
+                async with AsyncClient(transport=transport, base_url="http://test") as ac:
+                    rest_response = await ac.post(
+                        "/v1/documents",
+                        headers={"X-API-Key": "ink_test_key"},
+                        files={
+                            "file": (
+                                "report.doc",
+                                io.BytesIO(b"\xd0\xcf\x11\xe0 fake OLE compound file bytes"),
+                                "application/msword",
+                            )
+                        },
+                    )
+        finally:
+            application.dependency_overrides.clear()
+
+        assert rest_response.status_code == 400
+        assert ".docx" in rest_response.json()["detail"]
+        rest_storage.upload_file.assert_not_awaited()
+        rest_db.create_or_reset_pending_document.assert_not_awaited()
+        rest_mq.publish.assert_not_awaited()
+
+        # --- MCP: content_type OMITTED, exactly the gap the review found --
+        # '.doc' has no FILE_TYPE_REGISTRY entry, so the default-content-type
+        # resolution used to fall through to 'text/markdown' (MCP-eligible)
+        # and sail straight through as if it were prose.
+        mcp_db = _mock_db()
+        mcp_db.get_document_id_by_content_hash = AsyncMock(return_value=None)
+        mcp_db.get_document_id_by_filename = AsyncMock(return_value=None)
+        mcp_storage = MagicMock()
+        mcp_storage.generate_key.return_value = f"{WS}/fake-uuid/report.doc"
+        mcp_storage.upload_file = AsyncMock(return_value=f"{WS}/fake-uuid/report.doc")
+        mcp_storage.build_storage_url.return_value = f"s3://docs/{WS}/fake-uuid/report.doc"
+        mcp_storage._bucket = "docs"
+        mcp_mq = AsyncMock()
+        mcp_mq.publish = AsyncMock(return_value="1-0")
+
+        with (
+            patch(
+                "src.services.document_intake.get_storage_service",
+                return_value=mcp_storage,
+            ),
+            patch(
+                "src.services.document_intake.get_mq_service",
+                new_callable=AsyncMock,
+                return_value=mcp_mq,
+            ),
+        ):
+            mcp_result = await _call_mcp_tool(
+                "upload_document",
+                {
+                    "api_key": "ink_k",
+                    "filename": "report.doc",
+                    "content": "Q3 revenue was 4.2M, pasted straight from a .doc file",
+                    # content_type deliberately omitted.
+                },
+                mcp_db,
+            )
+
+        assert "Error" in mcp_result[0].text
+        assert ".docx" in mcp_result[0].text
         mcp_storage.upload_file.assert_not_awaited()
         mcp_db.create_or_reset_pending_document.assert_not_awaited()
         mcp_mq.publish.assert_not_awaited()

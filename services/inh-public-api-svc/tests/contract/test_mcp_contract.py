@@ -812,6 +812,94 @@ class TestUploadDocumentTool:
             f'"mime_type": "{expected_content_type}"' in content[0].text
         )
 
+    async def test_legacy_doc_rejected_with_explicit_content_type(self):
+        """#124/#126 review blocker 3: application/msword must get the same
+        actionable "convert to .docx" message as REST, not the generic
+        SUPPORTED_TEXT_MIME_TYPES allow-list dump."""
+        db = AsyncMock()
+        db.validate_api_key = AsyncMock(return_value=self._key())
+        db.get_user_workspace_ids = AsyncMock(return_value=["ws-1"])
+        db.create_or_reset_pending_document = AsyncMock()
+
+        storage = self._storage()
+        mq = self._mq()
+        p1, p2 = self._intake_patches(storage, mq)
+
+        with patch.object(mcp_server, "get_database", AsyncMock(return_value=db)), p1, p2:
+            content = await _call_tool(
+                "upload_document",
+                {
+                    "api_key": "x",
+                    "filename": "report.doc",
+                    "content": "pasted document text",
+                    "content_type": "application/msword",
+                },
+            )
+
+        assert content[0].text.startswith("Error")
+        assert ".docx" in content[0].text
+        storage.upload_file.assert_not_awaited()
+        db.create_or_reset_pending_document.assert_not_awaited()
+
+    async def test_legacy_doc_rejected_even_with_content_type_omitted(self):
+        """The exact accept-then-garble gap the review found: with
+        content_type omitted, `_default_upload_content_type("report.doc")`
+        used to fall through to 'text/markdown' (MCP-eligible) since '.doc'
+        has no FILE_TYPE_REGISTRY entry -- silently accepting and indexing
+        the exact format #126 says must be rejected. The extension itself
+        must be checked, not just a declared MIME type."""
+        db = AsyncMock()
+        db.validate_api_key = AsyncMock(return_value=self._key())
+        db.get_user_workspace_ids = AsyncMock(return_value=["ws-1"])
+        db.get_document_id_by_content_hash = AsyncMock(return_value=None)
+        db.get_document_id_by_filename = AsyncMock(return_value=None)
+        db.create_or_reset_pending_document = AsyncMock()
+
+        storage = self._storage()
+        mq = self._mq()
+        p1, p2 = self._intake_patches(storage, mq)
+
+        with patch.object(mcp_server, "get_database", AsyncMock(return_value=db)), p1, p2:
+            content = await _call_tool(
+                "upload_document",
+                {
+                    "api_key": "x",
+                    "filename": "report.doc",
+                    "content": (
+                        "Q3 revenue was 4.2M and the CEO approved the layoffs, "
+                        "pasted straight from a .doc file"
+                    ),
+                },
+            )
+
+        assert content[0].text.startswith("Error"), content[0].text
+        assert ".docx" in content[0].text
+        storage.upload_file.assert_not_awaited()
+        db.create_or_reset_pending_document.assert_not_awaited()
+
+    async def test_outlook_msg_rejected_even_with_content_type_omitted(self):
+        db = AsyncMock()
+        db.validate_api_key = AsyncMock(return_value=self._key())
+        db.get_user_workspace_ids = AsyncMock(return_value=["ws-1"])
+        db.get_document_id_by_content_hash = AsyncMock(return_value=None)
+        db.get_document_id_by_filename = AsyncMock(return_value=None)
+        db.create_or_reset_pending_document = AsyncMock()
+
+        storage = self._storage()
+        mq = self._mq()
+        p1, p2 = self._intake_patches(storage, mq)
+
+        with patch.object(mcp_server, "get_database", AsyncMock(return_value=db)), p1, p2:
+            content = await _call_tool(
+                "upload_document",
+                {"api_key": "x", "filename": "message.msg", "content": "pasted email text"},
+            )
+
+        assert content[0].text.startswith("Error"), content[0].text
+        assert ".eml" in content[0].text
+        storage.upload_file.assert_not_awaited()
+        db.create_or_reset_pending_document.assert_not_awaited()
+
     async def test_write_permission_denied(self):
         """A key without 'write' gets the standard permission error and never
         reaches storage/db."""

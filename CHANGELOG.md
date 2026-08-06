@@ -50,19 +50,31 @@ All notable changes to Inherent are documented here. The format follows
   are recorded in a clearly labeled section so an agent knows content was
   elided, nested `message/rfc822` parts inspected one level only);
   `.epub` (`application/epub+zip`, stdlib `zipfile` — chapters extracted
-  in `content.opf` **spine order** and run through the existing HTML
-  extractor rather than a second parser, nav/cover items skipped, DRM/
-  encrypted EPUBs fail with a clear `error_message` instead of crashing);
-  `.rtf` (`application/rtf` + `text/rtf` alias, new core dependency
-  `striprtf`); `.odt` (`application/vnd.oasis.opendocument.text`, stdlib
-  `zipfile` + the same HTML tag-strip path over `content.xml`, no `odfpy`
-  needed). EPUB and ODT share the ZIP `PK\x03\x04` signature with DOCX —
-  verified DOCX uploads still validate correctly with both registered
-  (`test_docx_still_validates_with_epub_and_odt_registered`). Legacy
-  `.doc` (`application/msword`) and Outlook `.msg`
-  (`application/vnd.ms-outlook`) are explicitly rejected with `400` and an
-  actionable "convert to .docx" / "export to .eml" message rather than
-  accepted and garbled.
+  in `content.opf` **spine order**, numbered by SPINE POSITION (not
+  extraction-success count, so one skipped chapter never renumbers the
+  rest), preferring each chapter's own `<title>`/`<h1>` as its heading, and
+  run through the existing HTML extractor rather than a second parser;
+  manifest hrefs are percent-decoded (EPUB OPF spec); nav/cover items
+  skipped; DRM/encrypted EPUBs fail with a clear `error_message` instead of
+  crashing); `.rtf` (`application/rtf` + `text/rtf` alias, new core
+  dependency `striprtf`, magic-byte check anchored to the first few bytes so
+  ordinary prose that mentions RTF's own signature isn't mislabeled);
+  `.odt` (`application/vnd.oasis.opendocument.text`, stdlib `zipfile` +
+  `content.xml` walked ODF-structure-aware via `ElementTree` — `no odfpy`
+  needed — excluding `text:tracked-changes` (retracted/deleted revision
+  text) and `office:annotation` (private reviewer comments) from indexed
+  text, and mapping `text:s`/`text:tab` to real whitespace rather than
+  markup residue). EPUB and ODT share the ZIP `PK\x03\x04` signature with
+  DOCX — verified DOCX uploads still validate correctly with both
+  registered (`test_docx_still_validates_with_epub_and_odt_registered`).
+  Legacy `.doc` (`application/msword`) and Outlook `.msg`
+  (`application/vnd.ms-outlook`) are explicitly rejected on BOTH REST and
+  MCP (`upload_document`, including when `content_type` is omitted and
+  would otherwise default from the file extension) with `400`/`Error` and
+  an actionable "convert to .docx" / "export to .eml" message rather than
+  accepted and garbled — sourced from one shared
+  `inh_contracts.EXPLICITLY_UNSUPPORTED` table so the two surfaces cannot
+  disagree.
 
 - **Retrieval-eval hard gate, baseline ratcheting, and trend history (#139).**
   Implements the "v2" items ADR 0003 deferred (run-over-run regression deltas,

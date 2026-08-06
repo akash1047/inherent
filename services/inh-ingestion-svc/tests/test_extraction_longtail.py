@@ -293,6 +293,95 @@ class TestExtractEpubText:
         with pytest.raises(RuntimeError, match="spine"):
             _extract_epub_text(epub_bytes, "no-spine.epub")
 
+    # -- #125 review blocker 1: manifest hrefs are URL references. EPUB 3
+    # requires spaces/non-ASCII to be percent-encoded, so a real EPUB's
+    # manifest can declare href="chapter%201.xhtml" for a zip member
+    # literally named "chapter 1.xhtml". Without urllib.parse.unquote,
+    # zf.read() misses the real member, the chapter is silently dropped,
+    # AND every later chapter renumbers down to fill the gap -- content loss
+    # reported as success, with wrong citations for the rest of the book.
+
+    def test_percent_encoded_href_resolves_and_loses_no_chapter(self):
+        buf = io.BytesIO()
+        manifest_items = (
+            '<item id="chap1" href="chapter%201.xhtml" media-type="application/xhtml+xml"/>'
+            '<item id="chap2" href="chap2.xhtml" media-type="application/xhtml+xml"/>'
+        )
+        opf = _opf('<itemref idref="chap1"/><itemref idref="chap2"/>', manifest_items)
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("mimetype", "application/epub+zip")
+            zf.writestr("META-INF/container.xml", _CONTAINER_XML)
+            zf.writestr("OEBPS/content.opf", opf)
+            # The ACTUAL zip member has a literal space; the manifest's href
+            # is percent-encoded per the EPUB OPF spec -- exactly the shape
+            # that silently dropped chapter 1 pre-fix.
+            zf.writestr(
+                "OEBPS/chapter 1.xhtml",
+                "<html><body><p>First chapter text.</p></body></html>",
+            )
+            zf.writestr(
+                "OEBPS/chap2.xhtml",
+                "<html><body><p>Second chapter text.</p></body></html>",
+            )
+
+        text = _extract_epub_text(buf.getvalue(), "book.epub")
+
+        # Chapter 1's text must not be silently lost...
+        assert "First chapter text." in text
+        assert "Second chapter text." in text
+        assert text.index("First chapter text.") < text.index("Second chapter text.")
+        # ...and chapter 2 must not be relabeled "Chapter 1" as a result.
+        assert "## Chapter 1" in text
+        assert "## Chapter 2" in text
+
+    def test_missing_manifest_item_does_not_renumber_later_chapters(self):
+        """Chapters are numbered by SPINE POSITION, not by count of
+        successfully-extracted chapters -- a genuinely skipped chapter
+        (spine references a manifest id that does not exist) must not shift
+        every later chapter's number down."""
+        buf = io.BytesIO()
+        # Spine has 3 itemrefs; the manifest only has entries for 1 and 3 --
+        # "chap2" is a real gap (typo'd/missing manifest entry), not a
+        # percent-encoding issue.
+        manifest_items = (
+            '<item id="chap1" href="chap1.xhtml" media-type="application/xhtml+xml"/>'
+            '<item id="chap3" href="chap3.xhtml" media-type="application/xhtml+xml"/>'
+        )
+        opf = _opf(
+            '<itemref idref="chap1"/><itemref idref="chap2"/><itemref idref="chap3"/>',
+            manifest_items,
+        )
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("mimetype", "application/epub+zip")
+            zf.writestr("META-INF/container.xml", _CONTAINER_XML)
+            zf.writestr("OEBPS/content.opf", opf)
+            zf.writestr("OEBPS/chap1.xhtml", "<html><body><p>Chapter one text.</p></body></html>")
+            zf.writestr("OEBPS/chap3.xhtml", "<html><body><p>Chapter three text.</p></body></html>")
+
+        text = _extract_epub_text(buf.getvalue(), "book.epub")
+
+        assert "Chapter one text." in text
+        assert "Chapter three text." in text
+        # The surviving second chapter is genuinely spine position 3 -- it
+        # must be labelled "Chapter 3", never renumbered down to "Chapter 2".
+        assert "## Chapter 1" in text
+        assert "## Chapter 3" in text
+        assert "## Chapter 2" not in text
+
+    def test_prefers_chapter_title_tag_over_generic_heading(self):
+        chapters = [
+            "<html><head><title>The Great Escape</title></head>"
+            "<body><p>Escape chapter text.</p></body></html>"
+        ]
+        text = _extract_epub_text(_build_epub(chapters=chapters), "book.epub")
+        assert "## The Great Escape" in text
+        assert "Escape chapter text." in text
+
+    def test_prefers_h1_when_no_title_tag(self):
+        chapters = ["<html><body><h1>Opening Chapter</h1><p>Some text.</p></body></html>"]
+        text = _extract_epub_text(_build_epub(chapters=chapters), "book.epub")
+        assert "## Opening Chapter" in text
+
     def test_encrypted_epub_fails_clearly_not_crash(self):
         """Failure-path fixture: DRM/encrypted EPUB (signalled by the
         standard META-INF/encryption.xml manifest) must fail with a clear,
@@ -380,7 +469,8 @@ class TestExtractRtfText:
 def _build_odt(content_xml_body: str) -> bytes:
     content_xml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
-    xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0">
+    xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"
+    xmlns:dc="http://purl.org/dc/elements/1.1/">
   <office:body>
     <office:text>
       {content_xml_body}
@@ -413,6 +503,83 @@ class TestExtractOdtText:
         assert "Plain paragraph text." in text
         assert "<text:" not in text
         assert "</text:" not in text
+
+    # -- #126 review blocker 2: content.xml is NOT "just another XML dialect
+    # with human text inside element bodies" -- tracked-changes retain
+    # DELETED text for revision history (not current content), and
+    # office:annotation is a PRIVATE reviewer comment. Both are real ODF
+    # constructs a generic tag-strip indexes indistinguishably from real
+    # content, letting an agent cite retracted text as fact or leak a
+    # private review comment to anyone with read access.
+
+    def test_tracked_changes_deletion_excluded_from_output(self):
+        body = (
+            "<text:tracked-changes>"
+            "<text:changed-region text:id='ct1'>"
+            "<text:deletion>"
+            "<text:p>THIS TEXT WAS DELETED and should arguably not be indexed</text:p>"
+            "</text:deletion>"
+            "</text:changed-region>"
+            "</text:tracked-changes>"
+            "<text:p>Real current paragraph text.</text:p>"
+        )
+        text = _extract_odt_text(_build_odt(body), "sample.odt")
+
+        assert "Real current paragraph text." in text
+        assert "THIS TEXT WAS DELETED" not in text
+
+    def test_annotation_and_author_name_excluded_from_output(self):
+        body = (
+            "<text:p>Visible sentence "
+            "<office:annotation>"
+            "<dc:creator>Reviewer</dc:creator>"
+            "<text:p>PRIVATE COMMENT</text:p>"
+            "</office:annotation>"
+            "continues after the note.</text:p>"
+        )
+        text = _extract_odt_text(_build_odt(body), "sample.odt")
+
+        assert "Visible sentence" in text
+        assert "continues after the note." in text
+        assert "PRIVATE COMMENT" not in text
+        assert "Reviewer" not in text
+
+    def test_combined_tracked_changes_and_annotation_excluded(self):
+        """The exact scenario from the review report: deleted text, an
+        annotation body, AND the reviewer's name must all be absent, while
+        real body text survives."""
+        body = (
+            "<text:tracked-changes>"
+            "<text:changed-region text:id='ct1'>"
+            "<text:deletion><text:p>Mallory deleted this</text:p></text:deletion>"
+            "</text:changed-region>"
+            "</text:tracked-changes>"
+            "<text:p>Approved current text."
+            "<office:annotation><dc:creator>Reviewer</dc:creator>"
+            "<text:p>PRIVATE COMMENT</text:p></office:annotation>"
+            "</text:p>"
+        )
+        text = _extract_odt_text(_build_odt(body), "sample.odt")
+
+        assert "Approved current text." in text
+        assert "Mallory" not in text
+        assert "PRIVATE COMMENT" not in text
+        assert "Reviewer" not in text
+
+    def test_text_s_and_tab_become_whitespace_not_newlines(self):
+        """Secondary defect from the same review: <text:s/> and <text:tab/>
+        must become literal whitespace, not be dropped or turned into
+        newlines that split one paragraph's words across several lines."""
+        body = '<text:p>Word<text:s text:c="3"/>with<text:tab/>spacing</text:p>'
+        text = _extract_odt_text(_build_odt(body), "sample.odt")
+
+        # The whole phrase must survive as ONE paragraph, not be split by
+        # spurious newlines -- word boundaries preserved via real whitespace.
+        lines = [line for line in text.splitlines() if line.strip()]
+        assert len(lines) == 1
+        assert "Word" in lines[0]
+        assert "with" in lines[0]
+        assert "spacing" in lines[0]
 
     def test_corrupt_zip_fails_clearly_not_crash(self):
         """Failure-path fixture: a corrupt zip must raise a clear

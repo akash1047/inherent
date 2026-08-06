@@ -12,6 +12,7 @@ from __future__ import annotations
 import pytest
 
 from inh_contracts.file_types import (
+    EXPLICITLY_UNSUPPORTED,
     FILE_TYPE_REGISTRY,
     ContentTypeMismatchError,
     ExtensionMismatchError,
@@ -19,6 +20,8 @@ from inh_contracts.file_types import (
     UnknownContentTypeError,
     all_mime_types,
     check_extension_consistency,
+    explicitly_unsupported_message_for_extension,
+    explicitly_unsupported_message_for_mime,
     get_spec_by_key,
     get_spec_for_extension,
     get_spec_for_mime,
@@ -352,6 +355,44 @@ class TestSniffContentType:
         with pytest.raises(ContentTypeMismatchError):
             ft.sniff_content_type(b"\x89PNG\r\n\x1a\n fake png bytes", docx_spec.mime_types[0])
 
+    # -- #126 review item 5: RTF's magic ("{\rtf") is plausible ENGLISH
+    # PROSE, unlike PDF's "%PDF-" -- a full 1024-byte substring search
+    # false-positives on ordinary text that merely discusses RTF. RTF's
+    # `magic_anchor_window` must keep real RTF files working while no longer
+    # rejecting prose that mentions "{\rtf" outside the first few bytes.
+
+    def test_real_rtf_file_still_sniffs_clean(self):
+        spec = sniff_content_type(b"{\\rtf1\\ansi\\deff0 hello world}", "application/rtf")
+        assert spec.key == "rtf"
+
+    def test_prose_mentioning_rtf_signature_is_not_mislabeled_as_rtf(self):
+        """The exact scenario the review caught: a markdown/text file
+        EXPLAINING the RTF format, declared as its real type, must not be
+        rejected just because the string '{\\rtf1' appears somewhere past
+        the anchored window."""
+        content = (
+            b"RTF files begin with the control word {\\rtf1\\ansi -- "
+            b"here is why that matters for parsers."
+        )
+        spec = sniff_content_type(content, "text/plain")
+        assert spec.key == "txt"
+
+    def test_prose_mentioning_rtf_signature_declared_as_markdown_is_not_mislabeled(self):
+        content = b"# About RTF\n\nRTF files begin with {\\rtf1\\ansi in the header."
+        spec = sniff_content_type(content, "text/markdown")
+        assert spec.key == "markdown"
+
+    def test_rtf_declared_but_bytes_are_not_rtf_still_rejected(self):
+        """The anchor narrows the window, it doesn't remove the check --
+        content genuinely not RTF, declared as RTF, is still caught."""
+        with pytest.raises(ContentTypeMismatchError):
+            sniff_content_type(b"this is definitely not an rtf file at all", "application/rtf")
+
+    def test_rtf_with_leading_bom_within_anchor_window_still_accepted(self):
+        content = b"\xef\xbb\xbf{\\rtf1\\ansi hello"
+        spec = sniff_content_type(content, "application/rtf")
+        assert spec.key == "rtf"
+
 
 # ---------------------------------------------------------------------------
 # check_extension_consistency -- the third leg of the sniffing story.
@@ -437,6 +478,30 @@ class TestCheckExtensionConsistency:
         spec = get_spec_for_mime("application/pdf")
         check_extension_consistency("REPORT.PDF", spec)  # must not raise
 
+    # -- #126 review item 6: RTF has a `magic` (needed for sniffing) but is
+    # genuinely ASCII text, not a binary container -- it belongs in the same
+    # "never rejected here" bucket as .txt/.md/.csv/.html, via
+    # `extension_check_exempt`, even though `magic is not None` for it.
+
+    def test_rtf_extension_declared_as_text_plain_is_accepted(self):
+        spec = get_spec_for_mime("text/plain")
+        check_extension_consistency("notes.rtf", spec)  # must not raise
+
+    def test_rtf_extension_declared_as_markdown_is_accepted(self):
+        spec = get_spec_for_mime("text/markdown")
+        check_extension_consistency("notes.rtf", spec)  # must not raise
+
+    def test_rtf_extension_declared_as_its_own_type_still_passes(self):
+        spec = get_spec_for_mime("application/rtf")
+        check_extension_consistency("report.rtf", spec)  # must not raise
+
+    def test_genuinely_binary_extension_still_rejected_alongside_exempt_rtf(self):
+        """The RTF exemption is scoped to RTF -- a real binary extension
+        (.pdf) declared as a mismatched type is still caught."""
+        spec = get_spec_for_mime("text/plain")
+        with pytest.raises(ExtensionMismatchError):
+            check_extension_consistency("report.pdf", spec)
+
 
 # ---------------------------------------------------------------------------
 # Docs generation
@@ -460,3 +525,62 @@ class TestRenderMarkdownTable:
         must never produce spurious churn from nondeterministic ordering
         (e.g. iterating a set)."""
         assert render_markdown_table() == render_markdown_table()
+
+
+# ---------------------------------------------------------------------------
+# EXPLICITLY_UNSUPPORTED -- deliberately-rejected formats with a real
+# replacement (#124/#126 review blocker 3). A single shared table so REST
+# and MCP cannot disagree about which formats get this treatment, unlike
+# the pre-fix state where each surface (or just REST) held its own copy.
+# ---------------------------------------------------------------------------
+
+
+class TestExplicitlyUnsupported:
+    def test_doc_and_msg_are_registered(self):
+        keys = {spec.key for spec in EXPLICITLY_UNSUPPORTED}
+        assert {"doc", "msg"} <= keys
+
+    def test_explicitly_unsupported_types_are_not_in_the_real_registry(self):
+        """A format cannot be both accepted and explicitly rejected -- the
+        two tables must never overlap on MIME type or extension."""
+        registered_mimes = set(all_mime_types())
+        registered_extensions = {ext for spec in FILE_TYPE_REGISTRY for ext in spec.extensions}
+        for spec in EXPLICITLY_UNSUPPORTED:
+            assert not (set(spec.mime_types) & registered_mimes)
+            assert not (set(spec.extensions) & registered_extensions)
+
+    def test_message_for_mime_names_the_replacement(self):
+        doc_message = explicitly_unsupported_message_for_mime("application/msword")
+        assert doc_message is not None
+        assert ".docx" in doc_message
+
+        msg_message = explicitly_unsupported_message_for_mime("application/vnd.ms-outlook")
+        assert msg_message is not None
+        assert ".eml" in msg_message
+
+    def test_message_for_mime_is_none_for_a_registered_or_unknown_type(self):
+        assert explicitly_unsupported_message_for_mime("application/pdf") is None
+        assert explicitly_unsupported_message_for_mime("application/x-made-up") is None
+
+    def test_message_for_mime_strips_content_type_parameters(self):
+        message = explicitly_unsupported_message_for_mime("application/msword; charset=utf-8")
+        assert message is not None
+        assert ".docx" in message
+
+    def test_message_for_extension_covers_the_content_type_omitted_case(self):
+        """The exact gap #124/#126 review blocker 3 found: a surface that
+        resolves content type FROM the filename (MCP upload_document with
+        content_type omitted) needs the extension itself as a rejection
+        key, not just the MIME type."""
+        doc_message = explicitly_unsupported_message_for_extension("report.doc")
+        assert doc_message is not None
+        assert ".docx" in doc_message
+
+        msg_message = explicitly_unsupported_message_for_extension("message.MSG")
+        assert msg_message is not None
+        assert ".eml" in msg_message
+
+    def test_message_for_extension_is_none_for_registered_or_unknown_extension(self):
+        assert explicitly_unsupported_message_for_extension("report.docx") is None
+        assert explicitly_unsupported_message_for_extension("notes.xyz") is None
+        assert explicitly_unsupported_message_for_extension("no-extension-at-all") is None

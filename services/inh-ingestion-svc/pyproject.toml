@@ -19,7 +19,7 @@ dependencies = [
     # RTF extraction (#126) -- tiny, pure-Python, no C extensions or system
     # binaries, so it's a core dependency (like python-docx/pypdf above)
     # rather than an optional extra.
-    "striprtf>=0.0.26",
+    "striprtf>=0.0.26,<0.1",
     # Charset detection for text extraction (#117) -- replaces
     # `errors="ignore"`, which silently DROPPED any non-UTF-8 byte instead of
     # decoding it, with a real best-guess decode of the file's actual encoding.
