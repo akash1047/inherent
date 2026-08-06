@@ -82,6 +82,7 @@ nav:
       - Supported file types: reference/file-types.md
   - Release Notes: release-notes.md
   - Architecture:
+      - System overview: architecture/overview.md
       - ADR index: adr/README.md
       - 0001 — Agent memory substrate: adr/0001-agent-memory-substrate.md
       - 0002 — Weaviate multi-tenancy scale: adr/0002-weaviate-multi-tenancy-scale.md
