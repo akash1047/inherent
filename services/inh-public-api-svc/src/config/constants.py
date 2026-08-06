@@ -7,6 +7,11 @@ from inh_contracts.file_types import all_mime_types
 # API version
 API_VERSION: Final[str] = "v1"
 
+# Default Postgres database name — single-sourced so the local DATABASE_URL
+# default and the Cloud SQL database default can't drift apart (they name
+# the same database).
+DEFAULT_DATABASE_NAME: Final[str] = "knowledge_base"
+
 # Default rate limit for keys without an explicit limit (see ApiKey.rate_limit)
 DEFAULT_RATE_LIMIT: Final[int] = 100
 

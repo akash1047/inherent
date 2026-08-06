@@ -48,9 +48,6 @@ from src.temporal.workflows.audit_log import WriteAuditLogWorkflow
 
 logger = structlog.get_logger(__name__)
 
-# Default task queue name for document ingestion
-TASK_QUEUE_NAME = "document-ingestion"
-
 # All activities registered with the ingestion worker
 _ALL_ACTIVITIES: list[Callable[..., Any]] = [
     create_pending_document,

@@ -211,6 +211,18 @@ All notable changes to Inherent are documented here. The format follows
 
 ### Changed
 
+- **Config defaults single-sourced to stop silent drift (#202).** The
+  Postgres database name is now `DEFAULT_DATABASE_NAME` in
+  `inh-public-api-svc`'s `config/constants.py`, feeding both the
+  `database_url` default and `cloud_sql_database` instead of being spelled
+  `"knowledge_base"` twice; both services' `embedder.py` now derive
+  `_DEFAULT_URL`/`_DEFAULT_DIM` from `Settings.model_fields[...].default`
+  rather than re-hardcoding the TEI URL and embedding dimension as separate
+  literals; `inh-ingestion-svc`'s dead `TASK_QUEUE_NAME` constant (a stale
+  duplicate of `settings.temporal_task_queue`) is removed. Same values, no
+  behavior change — asserted by test. Recovered from an unmerged branch
+  authored by Prime and rebased onto the current registry-derived
+  `ALLOWED_MIME_TYPES`.
 - **⚠️ BREAKING (behavior) — format-aware chunking driven by the registry
   `chunking_hint` (#129).** `chunk_text` previously resolved
   sentences/paragraphs/tokens purely from config — the same rule for a
