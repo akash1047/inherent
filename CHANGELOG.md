@@ -12,23 +12,34 @@ All notable changes to Inherent are documented here. The format follows
   (`application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`,
   `.xlsx`, REST-only) extracts row-aware, sheet-boundary-preserving text
   (`## Sheet: <name>` headers, pipe-delimited rows, computed formula values
-  via `openpyxl` `data_only=True`), with cost guards on evaluated-cell count
-  and emitted text length. PPTX
+  via `openpyxl` `data_only=True`, merged cells carrying a `[merged A1:D1]`
+  marker, the sheet name + header row periodically re-emitted so a
+  downstream chunker splitting mid-sheet still has context). PPTX
   (`application/vnd.openxmlformats-officedocument.presentationml.presentation`,
   `.pptx`, REST-only) extracts slide-boundary text (`## Slide <n>: <title>`
   headers, in-order text frames, pipe-delimited table rows, speaker notes
-  under `Notes:`) via `python-pptx`, with a slide-count and text-length cost
-  guard. Both are core (non-optional) dependencies of `inh-ingestion-svc`
-  (`openpyxl`, `python-pptx`), `hard_fail` degradation. Legacy `.xls`/`.ppt`
-  (a different, OLE2-based binary format) have no registry entry and
-  continue to 400 with the standard unsupported-type message rather than
-  being silently mis-parsed. XLSX, PPTX, and the existing DOCX format all
-  share the same ZIP local-file-header magic bytes (`PK\x03\x04`) — the
-  intake-time byte sniff cannot distinguish them from each other by design;
-  a mismatched filename extension is caught at upload (`ExtensionMismatchError`,
-  400), and a mismatched-but-extensionless upload is caught at the
-  extraction stage instead (the wrong OOXML part set fails to parse, never
-  silently mis-read as another format).
+  under `Notes:`) via `python-pptx`. Both are core (non-optional)
+  dependencies of `inh-ingestion-svc` (`openpyxl`, `python-pptx`),
+  `hard_fail` degradation. Legacy `.xls`/`.ppt` (a different, OLE2-based
+  binary format) have no registry entry and continue to 400 with the
+  standard unsupported-type message rather than being silently mis-parsed.
+  Cost guards (evaluated-cell/slide count, per-value length, total emitted
+  text length) are enforced incrementally while streaming rows/slides, not
+  after materializing the full output, so a pathological file fails fast
+  with bounded memory instead of risking OOM; every extraction failure
+  (corrupt/truncated file, password-protected file, a cap breach, a
+  mismatched OOXML sibling reaching DOCX's extractor) is deterministic given
+  the uploaded bytes and raises a non-retryable error, so Temporal fails the
+  document after one attempt instead of burning its retry budget on an
+  outcome already known at attempt 1. XLSX, PPTX, and the existing DOCX
+  format all share the same ZIP local-file-header magic bytes (`PK\x03\x04`)
+  — the intake-time byte sniff cannot distinguish them from each other by
+  design. A mismatched filename extension is caught at upload
+  (`ExtensionMismatchError`, 400); an extensionless upload, OR one renamed to
+  match the false declared type (e.g. real XLSX bytes as `report.docx`),
+  reaches extraction instead, where the wrong OOXML part set fails to parse
+  with a clear, filename-bearing, non-retryable error — never silently
+  mis-read as another format.
 - **Ingestion-source Temporal memo on `DocumentIngestionWorkflow` starts
   (#141).** `core.document.uploaded.v1` now optionally carries `source`
   (`connector:<provider>` | `public-api` | `manual`), `connection_id`, and

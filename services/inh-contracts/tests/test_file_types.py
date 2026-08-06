@@ -343,6 +343,44 @@ class TestSniffContentType:
         assert "xlsx" in str(exc_info.value)
         assert "docx" in str(exc_info.value)
 
+    def test_xlsx_bytes_renamed_to_match_the_declared_lie_passes_both_checks(self):
+        """Review follow-up: the extension check above ONLY fires when the
+        filename carries a RECOGNIZED, DIFFERING extension. It does NOT fire
+        when the filename is renamed to MATCH the (false) declared type --
+        genuine XLSX bytes, uploaded as "report.docx" and declared as DOCX,
+        pass BOTH `sniff_content_type` (same ZIP family, no contradiction)
+        AND `check_extension_consistency` (the extension IS ".docx", which
+        DOES match the declared docx spec -- there is nothing for this check
+        to object to). This is the complete, accurate statement of the
+        shared-magic guarantee's limit: renaming to match the lie reaches
+        extraction exactly like the extensionless case
+        test_xlsx_bytes_declared_as_docx_pass_the_byte_sniff already covers --
+        it is not a narrower or rarer case, it is the SAME reachable case
+        under a different, equally realistic filename. All six renamed pairs
+        among {docx, xlsx, pptx} behave identically (only docx<->xlsx is
+        spelled out here; the other four follow the same two-check argument
+        with no format-specific difference in either function)."""
+        docx_spec = get_spec_by_key("docx")
+        assert docx_spec is not None
+
+        # Genuine XLSX bytes, uploaded as "report.docx", declared as docx.
+        sniff_result = sniff_content_type(
+            b"PK\x03\x04 an actual xlsx workbook's bytes", docx_spec.mime_types[0]
+        )
+        assert sniff_result.key == "docx"  # passes -- resolves to the DECLARED type
+
+        check_extension_consistency("report.docx", docx_spec)  # must not raise -- ".docx" IS docx's own extension
+
+        # The mirror case: genuine DOCX bytes, uploaded as "sheet.xlsx",
+        # declared as xlsx -- same two-check pass, same underlying gap.
+        xlsx_spec = get_spec_by_key("xlsx")
+        assert xlsx_spec is not None
+        sniff_result_2 = sniff_content_type(
+            b"PK\x03\x04 an actual docx document's bytes", xlsx_spec.mime_types[0]
+        )
+        assert sniff_result_2.key == "xlsx"
+        check_extension_consistency("sheet.xlsx", xlsx_spec)  # must not raise
+
 
 # ---------------------------------------------------------------------------
 # check_extension_consistency -- the third leg of the sniffing story.

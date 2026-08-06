@@ -175,7 +175,10 @@ class TestExtractTextActivity:
         """#118: XLSX now HAS a FILE_TYPE_REGISTRY entry and a real
         extractor. Garbage bytes (not a real workbook) still fail -- just at
         a different, more specific layer: openpyxl can't open them, wrapped
-        as an actionable RuntimeError by `_extract_xlsx_text` (see
+        as an actionable, non-retryable ApplicationError by
+        `_extract_xlsx_text` (review follow-up: this used to be a bare
+        RuntimeError, retried 3x by Temporal's default activity RetryPolicy
+        for a deterministic, unfixable-by-retry failure -- see
         test_extraction_by_type.py::TestXlsxFailurePaths for the extractor
         unit test this pins end-to-end through the activity)."""
         mock_storage = MagicMock()
@@ -195,8 +198,9 @@ class TestExtractTextActivity:
 
         from src.temporal.activities.extract import extract_text
 
-        with pytest.raises(RuntimeError, match="Failed to open XLSX workbook"):
+        with pytest.raises(ApplicationError, match="XLSX extraction failed") as exc_info:
             await extract_text(input_data)
+        assert exc_info.value.non_retryable
 
         mock_staging.write_text.assert_not_called()
 
@@ -222,10 +226,35 @@ class TestExtractTextActivity:
 
         from src.temporal.activities.extract import extract_text
 
-        with pytest.raises(RuntimeError, match="Failed to open PPTX presentation"):
+        with pytest.raises(ApplicationError, match="PPTX extraction failed") as exc_info:
             await extract_text(input_data)
+        assert exc_info.value.non_retryable
 
         mock_staging.write_text.assert_not_called()
+
+    def test_xlsx_and_pptx_and_docx_failures_classify_as_extraction_failed(self):
+        """Review follow-up: `DocumentIngestionWorkflow._classify_error`
+        matches on the SUBSTRING "extract" in the lower-cased error message.
+        Before this fix, only the two *_TEXT_CAP messages matched (by
+        accident, via "extract**ed**") -- the open-failure and cap-breach
+        messages did not contain "extract" at all and classified as
+        "unknown", which means the dead-letter API's error_type filter would
+        never surface an OOXML extraction failure. Every new failure message
+        now explicitly says "extraction failed" by construction, not by
+        accident -- this pins that against the real classifier."""
+        from src.temporal.workflows.document_ingestion import DocumentIngestionWorkflow
+
+        messages = [
+            "XLSX extraction failed: could not open workbook (BadZipFile: File is not a zip file).",
+            "XLSX extraction failed: evaluated-cell cap (500000) exceeded while reading sheet 'S1'.",
+            "XLSX extraction failed: extracted text exceeds the 5000000-character cap.",
+            "PPTX extraction failed: could not open presentation (BadZipFile: File is not a zip file).",
+            "PPTX extraction failed: slide cap (5000) exceeded.",
+            "PPTX extraction failed: extracted text exceeds the 5000000-character cap.",
+            "DOCX extraction failed (report.docx): could not read the document (wrong OOXML content type (...)).",
+        ]
+        for message in messages:
+            assert DocumentIngestionWorkflow._classify_error(message) == "extraction_failed", message
 
     def test_legacy_xls_content_type_is_unregistered(self):
         """#118: legacy .xls (application/vnd.ms-excel, OLE2 binary format --

@@ -1064,8 +1064,8 @@ depend on it.
 | `sample.json` | `application/json` | `docs/examples/sample-documents/sample.json` |
 | `sample.csv` | `text/csv` | `docs/examples/sample-documents/sample.csv` |
 | `sample.html` | `text/html` | `docs/examples/sample-documents/sample.html` |
-| `sample.pdf` | `application/pdf` | Generate with any PDF tool; not committed (binary) |
-| `sample.docx` | `application/vnd.openxmlformats-officedocument.wordprocessingml.document` | Generate with LibreOffice/Word; not committed (binary) |
+| `sample.pdf` | `application/pdf` | `docs/examples/sample-documents/sample.pdf` |
+| `sample.docx` | `application/vnd.openxmlformats-officedocument.wordprocessingml.document` | `docs/examples/sample-documents/sample.docx` |
 | `sample.xlsx` | `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet` | `docs/examples/sample-documents/sample.xlsx` |
 | `sample.pptx` | `application/vnd.openxmlformats-officedocument.presentationml.presentation` | `docs/examples/sample-documents/sample.pptx` |
 | `sample.png` | `image/png` | `docs/examples/sample-documents/sample.png` |

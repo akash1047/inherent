@@ -18,6 +18,7 @@ from pathlib import Path
 import openpyxl
 import pytest
 from pptx import Presentation
+from temporalio.exceptions import ApplicationError
 
 from src.temporal.activities.extract import (
     _extract_docx_text,
@@ -25,6 +26,7 @@ from src.temporal.activities.extract import (
     _extract_pdf_text,
     _extract_pptx_text,
     _extract_xlsx_text,
+    _format_xlsx_cell,
 )
 
 # tests/ -> inh-ingestion-svc -> services -> repo
@@ -109,6 +111,12 @@ def test_extract_xlsx():
     # Row-aware: cells stay pipe-delimited in column order, so "which value
     # sat in which column" survives the flatten to plain text.
     assert "Product | Region | Revenue" in text
+    # The fixture's merged title cells (Overview A1:D1, Notes A1:B1) carry a
+    # visible span marker -- distinguishes "blank because merged" from
+    # "blank because genuinely empty" (review follow-up: previously the
+    # merge flattened to a value cell followed by unexplained blank cells).
+    assert "[merged A1:D1]" in text
+    assert "[merged A1:B1]" in text
 
 
 def test_extract_pptx():
@@ -136,40 +144,115 @@ def test_extract_pptx():
 
 
 class TestXlsxFailurePaths:
-    def test_corrupt_truncated_zip_raises_runtime_error(self):
+    def test_corrupt_truncated_zip_raises_non_retryable(self):
         """A ZIP-signature prefix followed by garbage (corrupt or truncated
         upload) must fail loudly -- openpyxl's zipfile.BadZipFile is caught
-        and re-raised as an actionable RuntimeError, not left to propagate
-        as a confusing low-level exception."""
-        with pytest.raises(RuntimeError, match="Failed to open XLSX workbook"):
+        and re-raised as an actionable, NON-RETRYABLE ApplicationError (review
+        follow-up: a bare RuntimeError here was retried 3x by Temporal's
+        default activity RetryPolicy even though the same bytes can never
+        succeed on retry -- deterministic given fixed content, same reasoning
+        as `_resolve_extractor`'s existing non-retryable failures)."""
+        with pytest.raises(ApplicationError, match="XLSX extraction failed") as exc_info:
             _extract_xlsx_text(b"PK\x03\x04" + b"garbage, not a real zip central directory")
+        assert exc_info.value.non_retryable
 
-    def test_password_protected_bytes_raise_runtime_error(self):
+    def test_password_protected_bytes_raise_non_retryable(self):
         """Password-protected OOXML is wrapped in an OLE2/CFBF container
         (magic D0 CF 11 E0 A1 B1 1A E1), not a ZIP -- it is normally caught
         earlier by inh_contracts.sniff_content_type's magic-byte check
         (declared xlsx, bytes don't match the zip signature) before ever
         reaching this extractor. This test is the defense-in-depth layer:
         even called directly, the extractor itself must not crash
-        ungracefully or hang -- it fails the same clear way as any other
-        non-zip input."""
+        ungracefully or hang -- it fails the same clear, non-retryable way as
+        any other non-zip input."""
         ole2_encrypted_magic = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + b"\x00" * 32
-        with pytest.raises(RuntimeError, match="Failed to open XLSX workbook"):
+        with pytest.raises(ApplicationError, match="XLSX extraction failed") as exc_info:
             _extract_xlsx_text(ole2_encrypted_magic)
+        assert exc_info.value.non_retryable
 
-    def test_empty_workbook_still_yields_sheet_boundary_text(self):
-        """An 'empty' workbook is never truly content-less: openpyxl (and
-        Excel) always ships at least one sheet, so extraction still emits
-        that sheet's '## Sheet: <name>' boundary heading even with zero data
-        rows. This is a DELIBERATE choice (preserve structure over emitting
-        nothing) -- documented here so it isn't mistaken for a bug: contrast
-        with PPTX below, where zero slides really does mean zero text."""
+    def test_missing_dependency_raises_non_retryable(self, monkeypatch):
+        """openpyxl not being installed is itself deterministic (retrying the
+        same worker process, or any worker with the same image, can never
+        succeed) -- non-retryable, same as every other failure mode here."""
+        import builtins
+
+        real_import = builtins.__import__
+
+        def _blocking_import(name, *args, **kwargs):
+            if name == "openpyxl":
+                raise ImportError("simulated: openpyxl not installed")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", _blocking_import)
+
+        with pytest.raises(ApplicationError, match="openpyxl not available") as exc_info:
+            _extract_xlsx_text(b"irrelevant")
+        assert exc_info.value.non_retryable
+
+    def test_empty_workbook_yields_empty_text_not_a_bare_sheet_heading(self):
+        """Review follow-up: an 'empty' workbook previously still yielded its
+        sheet's '## Sheet: <name>' heading with zero data rows -- non-empty
+        text that cleared extract_text's empty-extraction guard and got a
+        content-free document indexed. openpyxl (and Excel) always ships
+        >=1 sheet, so that asymmetry was XLSX-specific (contrast PPTX below,
+        where 0 slides genuinely means ""). Now XLSX matches PPTX's honest
+        "nothing extracted -> ''" contract when no sheet has any data."""
         workbook = openpyxl.Workbook()  # default: exactly one blank sheet
         buf = io.BytesIO()
         workbook.save(buf)
 
         text = _extract_xlsx_text(buf.getvalue())
-        assert "## Sheet:" in text
+        assert text == ""
+
+    def test_formula_only_workbook_with_no_cached_values_yields_empty_text(self):
+        """CAVEAT documented in `_extract_xlsx_text`'s docstring, now covered
+        by a real test: `data_only=True` reads only a formula's CACHED
+        computed value. A workbook whose formulas were never evaluated by a
+        calculating engine (Excel, LibreOffice) -- including any workbook
+        openpyxl itself writes, since openpyxl never evaluates formulas --
+        has no cache, so every formula cell reads back as None. That row is
+        then indistinguishable from a genuinely blank one and skipped; if
+        that's true of every row in every sheet, the whole extraction is
+        honestly empty (see the previous test) rather than silently indexing
+        a document whose only content was formula source text no one can
+        read as computed values."""
+        workbook = openpyxl.Workbook()
+        sheet = workbook.active
+        sheet["A1"] = "=1+1"  # formula string; openpyxl writes NO cached <v>
+        buf = io.BytesIO()
+        workbook.save(buf)
+
+        text = _extract_xlsx_text(buf.getvalue())
+        assert text == ""
+
+    def test_formula_only_workbook_logs_a_diagnostic_warning(self, monkeypatch):
+        """The empty-text result above is easy to misread as 'this workbook
+        is genuinely empty' -- a structured warning naming the sheet and the
+        data_only caveat is the runtime signal for the actual cause.
+        `structlog`'s warnings don't reach pytest's stdlib-`logging`-based
+        `caplog` fixture unless routed through `structlog.stdlib` (this
+        codebase isn't), so the module's `logger.warning` is monkeypatched
+        directly -- same pattern as mocking any other collaborator."""
+        import src.temporal.activities.extract as extract_module
+
+        calls = []
+        monkeypatch.setattr(
+            extract_module.logger, "warning", lambda msg, **kw: calls.append((msg, kw))
+        )
+
+        workbook = openpyxl.Workbook()
+        sheet = workbook.active
+        sheet["A1"] = "=1+1"
+        buf = io.BytesIO()
+        workbook.save(buf)
+
+        _extract_xlsx_text(buf.getvalue())
+
+        assert len(calls) == 1
+        message, kwargs = calls[0]
+        assert "none evaluated to visible data" in message
+        assert kwargs["sheet"] == "Sheet"
+        assert "data_only=True" in kwargs["hint"]
 
     def test_many_sheets_extracts_all_without_hanging(self):
         """550 sheets (comfortably above a realistic real-world workbook,
@@ -207,24 +290,133 @@ class TestXlsxFailurePaths:
         buf = io.BytesIO()
         workbook.save(buf)
 
-        with pytest.raises(RuntimeError, match="evaluated-cell cap"):
+        with pytest.raises(ApplicationError, match="evaluated-cell cap") as exc_info:
             _extract_xlsx_text(buf.getvalue())
+        assert exc_info.value.non_retryable
 
-    def test_dates_and_numbers_render_deterministically(self):
-        """#118 acceptance criterion: numbers and dates render
-        deterministically (not locale-dependent repr, not float noise)."""
-        import datetime
+    def test_text_cap_exceeded_incrementally_bounds_memory(self, monkeypatch):
+        """BLOCKER (review): the text-length cap used to be checked ONLY
+        after `"\\n\\n".join(sheet_parts)` had already built the full,
+        multi-sheet output string -- the exact allocation the cap exists to
+        prevent had already happened by the time it fired. Measured on
+        review with a 200x200 grid of 32KB-string cells (8% of the cell cap,
+        a 101KB upload): 2,572MB peak RSS and 24s before the old code's
+        end-of-function check raised.
+
+        This test proves the FIX -- the cap is now checked INSIDE the row
+        loop, immediately after each row's text is added to the running
+        total -- by lowering the cap and using a moderate multi-row grid: if
+        the check still only ran at the end, this would build the entire
+        ~200KB string and pass; because it now runs per-row, it must raise
+        after only a handful of rows, well before all of them are read.
+        """
+        import src.temporal.activities.extract as extract_module
+
+        monkeypatch.setattr(extract_module, "_MAX_XLSX_TEXT_CHARS", 10_000)
 
         workbook = openpyxl.Workbook()
         sheet = workbook.active
-        sheet.append(["Count", "When"])
-        sheet.append([42, datetime.date(2026, 1, 15)])
+        row_text = "x" * 2_000  # ~10 cols x 200 chars/cell-ish per row
+        for _ in range(200):
+            sheet.append([row_text] * 10)
+        buf = io.BytesIO()
+        workbook.save(buf)
+
+        with pytest.raises(ApplicationError, match="character cap") as exc_info:
+            _extract_xlsx_text(buf.getvalue())
+        assert exc_info.value.non_retryable
+
+    def test_single_pathological_cell_is_truncated_not_unbounded(self):
+        """BLOCKER (review): `_MAX_XLSX_CELLS` bounds the CELL COUNT, and a
+        cell is an unbounded-length string -- the cell-count cap alone
+        cannot prevent one pathologically large value from blowing the
+        memory/text budget by itself. `_format_xlsx_cell` must bound each
+        rendered value independently."""
+        huge = "z" * 50_000
+        rendered = _format_xlsx_cell(huge)
+        assert len(rendered) < len(huge)
+        assert rendered.startswith("z" * 100)
+        assert "truncated" in rendered
+        assert "50000" in rendered  # names the original length
+
+    def test_merge_scan_skips_oversized_worksheet_xml_not_decompress_unbounded(self, monkeypatch):
+        """Self-caught regression: the FIRST version of merge-span detection
+        (`_xlsx_merge_anchors`) read+decoded the ENTIRE worksheet XML part
+        unconditionally to regex-search it for `<mergeCell>` tags. Measured
+        directly: a worksheet's UNCOMPRESSED XML can be many orders of
+        magnitude larger than the upload's compressed size (a 2.6MB upload
+        -- the BLOCKER 1 pathological shape above, OOXML inline strings, not
+        shared strings -- decompresses to a 1.3GB sheet1.xml). Reading that
+        unconditionally reintroduced the exact unbounded-memory failure
+        BLOCKER 1 closes, through a completely different code path: peak RSS
+        measured at 2,516MB / 19.45s for that shape before this gate, 18MB /
+        0.14s after. This test pins the gate itself (`_MAX_MERGE_SCAN_BYTES`,
+        checked against `ZipInfo.file_size` BEFORE any `zf.read()`) directly,
+        without needing a multi-GB fixture in CI: lower the gate below any
+        real worksheet's size and confirm merge annotation is silently
+        skipped (not that extraction fails -- annotation is a nicety, never
+        worth failing over)."""
+        import src.temporal.activities.extract as extract_module
+
+        monkeypatch.setattr(extract_module, "_MAX_MERGE_SCAN_BYTES", 1)  # any real sheet exceeds this
+
+        workbook = openpyxl.Workbook()
+        sheet = workbook.active
+        sheet.merge_cells("A1:D1")
+        sheet["A1"] = "Title Row"
+        sheet.append(["a", "b", "c", "d"])
         buf = io.BytesIO()
         workbook.save(buf)
 
         text = _extract_xlsx_text(buf.getvalue())
-        assert "42" in text
-        assert "2026-01-15" in text
+        assert "Title Row" in text  # extraction itself is unaffected
+        assert "[merged" not in text  # but the (gated-off) annotation is absent
+
+    def test_pathological_many_small_cells_shape_caught_incrementally(self, monkeypatch):
+        """Reproduces the review's exact pathological shape at a scale a
+        unit test can afford (real cells are truncated per-cell anyway, per
+        the test above) -- 50 columns x 50KB-ish strings, cap lowered so the
+        incremental per-row check must fire within the first few rows, not
+        after streaming the whole 40k-cell grid the review's original report
+        described."""
+        import src.temporal.activities.extract as extract_module
+
+        monkeypatch.setattr(extract_module, "_MAX_XLSX_TEXT_CHARS", 50_000)
+        monkeypatch.setattr(extract_module, "_MAX_XLSX_CELL_CHARS", 2_000)
+
+        workbook = openpyxl.Workbook()
+        sheet = workbook.active
+        big_cell = "q" * 5_000  # will truncate to 2_000 chars each
+        for _ in range(50):
+            sheet.append([big_cell] * 50)
+        buf = io.BytesIO()
+        workbook.save(buf)
+
+        with pytest.raises(ApplicationError, match="character cap"):
+            _extract_xlsx_text(buf.getvalue())
+
+    def test_dates_and_numbers_render_deterministically(self):
+        """#118 acceptance criterion: numbers and dates render
+        deterministically (not locale-dependent repr, not float noise).
+        Pins the EXACT rendered line (review follow-up: the previous test
+        only substring-matched "2026-01-15", which also matches the buggy
+        "2026-01-15T00:00:00" -- passing without pinning the real output).
+        A date-only cell must render WITHOUT a spurious "T00:00:00" time
+        suffix; a cell with a real time component keeps its full timestamp."""
+        import datetime
+
+        workbook = openpyxl.Workbook()
+        sheet = workbook.active
+        sheet.append(["Count", "DateOnly", "Stamp"])
+        sheet.append(
+            [42, datetime.date(2026, 1, 15), datetime.datetime(2026, 1, 15, 13, 30, 0)]
+        )
+        buf = io.BytesIO()
+        workbook.save(buf)
+
+        text = _extract_xlsx_text(buf.getvalue())
+        assert "42 | 2026-01-15 | 2026-01-15T13:30:00" in text
+        assert "2026-01-15T00:00:00" not in text  # the bug this pins the fix for
 
     def test_legacy_xls_has_no_registry_entry(self):
         """Legacy .xls (binary OLE2 format, NOT the same format as .xlsx)
@@ -239,17 +431,41 @@ class TestXlsxFailurePaths:
 
 
 class TestPptxFailurePaths:
-    def test_corrupt_truncated_zip_raises_runtime_error(self):
-        with pytest.raises(RuntimeError, match="Failed to open PPTX presentation"):
+    def test_corrupt_truncated_zip_raises_non_retryable(self):
+        """Non-retryable ApplicationError (review follow-up, same reasoning
+        as XLSX above): a corrupt/truncated deck can never succeed on
+        retry."""
+        with pytest.raises(ApplicationError, match="PPTX extraction failed") as exc_info:
             _extract_pptx_text(b"PK\x03\x04" + b"garbage, not a real zip central directory")
+        assert exc_info.value.non_retryable
 
-    def test_password_protected_bytes_raise_runtime_error(self):
+    def test_password_protected_bytes_raise_non_retryable(self):
         """Same reasoning as the XLSX case above: encrypted PPTX is OLE2,
         normally caught by sniff_content_type before reaching here; this
-        pins the extractor's own defense-in-depth failure path."""
+        pins the extractor's own defense-in-depth, non-retryable failure
+        path."""
         ole2_encrypted_magic = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + b"\x00" * 32
-        with pytest.raises(RuntimeError, match="Failed to open PPTX presentation"):
+        with pytest.raises(ApplicationError, match="PPTX extraction failed") as exc_info:
             _extract_pptx_text(ole2_encrypted_magic)
+        assert exc_info.value.non_retryable
+
+    def test_missing_dependency_raises_non_retryable(self, monkeypatch):
+        """python-pptx not being installed is deterministic -- non-retryable,
+        mirrors the XLSX/openpyxl case above."""
+        import builtins
+
+        real_import = builtins.__import__
+
+        def _blocking_import(name, *args, **kwargs):
+            if name == "pptx":
+                raise ImportError("simulated: python-pptx not installed")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", _blocking_import)
+
+        with pytest.raises(ApplicationError, match="python-pptx not available") as exc_info:
+            _extract_pptx_text(b"irrelevant")
+        assert exc_info.value.non_retryable
 
     def test_empty_deck_yields_empty_text(self):
         """Unlike XLSX (always >=1 sheet), a brand-new python-pptx
@@ -285,7 +501,7 @@ class TestPptxFailurePaths:
 
     def test_slide_cap_exceeded_fails_actionably_not_oom(self, monkeypatch):
         """Mirrors the XLSX cell cap: a pathological deck must fail with an
-        actionable message rather than run away unbounded."""
+        actionable, non-retryable message rather than run away unbounded."""
         import src.temporal.activities.extract as extract_module
 
         monkeypatch.setattr(extract_module, "_MAX_PPTX_SLIDES", 2)
@@ -298,8 +514,46 @@ class TestPptxFailurePaths:
         buf = io.BytesIO()
         presentation.save(buf)
 
-        with pytest.raises(RuntimeError, match="slide cap"):
+        with pytest.raises(ApplicationError, match="slide cap") as exc_info:
             _extract_pptx_text(buf.getvalue())
+        assert exc_info.value.non_retryable
+
+    def test_text_cap_exceeded_incrementally_bounds_memory(self, monkeypatch):
+        """BLOCKER (review): mirrors the XLSX text-cap fix -- the cap used
+        to be checked only after the entire deck's text was joined into one
+        string. Now checked per-shape, inside the slide loop, so a
+        pathological deck fails after a handful of slides instead of after
+        materializing the whole thing."""
+        import src.temporal.activities.extract as extract_module
+
+        monkeypatch.setattr(extract_module, "_MAX_PPTX_TEXT_CHARS", 10_000)
+
+        presentation = Presentation()
+        layout = presentation.slide_layouts[1]
+        body_text = "y" * 3_000
+        for _ in range(20):
+            slide = presentation.slides.add_slide(layout)
+            slide.placeholders[1].text_frame.text = body_text
+        buf = io.BytesIO()
+        presentation.save(buf)
+
+        with pytest.raises(ApplicationError, match="character cap") as exc_info:
+            _extract_pptx_text(buf.getvalue())
+        assert exc_info.value.non_retryable
+
+    def test_single_pathological_run_is_truncated_not_unbounded(self):
+        """BLOCKER (review): mirrors the XLSX per-cell bound -- a single
+        pathologically long paragraph/table-cell must not blow the text
+        budget by itself; `_MAX_PPTX_SLIDES` bounds slide COUNT, not the
+        length of any one shape's text."""
+        from src.temporal.activities.extract import _pptx_bounded_text
+
+        huge = "w" * 50_000
+        rendered = _pptx_bounded_text(huge)
+        assert len(rendered) < len(huge)
+        assert rendered.startswith("w" * 100)
+        assert "truncated" in rendered
+        assert "50000" in rendered
 
     def test_legacy_ppt_has_no_registry_entry(self):
         """Legacy .ppt (binary OLE2 format) must never be silently
@@ -318,8 +572,21 @@ def test_genuine_xlsx_fed_to_docx_extractor_fails_loudly_not_silently():
     them apart. This is the layer that DOES catch it: python-docx's own
     OOXML content-type check refuses to open a package whose principal part
     is a spreadsheet, not a document, raising instead of returning mangled
-    or empty text. The document fails loudly (RuntimeError -> Temporal
-    activity failure -> document marked 'failed'), never silently garbled."""
+    or empty text.
+
+    Review follow-up: a bare `pytest.raises(Exception)` would have passed
+    even if this degraded to a bare `KeyError` or leaked python-docx's raw
+    `ValueError` (observed, unwrapped: a `<_io.BytesIO object at 0x...>`
+    heap-address repr with no filename) straight into the document's
+    `error_message` / dead-letter row -- neither of which is what "fails
+    loudly" is supposed to mean. This now pins the SPECIFIC exception type
+    (non-retryable ApplicationError, since the failure is deterministic
+    given fixed bytes), that the filename is present, and that the raw
+    heap-address repr is gone."""
     xlsx_bytes = _read("sample.xlsx")
-    with pytest.raises(Exception):
-        _extract_docx_text(xlsx_bytes)
+    with pytest.raises(ApplicationError, match="DOCX extraction failed") as exc_info:
+        _extract_docx_text(xlsx_bytes, "report.docx")
+    assert exc_info.value.non_retryable
+    message = str(exc_info.value)
+    assert "report.docx" in message
+    assert "_io.BytesIO object at 0x" not in message  # the heap-address leak this pins the fix for
