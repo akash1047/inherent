@@ -368,8 +368,11 @@ class TestDocumentDeletion:
         chunks_before = await db_service.get_document_chunks(message.document_id)
         assert len(chunks_before) == len(sample_chunks)
 
-        # Delete document
-        deleted = await db_service.delete_document(message.document_id)
+        # Delete document (workspace_id is required, #177 review -- see
+        # DatabaseService.delete_document's docstring)
+        deleted = await db_service.delete_document(
+            message.document_id, workspace_id=message.workspace_id
+        )
         assert deleted is True
 
         # Verify document is gone
@@ -386,7 +389,9 @@ class TestDocumentDeletion:
         db_service: DatabaseService,
     ):
         """Test that deleting nonexistent document returns False."""
-        deleted = await db_service.delete_document("nonexistent_doc_id")
+        deleted = await db_service.delete_document(
+            "nonexistent_doc_id", workspace_id="nonexistent_workspace"
+        )
         assert deleted is False
 
 

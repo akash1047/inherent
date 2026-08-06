@@ -1364,21 +1364,49 @@ class DatabaseService:
 
             return [dict(row._mapping) for row in results]
 
-    async def delete_document(self, document_id: str) -> bool:
-        """Delete a document and its chunks (CASCADE)."""
+    async def delete_document(self, document_id: str, workspace_id: str) -> bool:
+        """Delete a document and its chunks (CASCADE), always scoped to a workspace.
+
+        Args:
+            document_id: The document to delete.
+            workspace_id: REQUIRED workspace scope (#175, hardened post-#177
+                review). Callers that have already resolved ownership via
+                ``src.api.ownership.resolve_owned_document`` must pass the
+                *resolved* workspace_id here -- it scopes the DELETE's own
+                WHERE clause so a TOCTOU race between the ownership check
+                and this call (e.g. the document somehow changing workspace
+                in between) can never delete a document out from under a
+                workspace that no longer owns it. This was originally
+                optional ("existing internal callers with no workspace
+                context") but an adversarial review of the #177 fix found
+                that shape -- "absent means unscoped" -- is exactly what
+                produced the ``GET /dead-letter`` empty-string bypass one
+                call away; ``grep -rn "delete_document(" src/`` shows
+                exactly one caller (``src/api/app.py``), and it always has
+                a resolved workspace_id available. Mandatory now, with no
+                unscoped fallback to reintroduce.
+        """
+        if not workspace_id or not workspace_id.strip():
+            raise ValueError("delete_document requires a non-blank workspace_id")
+
         if not self.engine:
             raise RuntimeError("Database not connected")
 
         with self.get_session() as session:
             result = session.execute(
                 self.processed_documents.delete().where(
-                    self.processed_documents.c.document_id == document_id
+                    self.processed_documents.c.document_id == document_id,
+                    self.processed_documents.c.workspace_id == workspace_id,
                 )
             )
 
             deleted = bool(result.rowcount > 0)  # type: ignore[return-value]
             if deleted:
-                logger.info("Deleted document (cascade)", document_id=document_id)
+                logger.info(
+                    "Deleted document (cascade)",
+                    document_id=document_id,
+                    workspace_id=workspace_id,
+                )
 
             return deleted
 
@@ -1568,28 +1596,61 @@ class DatabaseService:
 
     async def get_dead_letter_jobs(
         self,
-        workspace_id: str | None = None,
-        status: str = "pending",
+        workspace_id: str,
+        status: str | None = "pending",
         limit: int = 50,
     ) -> list[dict[str, Any]]:
-        """Get dead-letter jobs with optional filters.
+        """Get dead-letter jobs, always scoped to a workspace.
 
         Args:
-            workspace_id: Optional workspace filter
-            status: Filter by status (default 'pending')
-            limit: Maximum results to return
+            workspace_id: REQUIRED workspace scope. This method's only
+                caller is the multi-tenant ``GET /dead-letter`` HTTP route
+                (#177), and a post-fix adversarial review found that an
+                earlier version of this method treated a falsy
+                ``workspace_id`` (``None`` or ``""``) as "no filter" via a
+                bare ``if workspace_id:`` guard -- i.e. it FAILED OPEN,
+                widening the query to every tenant instead of raising. A
+                security-scoping parameter that can be disabled by passing
+                an empty string is not a filter. It is now mandatory and a
+                falsy value RAISES rather than silently broadening scope --
+                this is a deliberately redundant second layer: the route
+                itself already boundary-validates via
+                ``src.api.ownership.require_workspace_id`` before calling
+                this method, but that guard living only in the route would
+                mean the NEXT caller of this method (a script, a future
+                route) could reintroduce the exact same fail-open bug by
+                simply not calling it. The DB layer is where that can't
+                happen twice.
+            status: Optional status filter (``None`` = no status filter --
+                e.g. an operator wanting every dead-letter job in their
+                workspace regardless of status). Unlike ``workspace_id``,
+                "no filter" here is safe: it never crosses a tenant
+                boundary, it only widens which STATUSES are shown WITHIN
+                the workspace the caller already proved it owns. Default
+                ``'pending'``.
+            limit: Maximum results to return.
 
         Returns:
-            List of dead-letter job records
+            List of dead-letter job records, all belonging to workspace_id.
+
+        Raises:
+            ValueError: if ``workspace_id`` is falsy (``None``, ``""``, or
+                whitespace-only).
         """
+        if not workspace_id or not workspace_id.strip():
+            raise ValueError(
+                "get_dead_letter_jobs requires a non-blank workspace_id -- "
+                "listing dead-letter jobs across every workspace is not a "
+                "supported operation of this method (#177)."
+            )
+
         if not self.engine:
             raise RuntimeError("Database not connected")
 
         with self.get_session() as session:
-            query = self.dead_letter_jobs.select()
-
-            if workspace_id:
-                query = query.where(self.dead_letter_jobs.c.workspace_id == workspace_id)
+            query = self.dead_letter_jobs.select().where(
+                self.dead_letter_jobs.c.workspace_id == workspace_id
+            )
 
             if status:
                 query = query.where(self.dead_letter_jobs.c.status == status)
