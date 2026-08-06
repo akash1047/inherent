@@ -1155,7 +1155,7 @@ def _extract_epub_text(content: bytes, filename: str) -> str:
     `META-INF/container.xml` -> `content.opf` -> `<manifest>` (id -> href)
     -> `<spine>` (ordered idrefs).
 
-    Failure paths (never a crash, always an actionable RuntimeError):
+    Failure paths (never a crash, always a non-retryable ApplicationError):
     - Corrupt zip.
     - Missing/unparseable META-INF/container.xml or content.opf.
     - No spine items at all (nothing to determine chapter order from).
@@ -1163,52 +1163,97 @@ def _extract_epub_text(content: bytes, filename: str) -> str:
       META-INF/encryption.xml manifest -- its mere presence means the
       referenced resources cannot be read as plain XHTML, so this is
       checked and rejected BEFORE attempting to parse any chapter.
+
+    All ten failure sites below raise a non-retryable ``ApplicationError``
+    rather than a bare exception (#206, same reasoning already applied to
+    PDF/JSON/XLSX/PPTX/DOCX in this module -- see `_extract_pdf_text`):
+    every one is a pure function of `content`'s bytes, so it fails
+    identically on all of Temporal's default 3 retry attempts. Every except
+    clause here is scoped to a NARROW exception type
+    (`zipfile.BadZipFile`/`KeyError`/`ET.ParseError`), never a broad
+    `except Exception` -- so a `MemoryError` from a pathological zip central
+    directory or an oversized XML part is never caught here and propagates
+    completely unconverted, same discipline `_extract_pdf_text` established
+    for its own construction-only wrap (#195 review follow-up). The chapter
+    loop below is likewise unwrapped, for the same reason PDF's page loop
+    and XLSX's row loop are: a per-chapter failure discovered lazily (e.g.
+    `_extract_html_text` OOMing on one pathological chapter) must stay
+    retryable, not be swept into `non_retryable=True` by a catch-all around
+    the whole loop.
     """
     try:
         zf = zipfile.ZipFile(io.BytesIO(content))
     except zipfile.BadZipFile as e:
-        raise RuntimeError(f"'{filename}' is not a valid EPUB (corrupt zip archive): {e}") from e
+        raise ApplicationError(
+            f"EPUB extraction failed: '{filename}' is not a valid EPUB (corrupt zip archive): {e}",
+            type="EpubCorruptZip",
+            non_retryable=True,
+        ) from e
 
     try:
         names = zf.namelist()
     except zipfile.BadZipFile as e:
-        raise RuntimeError(
-            f"'{filename}' is not a valid EPUB (corrupt zip central directory): {e}"
+        raise ApplicationError(
+            f"EPUB extraction failed: '{filename}' is not a valid EPUB "
+            f"(corrupt zip central directory): {e}",
+            type="EpubCorruptZip",
+            non_retryable=True,
         ) from e
 
     if "META-INF/encryption.xml" in names:
-        raise RuntimeError(
-            f"'{filename}' is a DRM-protected/encrypted EPUB and cannot be extracted."
+        raise ApplicationError(
+            f"EPUB extraction failed: '{filename}' is a DRM-protected/encrypted "
+            f"EPUB and cannot be extracted.",
+            type="EpubDrmProtected",
+            non_retryable=True,
         )
 
     try:
         container_xml = zf.read("META-INF/container.xml")
     except KeyError as e:
-        raise RuntimeError(
-            f"'{filename}' is not a valid EPUB: missing META-INF/container.xml"
+        raise ApplicationError(
+            f"EPUB extraction failed: '{filename}' is not a valid EPUB: "
+            f"missing META-INF/container.xml",
+            type="EpubMissingContainerXml",
+            non_retryable=True,
         ) from e
 
     try:
         container_root = ET.fromstring(container_xml)
     except ET.ParseError as e:
-        raise RuntimeError(f"'{filename}' has an unparseable META-INF/container.xml: {e}") from e
+        raise ApplicationError(
+            f"EPUB extraction failed: '{filename}' has an unparseable META-INF/container.xml: {e}",
+            type="EpubUnparseableContainerXml",
+            non_retryable=True,
+        ) from e
 
     rootfile = container_root.find(f".//{{{_EPUB_CONTAINER_NS}}}rootfile")
     if rootfile is None or "full-path" not in rootfile.attrib:
-        raise RuntimeError(f"'{filename}' is not a valid EPUB: no rootfile declared")
+        raise ApplicationError(
+            f"EPUB extraction failed: '{filename}' is not a valid EPUB: no rootfile declared",
+            type="EpubNoRootfile",
+            non_retryable=True,
+        )
     opf_path = rootfile.attrib["full-path"]
 
     try:
         opf_xml = zf.read(opf_path)
     except KeyError as e:
-        raise RuntimeError(
-            f"'{filename}' is not a valid EPUB: declared content.opf '{opf_path}' is missing"
+        raise ApplicationError(
+            f"EPUB extraction failed: '{filename}' is not a valid EPUB: "
+            f"declared content.opf '{opf_path}' is missing",
+            type="EpubMissingContentOpf",
+            non_retryable=True,
         ) from e
 
     try:
         opf_root = ET.fromstring(opf_xml)
     except ET.ParseError as e:
-        raise RuntimeError(f"'{filename}' has an unparseable content.opf: {e}") from e
+        raise ApplicationError(
+            f"EPUB extraction failed: '{filename}' has an unparseable content.opf: {e}",
+            type="EpubUnparseableContentOpf",
+            non_retryable=True,
+        ) from e
 
     # Manifest: item id -> its attributes (href, media-type, properties).
     # `properties` carries EPUB3's "nav"/"cover-image" markers used below to
@@ -1221,7 +1266,11 @@ def _extract_epub_text(content: bytes, filename: str) -> str:
 
     spine_items = opf_root.findall(".//opf:spine/opf:itemref", _EPUB_OPF_NS)
     if not spine_items:
-        raise RuntimeError(f"'{filename}' has no spine -- cannot determine reading order")
+        raise ApplicationError(
+            f"EPUB extraction failed: '{filename}' has no spine -- cannot determine reading order",
+            type="EpubNoSpine",
+            non_retryable=True,
+        )
 
     # Resolve manifest hrefs relative to content.opf's own directory.
     opf_dir = opf_path.rsplit("/", 1)[0] + "/" if "/" in opf_path else ""
@@ -1284,7 +1333,12 @@ def _extract_epub_text(content: bytes, filename: str) -> str:
         chapters.append((position, f"## {heading}\n\n{chapter_text}"))
 
     if not chapters:
-        raise RuntimeError(f"'{filename}' has a spine but no chapter produced any extractable text")
+        raise ApplicationError(
+            f"EPUB extraction failed: '{filename}' has a spine but no chapter "
+            f"produced any extractable text",
+            type="EpubNoExtractableContent",
+            non_retryable=True,
+        )
 
     # `chapters` is already in spine (reading) order because the loop above
     # walks `spine_items` in order and only ever appends -- no re-sort
@@ -1329,11 +1383,34 @@ def _extract_rtf_text(content: bytes, filename: str) -> str:
     `striprtf.rtf_to_text` already handles arbitrarily nested control-word
     groups correctly (that's the whole point of the library), so no bespoke
     nesting logic is needed here.
+
+    Raises:
+        ApplicationError (non_retryable=True): striprtf is not installed
+            (deterministic per worker/image -- same
+            ``MissingExtractionDependency`` reasoning as every other missing
+            -library case in this module), `rtf_to_text` cannot parse
+            `content` at all, or parsing yields no non-whitespace text. All
+            three are deterministic given fixed `content` bytes (#206, same
+            fix shape as PDF/JSON/XLSX/PPTX/DOCX above) -- a bare
+            `RuntimeError` here was retried 3x by Temporal's default
+            RetryPolicy for an outcome already known at attempt 1.
+
+            The try/except around `rtf_to_text` is scoped to ONLY that call
+            -- matching `_extract_pdf_text`'s construction-only wrap -- and
+            explicitly re-raises `MemoryError` before falling through to the
+            broad `except Exception` (#195 review follow-up): a
+            load-dependent OOM parsing a pathological/deeply-nested RTF must
+            stay retryable, never be reclassified as non-retryable by a
+            catch-all.
     """
     try:
         from striprtf.striprtf import rtf_to_text
     except ImportError as e:
-        raise RuntimeError("striprtf not available for RTF extraction") from e
+        raise ApplicationError(
+            "striprtf not available for RTF extraction",
+            type="MissingExtractionDependency",
+            non_retryable=True,
+        ) from e
 
     # RTF is a control-word format where non-ASCII text is escaped inline
     # (\'hh hex escapes, \uNNNN unicode control words) rather than encoded
@@ -1349,11 +1426,26 @@ def _extract_rtf_text(content: bytes, filename: str) -> str:
         # a str) but gives the function's own `-> str` signature a real
         # guarantee instead of just trusting an untyped third party.
         text = str(rtf_to_text(raw_text))
+    except MemoryError:
+        # Load-dependent, not a property of the bytes -- must stay
+        # retryable (see the docstring above). Never reclassified as
+        # non_retryable.
+        raise
     except Exception as e:
-        raise RuntimeError(f"Failed to parse RTF content in '{filename}': {e}") from e
+        raise ApplicationError(
+            f"RTF extraction failed: could not parse '{filename}' "
+            f"({type(e).__name__}: {e}). The file may be corrupt or not "
+            f"actually RTF despite its declared type.",
+            type="RtfParseFailed",
+            non_retryable=True,
+        ) from e
 
     if not text.strip():
-        raise RuntimeError(f"'{filename}' produced no extractable text from RTF content")
+        raise ApplicationError(
+            f"RTF extraction failed: '{filename}' produced no extractable text from RTF content",
+            type="RtfNoExtractableText",
+            non_retryable=True,
+        )
     return text
 
 
@@ -1438,11 +1530,36 @@ def _extract_odt_text(content: bytes, filename: str) -> str:
     its own function (not sharing code with `_extract_rtf_text` above) so
     ODT's zip/XML handling and RTF's control-word parsing never bleed
     together.
+
+    Raises:
+        ApplicationError (non_retryable=True): the zip cannot be opened or
+            its central directory cannot be read, `content.xml` is missing
+            (also the exact signal for a DOCX payload mislabeled as ODT --
+            DOCX has `word/document.xml`, not `content.xml`, at its root),
+            `content.xml` is unparseable XML, no `office:body/office:text`
+            element exists, or the walk yields no text at all. All six are
+            deterministic given fixed `content` bytes (#206, same fix shape
+            as PDF/JSON/XLSX/PPTX/DOCX/EPUB above) -- a bare `RuntimeError`
+            here was retried 3x by Temporal's default RetryPolicy for an
+            outcome already known at attempt 1.
+
+            Every except clause below is scoped to a NARROW exception type
+            (`zipfile.BadZipFile`/`KeyError`/`ET.ParseError`), never a broad
+            `except Exception` -- so a `MemoryError` (e.g. from a
+            pathological zip central directory) is never caught here and
+            propagates completely unconverted, same discipline
+            `_extract_epub_text` above and `_extract_pdf_text` establish.
+            `_odf_extract_text`'s recursive body walk below is likewise
+            unwrapped, for the same reason.
     """
     try:
         zf = zipfile.ZipFile(io.BytesIO(content))
     except zipfile.BadZipFile as e:
-        raise RuntimeError(f"'{filename}' is not a valid ODT (corrupt zip archive): {e}") from e
+        raise ApplicationError(
+            f"ODT extraction failed: '{filename}' is not a valid ODT (corrupt zip archive): {e}",
+            type="OdtCorruptZip",
+            non_retryable=True,
+        ) from e
 
     try:
         content_xml = zf.read("content.xml")
@@ -1451,25 +1568,37 @@ def _extract_odt_text(content: bytes, filename: str) -> str:
         # actually a different OOXML/ZIP payload (e.g. DOCX)": a real ODT
         # always has content.xml at its root; DOCX has word/document.xml
         # instead, so this KeyError is a real, actionable contradiction.
-        raise RuntimeError(
-            f"'{filename}' is not a valid ODT: no content.xml found in the archive "
-            f"(the file may be a different ZIP-based format, e.g. DOCX, saved with "
-            f"an .odt extension)"
+        raise ApplicationError(
+            f"ODT extraction failed: '{filename}' is not a valid ODT: no "
+            f"content.xml found in the archive (the file may be a different "
+            f"ZIP-based format, e.g. DOCX, saved with an .odt extension)",
+            type="OdtMissingContentXml",
+            non_retryable=True,
         ) from e
     except zipfile.BadZipFile as e:
-        raise RuntimeError(
-            f"'{filename}' is not a valid ODT (corrupt zip central directory): {e}"
+        raise ApplicationError(
+            f"ODT extraction failed: '{filename}' is not a valid ODT "
+            f"(corrupt zip central directory): {e}",
+            type="OdtCorruptZip",
+            non_retryable=True,
         ) from e
 
     try:
         root = ET.fromstring(content_xml)
     except ET.ParseError as e:
-        raise RuntimeError(f"'{filename}' has an unparseable content.xml: {e}") from e
+        raise ApplicationError(
+            f"ODT extraction failed: '{filename}' has an unparseable content.xml: {e}",
+            type="OdtUnparseableContentXml",
+            non_retryable=True,
+        ) from e
 
     body = root.find(f".//{{{_ODF_OFFICE_NS}}}body/{{{_ODF_OFFICE_NS}}}text")
     if body is None:
-        raise RuntimeError(
-            f"'{filename}' is not a valid ODT: no office:body/office:text found in content.xml"
+        raise ApplicationError(
+            f"ODT extraction failed: '{filename}' is not a valid ODT: no "
+            f"office:body/office:text found in content.xml",
+            type="OdtMissingBody",
+            non_retryable=True,
         )
 
     raw = "".join(_odf_extract_text(body))
@@ -1480,7 +1609,11 @@ def _extract_odt_text(content: bytes, filename: str) -> str:
     text = "\n".join(line.strip() for line in raw.splitlines() if line.strip())
 
     if not text:
-        raise RuntimeError(f"'{filename}' produced no extractable text from content.xml")
+        raise ApplicationError(
+            f"ODT extraction failed: '{filename}' produced no extractable text from content.xml",
+            type="OdtNoExtractableContent",
+            non_retryable=True,
+        )
     return text
 
 
@@ -1612,20 +1745,32 @@ def _extract_subtitle_text(content: bytes, filename: str) -> str:
     deliberate middle ground.
 
     Raises:
-        RuntimeError: no cue has a recognizable timestamp line at all (#127
-            failure path) -- distinct from the generic "empty extraction"
-            guard in `_extract_text_inner`: this is specifically "not a
-            valid SRT/WebVTT file", not "a valid one that happened to be
-            blank", so the message points at the actual problem.
+        ApplicationError (non_retryable=True): no cue has a recognizable
+            timestamp line at all (#127 failure path) -- distinct from the
+            generic "empty extraction" guard in `_extract_text_inner`: this
+            is specifically "not a valid SRT/WebVTT file", not "a valid one
+            that happened to be blank", so the message points at the actual
+            problem. Deterministic given fixed `content` bytes (#206, same
+            fix shape as PDF/JSON/XLSX/PPTX/DOCX/EPUB/RTF/ODT above) -- a
+            bare `RuntimeError` here was retried 3x by Temporal's default
+            RetryPolicy for an outcome already known at attempt 1.
+
+            Neither `_decode_text` nor `_parse_subtitle_cues` is wrapped in
+            any try/except in this function, so a `MemoryError` from either
+            (e.g. charset detection scanning a huge mis-encoded file)
+            already propagates completely unconverted.
     """
     text = _decode_text(content)
     cues = _parse_subtitle_cues(text)
 
     if not cues:
-        raise RuntimeError(
-            f"No subtitle cues with valid timestamps found in {filename}. Expected at least "
-            "one 'HH:MM:SS,mmm --> HH:MM:SS,mmm' (SRT) or 'HH:MM:SS.mmm --> HH:MM:SS.mmm' "
-            "(WebVTT) cue."
+        raise ApplicationError(
+            f"Subtitle extraction failed: no subtitle cues with valid timestamps "
+            f"found in {filename}. Expected at least one "
+            "'HH:MM:SS,mmm --> HH:MM:SS,mmm' (SRT) or 'HH:MM:SS.mmm --> HH:MM:SS.mmm' "
+            "(WebVTT) cue.",
+            type="SubtitleNoCuesFound",
+            non_retryable=True,
         )
 
     parts: list[str] = []

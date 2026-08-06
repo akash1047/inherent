@@ -323,9 +323,9 @@ class TestExtractTextActivity:
             "JSON extraction failed: could not parse the document (Expecting value: line 1 column 1 (char 0)).",
         ]
         for message in messages:
-            assert (
-                DocumentIngestionWorkflow._classify_error(message) == "extraction_failed"
-            ), message
+            assert DocumentIngestionWorkflow._classify_error(message) == "extraction_failed", (
+                message
+            )
 
     def test_legacy_xls_content_type_is_unregistered(self):
         """#118: legacy .xls (application/vnd.ms-excel, OLE2 binary format --
@@ -533,7 +533,10 @@ class TestExtractTextActivity:
     @pytest.mark.asyncio
     async def test_extract_text_srt_no_timestamps_raises(self, mock_get_storage, mock_get_staging):
         """#127 failure path: an SRT-labeled file with no cue timestamps at
-        all must fail the document, not silently emit garbage/empty text."""
+        all must fail the document, not silently emit garbage/empty text.
+        #206: deterministic given fixed content bytes -- must be a
+        non-retryable ApplicationError, not a bare RuntimeError Temporal
+        retries 3x for no reason."""
         mock_storage = MagicMock()
         mock_storage.read_file.return_value = b"This is just prose, not a real SRT file.\n"
         mock_get_storage.return_value = mock_storage
@@ -550,8 +553,9 @@ class TestExtractTextActivity:
 
         from src.temporal.activities.extract import extract_text
 
-        with pytest.raises(RuntimeError, match="No subtitle cues"):
+        with pytest.raises(ApplicationError, match="no subtitle cues") as exc_info:
             await extract_text(input_data)
+        assert exc_info.value.non_retryable
         mock_staging.write_text.assert_not_called()
 
     @patch("src.temporal.shared_services.get_storage_service")
@@ -705,11 +709,13 @@ class TestExtractSubtitleText:
 
     def test_no_timestamps_raises(self):
         """#127 failure path: content with no cue timestamps at all is not
-        a valid subtitle file -- fail loudly rather than emit nothing."""
+        a valid subtitle file -- fail loudly rather than emit nothing.
+        #206: non-retryable -- deterministic given fixed content bytes."""
         from src.temporal.activities.extract import _extract_subtitle_text
 
-        with pytest.raises(RuntimeError, match="No subtitle cues"):
+        with pytest.raises(ApplicationError, match="no subtitle cues") as exc_info:
             _extract_subtitle_text(b"just some prose, no cues here", "fake.srt")
+        assert exc_info.value.non_retryable
 
     def test_multiline_cue_text_is_joined(self):
         from src.temporal.activities.extract import _extract_subtitle_text

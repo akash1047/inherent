@@ -387,6 +387,29 @@ All notable changes to Inherent are documented here. The format follows
   correctly. Pattern sweep found the same unwrapped-extractor defect,
   unfixed, in EPUB, RTF, ODT, and SRT/WebVTT extraction — filed separately
   as #206 (out of this issue's scope).
+- **EPUB, RTF, ODT, and SRT/WebVTT extractors retried deterministic
+  (unfixable) failures 3x (#206).** `_extract_epub_text` (10 sites),
+  `_extract_rtf_text` (3), `_extract_odt_text` (6), and
+  `_extract_subtitle_text` (1)
+  (`services/inh-ingestion-svc/src/temporal/activities/extract.py`) raised a
+  bare `RuntimeError` on corrupt/truncated zips, DRM-protected EPUBs,
+  missing/unparseable container.xml/content.opf/content.xml, a missing
+  spine or `office:body`, a missing `striprtf` dependency, an unparseable
+  RTF/EPUB/ODT payload, or no cues with a recognizable timestamp line — all
+  deterministic given the uploaded bytes, so Temporal's default 3-attempt
+  `RetryPolicy` retried an outcome already known at attempt 1. Same fix
+  shape as #195 and the #118/#119 precedent: all 20 sites now raise a
+  non-retryable `ApplicationError` naming the likely cause. Every EPUB/ODT
+  except clause is scoped to a narrow exception type
+  (`zipfile.BadZipFile`/`KeyError`/`ET.ParseError`), so a `MemoryError` from
+  a pathological zip or oversized XML part is never caught and stays
+  retryable; RTF's `rtf_to_text` wrap explicitly re-raises `MemoryError`
+  before its broad `except Exception`, mirroring `_extract_pdf_text`'s
+  construction-only wrap (#195 review follow-up). Pattern sweep of the rest
+  of this file plus both services found one related, unfixed defect (not in
+  this issue's scope): `_extract_docx_text`'s own broad except wraps its
+  paragraph-iteration loop with no `MemoryError` carve-out, unlike the
+  PDF/EPUB/ODT precedent it should be following — filed as #215.
 - **MCP upload labelled every source-code file `text/x-python` when
   `content_type` was omitted (#197).** `_default_upload_content_type`
   (`services/inh-public-api-svc/src/mcp_server/server.py`) took
