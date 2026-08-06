@@ -128,7 +128,7 @@ and binds all datastore ports to `127.0.0.1`.
 
 | Variable | Default | Effect |
 | --- | --- | --- |
-| `CHUNKING_STRATEGY` | `sentences` | `tokens` / `sentences` / `paragraphs`. **#129:** only consulted for a content type with no registry entry — every currently-registered format resolves a `chunking_hint` instead (see below), so this var no longer governs chunking in practice for any of them. Use the per-document `chunking_strategy` override to force one strategy uniformly. |
+| `CHUNKING_STRATEGY` | `sentences` | `tokens` / `sentences` / `paragraphs`. **#129:** only consulted for a content type with no registry entry — every currently-registered format resolves a `chunking_hint` instead (see below), so this var no longer governs chunking in practice for any of them. **No per-document override reaches the upload surface yet** (`DocumentIngestionInput.chunking_strategy` exists at the workflow layer, but neither `POST /v1/documents` nor the MCP `upload_document` tool expose it — tracked in [#198](https://github.com/inherent-prime/inherent/issues/198)); there is currently no way to force one strategy uniformly across formats after this change. |
 | `MAX_CHUNK_SIZE` / `CHUNK_OVERLAP` | `1000` / `200` | Chunk sizing |
 | `EMBEDDING_ENABLED` | `true` | Toggle embedding generation |
 | `EMBEDDING_SERVICE_URL` / `EMBEDDING_DIM` | `http://text-embeddings-inference:80` / `384` | TEI sidecar |
@@ -144,9 +144,11 @@ upload chunks by this precedence, resolved once per document inside the
 hint, `CHUNKING_STRATEGY` is effectively dead for normal uploads; it only
 fires for a content type outside `FILE_TYPE_REGISTRY`:
 
-1. **Per-document override** — a caller-supplied `chunking_strategy` on the
-   upload (`tokens` / `sentences` / `paragraphs`). Wins outright; format-aware
-   dispatch below never runs.
+1. **Per-document override** — `tokens` / `sentences` / `paragraphs` set
+   directly on `DocumentIngestionInput.chunking_strategy`. Wins outright;
+   format-aware dispatch below never runs. Exists at the workflow/activity
+   layer only — **not yet reachable from either upload surface** (REST or
+   MCP; tracked in [#198](https://github.com/inherent-prime/inherent/issues/198)).
 2. **Registry `chunking_hint`** — looked up from the document's content type
    against [`FILE_TYPE_REGISTRY`](file-types.md) (`prose` / `tabular` /
    `structured` / `media`). Maps to one of three shape-aware strategies:

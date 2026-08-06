@@ -7,12 +7,25 @@ Format-aware chunking (#129)
 -----------------------------
 Before this, `_chunk_text_inner` picked sentences/paragraphs/tokens purely
 from config -- the same rule for a one-page memo and a 10,000-row XLSX.
-Measured cost of that (see the #129 issue body): a 10k-row XLSX flattened to
-529,057 chars produced 669 positional token chunks, of which exactly ONE
-carried the header row and exactly ONE carried the "## Sheet:" line; an
-.eml's From/To/Subject/Date block appears once at the top, so any mid-body
-chunk of a longer email carries no sender, no subject, no thread. A fragment
-that cannot be interpreted or cited on its own is the defect this closes.
+Measured cost of that (see the #129 issue body, "tokens" config): a 10k-row
+XLSX flattened to 529,057 chars produced 669 positional token chunks, of
+which exactly ONE carried the header row and exactly ONE carried the
+"## Sheet:" line.
+
+The SHIPPED default is worse, not milder: `CHUNKING_STRATEGY=sentences`
+(settings.py, .env.example) splits on `[.!?]` -- and a flattened XLSX's
+pipe-delimited rows contain NO sentence-ending punctuation at all, so the
+"sentence" splitter never finds a boundary and the entire 10,000-row sheet
+becomes exactly ONE chunk (measured: 510,258 chars, one chunk, for a
+similarly-shaped 10k-row sheet). `embedder.py`'s `_post_embed` calls TEI
+with `truncate=True` (the all-MiniLM-L6-v2 model's 256-token input limit) --
+so ~99.8% of that single chunk is silently discarded before a vector is
+ever computed. This is not a hypothetical worst case; it is what every
+default-configuration deployment does today. Separately: an .eml's
+From/To/Subject/Date block appears once at the top, so any mid-body chunk
+of a longer email carries no sender, no subject, no thread. A fragment that
+cannot be interpreted or cited on its own -- or, worse, is never embedded at
+all -- is the defect this closes.
 
 Resolution precedence (per the #129 issue's proposed contract):
 
@@ -241,12 +254,20 @@ async def _chunk_text_inner(input: ChunkTextInput) -> ChunkTextOutput:
         chunks = _chunk_by_rows(text, document_id, max_size)
         chunking_strategy_used = "rows"
     elif chunking_hint == "structured":
-        chunks = _chunk_by_sections(text, document_id, max_size, overlap)
-        chunking_strategy_used = "sections" if _has_section_markers(text) else "tokens"
+        # Computed once here and passed down (#129 follow-up item 12) so
+        # _chunk_by_sections doesn't re-scan the whole text a second time
+        # just to re-derive the same flag -- up to 5,000,000 chars per the
+        # extraction cost guard.
+        has_section_markers = _has_section_markers(text)
+        chunks = _chunk_by_sections(
+            text, document_id, max_size, overlap, _has_markers=has_section_markers
+        )
+        chunking_strategy_used = "sections" if has_section_markers else "tokens"
     elif chunking_hint == "prose":
-        header_block, _header_end = _detect_header_block(text)
-        chunks = _chunk_prose(text, document_id, max_size, overlap)
-        chunking_strategy_used = "prose_header" if header_block else "sentences"
+        # Same single-scan reasoning as above (#129 follow-up item 12).
+        header = _detect_header_block(text)
+        chunks = _chunk_prose(text, document_id, max_size, overlap, _header=header)
+        chunking_strategy_used = "prose_header" if header[0] else "sentences"
     elif chunking_hint == "media":
         # OCR/placeholder text is short and unstructured -- no header or
         # section shape worth preserving; plain size-based chunking.
@@ -502,17 +523,32 @@ def _chunk_by_paragraphs(text: str, document_id: str, max_size: int) -> list[Chu
 # ---------------------------------------------------------------------------
 
 
-def _bounded_context(text: str) -> str:
-    """Cap injected context (table header, section heading, email header
-    block) so it can never blow the chunk budget by itself -- the
-    adversarial "200 columns" / "huge Cc list" case. Never truncates the
-    ORIGINAL occurrence of this text in the source (that one is a real,
-    untouched slice); only truncates the COPY being re-injected into a
-    later chunk."""
-    if len(text) <= _MAX_INJECTED_CONTEXT_CHARS:
+def _bounded_context(text: str, max_size: int = _MAX_INJECTED_CONTEXT_CHARS) -> str:
+    """Cap injected context (table header, section heading) so it can never
+    blow the chunk budget by itself -- the adversarial "200 columns" case.
+    Never truncates the ORIGINAL occurrence of this text in the source (that
+    one is a real, untouched slice); only truncates the COPY being
+    re-injected into a later chunk.
+
+    `max_size` (#129 follow-up, blocker 2) SCALES the cap down for a small
+    configured chunk budget: the absolute default (`_MAX_INJECTED_CONTEXT_CHARS`,
+    500) is only safe when `max_size` is comfortably bigger than that. A
+    caller with a small `max_size` (a tuned `MAX_CHUNK_SIZE`, or a small
+    embedding token budget via `_token_budget_char_cap`) that still got the
+    absolute 500-char cap could see injected context alone consume the
+    ENTIRE budget, collapsing `_slice_oversized_line`'s per-slice body
+    budget toward zero (measured: a 747-char header against a 393-char
+    `max_size` produced 3,883 one-line chunks from 3,908 source chars).
+    Capping context to at most a THIRD of `max_size` (with a small absolute
+    floor so a truncation marker is still legible) keeps context injection
+    from ever dominating a chunk's budget, at any configured size.
+    """
+    cap = max(20, min(max_size, max_size // 3 if max_size > 60 else max_size))
+    cap = min(cap, _MAX_INJECTED_CONTEXT_CHARS)
+    if len(text) <= cap:
         return text
-    dropped = len(text) - _MAX_INJECTED_CONTEXT_CHARS
-    return text[:_MAX_INJECTED_CONTEXT_CHARS] + f"...[+{dropped} chars]"
+    dropped = len(text) - cap
+    return text[:cap] + f"...[+{dropped} chars]"
 
 
 def _line_entries(text: str) -> list[tuple[str, int, int]]:
@@ -548,12 +584,35 @@ def _slice_oversized_line(
     so the fragment stays self-describing even split apart. Offsets map
     exactly to the real sliced span of `line` in the source -- nothing is
     dropped, the slices concatenate back to `line` byte-for-byte.
+
+    Real forward progress per slice is guaranteed to be at least
+    `max_size // 5` (#129 follow-up blocker 2) regardless of how large the
+    injected context is. `_bounded_context` already scales its own cap with
+    `max_size`, but two independently-scaled pieces (a tabular chunk's sheet
+    heading + header row) can still combine to leave very little of the
+    budget for real content when `max_size` itself is small -- an absolute
+    cap alone let `budget` collapse to 1, turning one oversized row into one
+    chunk PER CHARACTER (measured: a 747-char header against a 393-char
+    `max_size` produced 3,883 one-line chunks from a 3,908-char sheet). This
+    floor is the second, independent guarantee: context is shrunk FURTHER
+    than its own scaled cap, if needed, before ever letting per-slice
+    progress fall below it.
     """
     out: list[ChunkData] = []
-    context_block = f"{_bounded_context(context)}\n\n" if context else ""
+    floor = max(1, max_size // 5)
+    context_block = f"{_bounded_context(context, max_size)}\n\n" if context else ""
+    if max_size - len(context_block) < floor:
+        # Even the already-scaled context still leaves less than the floor
+        # -- shrink it further (context is a nice-to-have; guaranteed
+        # forward progress on the actual data is not negotiable) rather than
+        # let `budget` collapse toward zero.
+        context_cap = max(0, max_size - floor - 2)  # -2 for the "\n\n" separator
+        trimmed = context[:context_cap] if context else ""
+        context_block = f"{trimmed}\n\n" if trimmed else ""
     # Reserve room for the injected context so the FINAL content (context +
-    # slice) still respects max_size, not just the slice alone.
-    budget = max(1, max_size - len(context_block))
+    # slice) still respects max_size, not just the slice alone -- but never
+    # below `floor`.
+    budget = max(floor, max_size - len(context_block))
     idx = first_index
     pos = 0
     while pos < len(line):
@@ -580,6 +639,14 @@ def _slice_oversized_line(
 # sheet boundaries, just a header row", which is exactly CSV's shape.
 _SHEET_HEADING_PREFIX = "## Sheet:"
 
+# extract.py re-emits the sheet heading periodically with this suffix as a
+# cheap, extraction-time insurance marker (see _XLSX_HEADER_REPEAT_ROWS).
+# That suffix is plumbing about the RAW extracted text, not something worth
+# repeating into every chunk's INJECTED copy of the heading (#129 follow-up
+# item 7) -- the line as it actually appears in the source keeps it, only
+# the tracked copy used for later re-injection is normalized.
+_SHEET_HEADING_CONTINUED_SUFFIX = " (continued)"
+
 
 def _chunk_by_rows(text: str, document_id: str, max_size: int) -> list[ChunkData]:
     """Row-based chunking for the ``tabular`` hint (CSV, XLSX) (#129).
@@ -603,6 +670,12 @@ def _chunk_by_rows(text: str, document_id: str, max_size: int) -> list[ChunkData
     is not part of the offset range (see `test_chunk_format_aware.py`'s
     relaxed invariant: the source span is a substring of `content`, not
     equal to it, whenever context was injected).
+
+    Packing reserves room for injected context UP FRONT for any group that
+    will need it (#129 follow-up item 5): without this, content could exceed
+    `max_size` (measured 1,313 chars against a 787 cap) because context was
+    added ON TOP of an already-full group instead of the group being packed
+    smaller to make room for it.
     """
     entries = _line_entries(text)
     chunks: list[ChunkData] = []
@@ -616,7 +689,18 @@ def _chunk_by_rows(text: str, document_id: str, max_size: int) -> list[ChunkData
 
     def context_prefix() -> str:
         parts = [p for p in (sheet_heading, header_row) if p]
-        return "\n".join(_bounded_context(p) for p in parts)
+        return "\n".join(_bounded_context(p, max_size) for p in parts)
+
+    def pack_cap() -> int:
+        # The group currently open only needs the injection reserved for if
+        # it will NOT already contain the context naturally at flush time.
+        # The first group of a sheet (heading, then header_row, both real
+        # content) needs no reservation -- their length is already counted
+        # in group_size by the normal packing loop below.
+        if group_has_context:
+            return max_size
+        ctx = context_prefix()
+        return max(1, max_size - len(ctx) - 2) if ctx else max_size  # -2 for "\n\n"
 
     def flush() -> None:
         nonlocal group, group_size, group_has_context, chunk_index
@@ -649,22 +733,39 @@ def _chunk_by_rows(text: str, document_id: str, max_size: int) -> list[ChunkData
             # the new sheet's group with its own heading (so it never needs
             # the heading injected back into itself).
             flush()
-            sheet_heading = line
+            sheet_heading = (
+                line[: -len(_SHEET_HEADING_CONTINUED_SUFFIX)]
+                if line.endswith(_SHEET_HEADING_CONTINUED_SUFFIX)
+                else line
+            )
             header_row = None
             group.append((line, start, end))
             group_size = len(line)
             group_has_context = True
             continue
 
-        first_header_sighting = header_row is None
-        if first_header_sighting:
-            header_row = line
-
         if len(line) > max_size:
             # Adversarial: a single row (e.g. 200 columns) alone exceeds the
-            # budget. Flush what's pending, slice this row on its own, then
-            # resume accumulating fresh rows after it.
-            flush()
+            # budget.
+            #
+            # Do NOT adopt this oversized row as `header_row` (#129 follow-up
+            # item 6's root cause): the row about to be sliced becoming its
+            # OWN injected "header context" would duplicate its own giant
+            # text into every one of its own slices. A later, normal-sized
+            # row (if any) still becomes header_row for subsequent chunks --
+            # `header_row` is deliberately left untouched here.
+            #
+            # Merge a PENDING context-only group (just the sheet heading, or
+            # heading+header_row, with zero real data rows) into the slices
+            # instead of flushing it as a useless standalone orphan chunk
+            # (#129 follow-up item 6: measured a 56-char zero-data-row
+            # orphan chunk emitted right before the oversized row's slices).
+            context_only_lines = {t for t in (sheet_heading, header_row) if t}
+            is_orphan = bool(group) and all(t in context_only_lines for t, _s, _e in group)
+            if is_orphan:
+                group, group_size, group_has_context = [], 0, False
+            else:
+                flush()
             slices = _slice_oversized_line(
                 line, start, end, document_id, max_size, context_prefix(), chunk_index
             )
@@ -672,8 +773,12 @@ def _chunk_by_rows(text: str, document_id: str, max_size: int) -> list[ChunkData
             chunk_index = slices[-1].chunk_index + 1
             continue
 
+        first_header_sighting = header_row is None
+        if first_header_sighting:
+            header_row = line
+
         line_len = len(line) + 1  # +1 for the join separator
-        if group and group_size + line_len > max_size:
+        if group and group_size + line_len > pack_cap():
             flush()
         group.append((line, start, end))
         group_size += line_len
@@ -700,7 +805,13 @@ def _has_section_markers(text: str) -> bool:
     return any(line.startswith(_SECTION_HEADING_PREFIX) for line, _s, _e in _line_entries(text))
 
 
-def _chunk_by_sections(text: str, document_id: str, max_size: int, overlap: int) -> list[ChunkData]:
+def _chunk_by_sections(
+    text: str,
+    document_id: str,
+    max_size: int,
+    overlap: int,
+    _has_markers: bool | None = None,
+) -> list[ChunkData]:
     """Section-based chunking for the ``structured`` hint (JSON, PPTX) (#129).
 
     Splits at "## " section boundaries (PPTX's per-slide headings); every
@@ -716,8 +827,20 @@ def _chunk_by_sections(text: str, document_id: str, max_size: int, overlap: int)
     section markers; a future extractor change could drop them too), and
     that must degrade gracefully rather than crash or emit one unbounded
     chunk covering the whole document.
+
+    Packing reserves room for injected context up front for a continuation
+    group that will need the heading re-injected at flush time (#129
+    follow-up item 5, same fix as `_chunk_by_rows`'s `pack_cap`).
+
+    `_has_markers`: precomputed `_has_section_markers(text)` result, so the
+    dispatcher in `_chunk_text_inner` (which needs the same flag to label
+    `chunking_strategy`) and this function don't each independently scan the
+    whole text (#129 follow-up item 12 -- up to 5,000,000 chars, per the
+    extraction cost guard). Recomputed internally when omitted (`None`, the
+    default), so this function stays independently callable/testable.
     """
-    if not _has_section_markers(text):
+    has_markers = _has_section_markers(text) if _has_markers is None else _has_markers
+    if not has_markers:
         return _chunk_by_size(text, document_id, max_size, overlap)
 
     entries = _line_entries(text)
@@ -729,6 +852,15 @@ def _chunk_by_sections(text: str, document_id: str, max_size: int, overlap: int)
     group_has_heading = False
     section_heading: str | None = None
 
+    def pack_cap() -> int:
+        # Symmetric with _chunk_by_rows's pack_cap (#129 follow-up item 5):
+        # a continuation group that will need the section heading injected
+        # at flush time must reserve room for it up front, or content can
+        # end up larger than max_size.
+        if group_has_heading or not section_heading:
+            return max_size
+        return max(1, max_size - len(_bounded_context(section_heading, max_size)) - 2)
+
     def flush() -> None:
         nonlocal group, group_size, group_has_heading, chunk_index
         if not group:
@@ -739,7 +871,7 @@ def _chunk_by_sections(text: str, document_id: str, max_size: int, overlap: int)
         content = (
             body
             if (not section_heading or group_has_heading)
-            else f"{_bounded_context(section_heading)}\n\n{body}"
+            else f"{_bounded_context(section_heading, max_size)}\n\n{body}"
         )
         chunks.append(
             ChunkData(
@@ -769,9 +901,21 @@ def _chunk_by_sections(text: str, document_id: str, max_size: int, overlap: int)
 
         if len(line) > max_size:
             # Adversarial: one oversized line within a section (a huge
-            # paragraph or table cell). Flush, slice it on its own carrying
-            # the section heading, then resume.
-            flush()
+            # paragraph or table cell).
+            #
+            # Merge a pending context-only group (just the section heading,
+            # zero real body lines) into the slices instead of flushing it
+            # as a useless standalone orphan chunk (#129 follow-up item 6,
+            # same fix as _chunk_by_rows's oversized-row path).
+            is_orphan = (
+                bool(group)
+                and group_has_heading
+                and all(t == section_heading for t, _s, _e in group)
+            )
+            if is_orphan:
+                group, group_size, group_has_heading = [], 0, False
+            else:
+                flush()
             slices = _slice_oversized_line(
                 line, start, end, document_id, max_size, section_heading or "", chunk_index
             )
@@ -780,7 +924,7 @@ def _chunk_by_sections(text: str, document_id: str, max_size: int, overlap: int)
             continue
 
         line_len = len(line) + 1
-        if group and group_size + line_len > max_size:
+        if group and group_size + line_len > pack_cap():
             flush()
         group.append((line, start, end))
         group_size += line_len
@@ -801,6 +945,26 @@ _HEADER_LINE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9 _-]{0,40}:\s+\S")
 # body content into what it thinks is a header block.
 _MAX_HEADER_BLOCK_LINES = 8
 _MAX_HEADER_BLOCK_SCAN_CHARS = 2000
+# Require at least TWO consecutive "Key: value" lines before treating them
+# as a real header block (#129 follow-up item 8). A single such line is a
+# common, ordinary false-positive shape in genuine prose ("Note: this
+# document is confidential.", a lone "Content-Type: application/json" line
+# before a JSON body) -- one line proves nothing about document structure.
+# Two or more consecutive matches is a much stronger signal: it's what a
+# REAL header block (.eml's 2-5 From/To/Cc/Date/Subject lines) always looks
+# like, and it's what most single-sentence false positives don't have.
+#
+# Residual, ACCEPTED false-positive class (not eliminated by this
+# threshold, cost documented rather than chased further): a genuine
+# multi-line "Key: value"-shaped block that isn't actually a document
+# header -- a short definition list ("Alpha: ...\nBeta: ...\nGamma: ..."),
+# or a 2-line config file ("host: ...\nport: ..."). These are structurally
+# indistinguishable from a real header block by this generic, format-
+# agnostic heuristic; carrying them forward costs a modest, now-BOUNDED
+# increase in chunk count (see the overlap clamp below -- it caps how much
+# worse this can get, it doesn't try to detect intent). No content is ever
+# corrupted by a false positive, only chunk count/cost shifts modestly.
+_MIN_HEADER_BLOCK_LINES = 2
 
 
 def _detect_header_block(text: str) -> tuple[str, int]:
@@ -809,11 +973,12 @@ def _detect_header_block(text: str) -> tuple[str, int]:
     at the top, so a mid-body chunk of a longer email carries none of them).
 
     Returns ``(header_block_text, offset_immediately_after_it)``. Returns
-    ``("", 0)`` when the very first line doesn't match the "Key: value"
-    shape at all -- the overwhelming majority of prose documents (a plain
-    memo opening with an ordinary sentence) -- so `_chunk_prose` below is a
-    complete no-op for them, byte-for-byte identical to the pre-#129
-    sentence chunker.
+    ``("", 0)`` when fewer than `_MIN_HEADER_BLOCK_LINES` consecutive lines
+    match the "Key: value" shape from the very start of the text -- the
+    overwhelming majority of prose documents (a plain memo opening with an
+    ordinary sentence, or a single incidental "Note: ..." line) -- so
+    `_chunk_prose` below is a complete no-op for them, byte-for-byte
+    identical to the pre-#129 sentence chunker.
     """
     window = text[:_MAX_HEADER_BLOCK_SCAN_CHARS]
     matched: list[str] = []
@@ -823,17 +988,49 @@ def _detect_header_block(text: str) -> tuple[str, int]:
         if not stripped:
             break  # blank line ends the header block
         if not _HEADER_LINE_RE.match(stripped):
-            return ("", 0) if not matched else ("\n".join(matched), cursor)
+            break
         matched.append(stripped)
         cursor += len(raw)
         if len(matched) >= _MAX_HEADER_BLOCK_LINES:
             break
-    if not matched:
+    if len(matched) < _MIN_HEADER_BLOCK_LINES:
         return "", 0
     return "\n".join(matched), cursor
 
 
-def _chunk_prose(text: str, document_id: str, max_size: int, overlap: int) -> list[ChunkData]:
+# Per-line (not whole-block) truncation cap for a detected header block
+# (#129 follow-up blocker 1). `_extract_eml_text` emits From/To/Cc/Date/
+# Subject IN THAT ORDER -- truncating the whole joined block from the tail
+# (the old behavior, via the generic `_bounded_context`) drops whichever
+# field sorts LAST first, which is Subject: the field with the most
+# retrieval value. What actually blows up a real header's size is a long
+# recipient list (a big To:/Cc:); capping each line independently keeps
+# every field/key present and only trims the value that's actually
+# oversized.
+_MAX_HEADER_LINE_CHARS = 200
+
+
+def _bound_header_block(header_block: str) -> str:
+    """Cap each line of `header_block` independently -- see the
+    `_MAX_HEADER_LINE_CHARS` comment above for why this replaces a single
+    whole-block truncation."""
+    bounded = []
+    for line in header_block.split("\n"):
+        if len(line) > _MAX_HEADER_LINE_CHARS:
+            dropped = len(line) - _MAX_HEADER_LINE_CHARS
+            bounded.append(line[:_MAX_HEADER_LINE_CHARS] + f"...[+{dropped} chars]")
+        else:
+            bounded.append(line)
+    return "\n".join(bounded)
+
+
+def _chunk_prose(
+    text: str,
+    document_id: str,
+    max_size: int,
+    overlap: int,
+    _header: tuple[str, int] | None = None,
+) -> list[ChunkData]:
     """Sentence chunking for the ``prose`` hint, with header-block
     carry-forward (#129).
 
@@ -847,22 +1044,41 @@ def _chunk_prose(text: str, document_id: str, max_size: int, overlap: int) -> li
     then re-injected into every chunk that doesn't already contain it
     naturally -- so the header stays within the overall max_chunk_size
     budget instead of pushing a full chunk over it.
+
+    `overlap` is CLAMPED to at most half of `effective_max_size` (#129
+    follow-up blocker 1): the caller's `overlap` is calibrated against
+    `max_size`, not against the smaller `effective_max_size` left after
+    reserving room for the header. Left unclamped, the sentence chunker's
+    stride (`effective_max_size - overlap`) can collapse toward zero as the
+    header grows -- measured on a 19KB email with a 400-sentence body at the
+    SHIPPED defaults (max_size 787 / overlap 200): a 20-recipient To: list
+    shrank `effective_max_size` to 268, leaving a stride of 68 (9% of the
+    original 787 budget) and multiplying 32 chunks into 348. Bounding
+    `overlap` to at most half of `effective_max_size` keeps stride at >= 50%
+    of it regardless of how large the header is.
+
+    `_header`: precomputed `_detect_header_block(text)` result, so the
+    dispatcher in `_chunk_text_inner` (which needs the same detection to
+    label `chunking_strategy`) and this function don't each independently
+    scan the text (#129 follow-up item 12). Recomputed internally when
+    omitted (`None`, the default), so this function stays independently
+    callable/testable.
     """
-    header_block, header_end = _detect_header_block(text)
+    header_block, header_end = _detect_header_block(text) if _header is None else _header
     if not header_block:
         return _chunk_by_sentences(text, document_id, max_size, overlap)
 
-    header_block = _bounded_context(header_block)
+    header_block = _bound_header_block(header_block)
     reserved = len(header_block) + 2  # +2 for the "\n\n" separator
     # If the header alone would consume the whole budget (a pathological
-    # tiny max_size, or a header truncated right up to the injected-context
-    # cap), fall back to plain sentence chunking rather than starving the
-    # body down to near-nothing.
+    # tiny max_size, or a very long multi-line header), fall back to plain
+    # sentence chunking rather than starving the body down to near-nothing.
     if reserved >= max_size:
         return _chunk_by_sentences(text, document_id, max_size, overlap)
 
     effective_max_size = max_size - reserved
-    chunks = _chunk_by_sentences(text, document_id, effective_max_size, overlap)
+    effective_overlap = min(overlap, effective_max_size // 2)
+    chunks = _chunk_by_sentences(text, document_id, effective_max_size, effective_overlap)
     for c in chunks:
         if c.start_char >= header_end:
             c.content = f"{header_block}\n\n{c.content}".strip()
