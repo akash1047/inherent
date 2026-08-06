@@ -31,6 +31,8 @@ the build if this table and the registry ever disagree.
 | pdf | `.pdf` | `application/pdf` | rest | prose | — |
 | json | `.json` | `application/json` | rest | structured | — |
 | docx | `.docx` | `application/vnd.openxmlformats-officedocument.wordprocessingml.document` | rest | prose | — |
+| xlsx | `.xlsx` | `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet` | rest | tabular | — |
+| pptx | `.pptx` | `application/vnd.openxmlformats-officedocument.presentationml.presentation` | rest | structured | — |
 | png | `.png` | `image/png` | rest | media | `ocr` |
 
 <!-- END GENERATED FILE TYPES TABLE -->

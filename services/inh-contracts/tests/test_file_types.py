@@ -15,7 +15,6 @@ from inh_contracts.file_types import (
     FILE_TYPE_REGISTRY,
     ContentTypeMismatchError,
     ExtensionMismatchError,
-    FileTypeSpec,
     UnknownContentTypeError,
     all_mime_types,
     check_extension_consistency,
@@ -66,12 +65,24 @@ class TestRegistryShape:
                     f"{spec.key} has no optional_extra but degradation=" f"{spec.degradation!r}"
                 )
 
-    def test_current_eight_formats_present(self):
-        """Pins the eight formats that existed pre-#117 migrated with no
-        loss (acceptance criterion: 'All 8 current formats migrate to
-        registry entries with behavior unchanged')."""
+    def test_current_ten_formats_present(self):
+        """Pins the eight formats that existed pre-#117, plus XLSX (#118) and
+        PPTX (#119), migrated/added with no loss (acceptance criterion: 'All
+        8 current formats migrate to registry entries with behavior
+        unchanged')."""
         keys = {spec.key for spec in FILE_TYPE_REGISTRY}
-        assert keys == {"txt", "markdown", "csv", "html", "json", "pdf", "docx", "png"}
+        assert keys == {
+            "txt",
+            "markdown",
+            "csv",
+            "html",
+            "json",
+            "pdf",
+            "docx",
+            "xlsx",
+            "pptx",
+            "png",
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -98,7 +109,11 @@ class TestLookups:
         assert get_spec_for_extension("md").key == "markdown"
 
     def test_get_spec_for_extension_unknown_returns_none(self):
-        assert get_spec_for_extension(".xlsx") is None
+        """.xls (legacy binary Excel, NOT the same format as .xlsx) must stay
+        unregistered -- #118 explicitly requires legacy .xls to be rejected,
+        never silently mis-parsed as its OOXML successor. (.xlsx itself is
+        now registered as of #118 -- see test_get_spec_for_extension_xlsx.)"""
+        assert get_spec_for_extension(".xls") is None
 
     def test_get_spec_by_key(self):
         assert get_spec_by_key("png").mime_types == ("image/png",)
@@ -107,7 +122,10 @@ class TestLookups:
     def test_all_mime_types_matches_historical_allowed_list(self):
         """Pins byte-for-byte parity (SET *and* ORDER) with the pre-#117
         hand-maintained ALLOWED_MIME_TYPES list in constants.py, so the 400
-        error text's exact wording is unchanged by this migration."""
+        error text's exact wording is unchanged by this migration -- with
+        XLSX (#118) and PPTX (#119) inserted right after docx, keeping the
+        three OOXML siblings adjacent (matches the registry's own ordering:
+        see the FILE_TYPE_REGISTRY comment). png stays last, as before."""
         assert all_mime_types() == [
             "text/plain",
             "text/markdown",
@@ -116,6 +134,8 @@ class TestLookups:
             "application/pdf",
             "application/json",
             "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation",
             "image/png",
         ]
 
@@ -137,6 +157,38 @@ class TestLookups:
         must preserve that."""
         spec = get_spec_for_mime("application/json")
         assert spec.surfaces == frozenset({"rest"})
+
+    def test_get_spec_for_mime_xlsx(self):
+        """#118: XLSX is registered, REST-only (binary), tabular chunking."""
+        spec = get_spec_for_mime(
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+        assert spec is not None
+        assert spec.key == "xlsx"
+        assert spec.surfaces == frozenset({"rest"})
+        assert spec.chunking_hint == "tabular"
+        assert spec.extractor == "xlsx"
+
+    def test_get_spec_for_mime_pptx(self):
+        """#119: PPTX is registered, REST-only (binary). chunking_hint is
+        "structured" -- ChunkingHint has no "sections" member (the issue's
+        proposed name); "structured" is the closest existing value for a
+        format made of discrete addressable units (slides) rather than
+        continuous prose, same rationale as json's "structured" hint."""
+        spec = get_spec_for_mime(
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+        )
+        assert spec is not None
+        assert spec.key == "pptx"
+        assert spec.surfaces == frozenset({"rest"})
+        assert spec.chunking_hint == "structured"
+        assert spec.extractor == "pptx"
+
+    def test_get_spec_for_extension_xlsx(self):
+        assert get_spec_for_extension(".xlsx").key == "xlsx"
+
+    def test_get_spec_for_extension_pptx(self):
+        assert get_spec_for_extension(".pptx").key == "pptx"
 
 
 # ---------------------------------------------------------------------------
@@ -217,56 +269,117 @@ class TestSniffContentType:
             sniff_content_type(b"this text never contains the pdf marker at all", "application/pdf")
 
     # -- BLOCKER 4: shared-magic-prefix formats (the OOXML/ZIP family) must
-    # not mutually reject each other the moment a sibling registers. This is
-    # the load-bearing test #118 (XLSX)/#119 (PPTX)/#130 (ZIP) all rely on:
-    # registering a new spec with the SAME magic as an existing one must
-    # leave the EXISTING one (docx) still valid, not newly broken.
+    # not mutually reject each other. This was proven with a SYNTHETIC xlsx
+    # spec before #118 landed; now that XLSX (#118) and PPTX (#119) are both
+    # REAL registry entries, this exercises the real three-way family --
+    # docx, xlsx, pptx -- with no monkeypatching required. #130 (ZIP) is the
+    # next sibling this same guarantee must hold for.
 
-    def test_shared_magic_family_does_not_mutually_reject(self, monkeypatch):
-        """Simulates #118 landing: register a synthetic 'xlsx' spec with the
-        identical ZIP signature docx already uses, then confirm BOTH a real
-        DOCX-declared-as-DOCX and a real XLSX-declared-as-XLSX still sniff
-        clean -- neither one takes the other down."""
-        import inh_contracts.file_types as ft
-
+    def test_shared_magic_family_does_not_mutually_reject(self):
+        """A real DOCX, a real XLSX, and a real PPTX -- all declaring the
+        identical ZIP local-file-header magic (PK\\x03\\x04) -- each sniff
+        clean as THEMSELVES. Registering the second and third OOXML sibling
+        did not newly break the first (docx), which is the exact regression
+        #117's first attempt (treating shared magic as an automatic reject)
+        would have caused the moment #118 landed."""
         docx_spec = get_spec_by_key("docx")
-        xlsx_spec = FileTypeSpec(
-            key="xlsx",
-            mime_types=("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",),
-            extensions=(".xlsx",),
-            magic=b"PK\x03\x04",  # identical signature -- the whole point
-            surfaces=frozenset({"rest"}),
-            extractor="xlsx",
-            chunking_hint="tabular",
-        )
-        monkeypatch.setattr(ft, "FILE_TYPE_REGISTRY", (*FILE_TYPE_REGISTRY, xlsx_spec))
+        xlsx_spec = get_spec_by_key("xlsx")
+        pptx_spec = get_spec_by_key("pptx")
+        assert docx_spec is not None
+        assert xlsx_spec is not None
+        assert pptx_spec is not None
 
-        docx_result = ft.sniff_content_type(b"PK\x03\x04 real docx bytes", docx_spec.mime_types[0])
+        docx_result = sniff_content_type(b"PK\x03\x04 real docx bytes", docx_spec.mime_types[0])
         assert docx_result.key == "docx"
 
-        xlsx_result = ft.sniff_content_type(b"PK\x03\x04 real xlsx bytes", xlsx_spec.mime_types[0])
+        xlsx_result = sniff_content_type(b"PK\x03\x04 real xlsx bytes", xlsx_spec.mime_types[0])
         assert xlsx_result.key == "xlsx"
 
-    def test_shared_magic_family_still_rejects_a_genuinely_different_binary(self, monkeypatch):
+        pptx_result = sniff_content_type(b"PK\x03\x04 real pptx bytes", pptx_spec.mime_types[0])
+        assert pptx_result.key == "pptx"
+
+    def test_shared_magic_family_still_rejects_a_genuinely_different_binary(self):
         """The overlap tolerance is family-scoped, not "PDF/PNG can now claim
-        to be a docx" -- a real cross-family mismatch is still caught even
-        with the synthetic xlsx sibling present."""
-        import inh_contracts.file_types as ft
+        to be a docx" -- a real cross-family mismatch (PNG bytes) is still
+        caught for each of the three real OOXML siblings."""
+        for spec in (get_spec_by_key("docx"), get_spec_by_key("xlsx"), get_spec_by_key("pptx")):
+            assert spec is not None
+            with pytest.raises(ContentTypeMismatchError):
+                sniff_content_type(b"\x89PNG\r\n\x1a\n fake png bytes", spec.mime_types[0])
 
+    def test_xlsx_bytes_declared_as_docx_pass_the_byte_sniff(self):
+        """The reachable case this guarantee implies: a byte sniff CANNOT
+        distinguish the OOXML siblings from each other (a 4-byte ZIP header
+        is all any of them has to check). Genuine XLSX bytes, declared as
+        DOCX, pass `sniff_content_type` -- it resolves to the DECLARED spec
+        (docx), not the true one. This is NOT a hole: `sniff_content_type`
+        only proves "these bytes are plausibly a ZIP-family OOXML document",
+        never "these bytes are SPECIFICALLY a .docx". Disambiguation for a
+        filename-less/extension-mismatched upload is deferred to the
+        extraction stage, which fails loudly instead of mis-parsing (see
+        inh-ingestion-svc's test_extraction_by_type.py::
+        test_genuine_xlsx_fed_to_docx_extractor_fails_loudly_not_silently)."""
         docx_spec = get_spec_by_key("docx")
-        xlsx_spec = FileTypeSpec(
-            key="xlsx",
-            mime_types=("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",),
-            extensions=(".xlsx",),
-            magic=b"PK\x03\x04",
-            surfaces=frozenset({"rest"}),
-            extractor="xlsx",
-            chunking_hint="tabular",
-        )
-        monkeypatch.setattr(ft, "FILE_TYPE_REGISTRY", (*FILE_TYPE_REGISTRY, xlsx_spec))
+        assert docx_spec is not None
 
-        with pytest.raises(ContentTypeMismatchError):
-            ft.sniff_content_type(b"\x89PNG\r\n\x1a\n fake png bytes", docx_spec.mime_types[0])
+        # Genuine XLSX bytes (same ZIP signature), declared as the DOCX mime.
+        result = sniff_content_type(b"PK\x03\x04 an actual xlsx workbook's bytes", docx_spec.mime_types[0])
+        # Resolves to the DECLARED type -- sniff_content_type's contract is
+        # "do the bytes CONTRADICT the declared type", not "identify the
+        # true type". They don't contradict (same family), so it resolves
+        # docx, silently wrong about the TRUE format.
+        assert result.key == "docx"
+
+    def test_xlsx_named_file_declared_as_docx_is_caught_by_extension_check(self):
+        """The byte sniff alone cannot catch a mislabeled OOXML sibling, but
+        `check_extension_consistency` (the THIRD signal: filename) can, and
+        does, whenever the upload has a recognized, differing extension --
+        the common real-world case (an uploader's filename normally matches
+        its true type even when Content-Type is wrong)."""
+        docx_spec = get_spec_by_key("docx")
+        assert docx_spec is not None
+        with pytest.raises(ExtensionMismatchError) as exc_info:
+            check_extension_consistency("workbook.xlsx", docx_spec)
+        assert "xlsx" in str(exc_info.value)
+        assert "docx" in str(exc_info.value)
+
+    def test_xlsx_bytes_renamed_to_match_the_declared_lie_passes_both_checks(self):
+        """Review follow-up: the extension check above ONLY fires when the
+        filename carries a RECOGNIZED, DIFFERING extension. It does NOT fire
+        when the filename is renamed to MATCH the (false) declared type --
+        genuine XLSX bytes, uploaded as "report.docx" and declared as DOCX,
+        pass BOTH `sniff_content_type` (same ZIP family, no contradiction)
+        AND `check_extension_consistency` (the extension IS ".docx", which
+        DOES match the declared docx spec -- there is nothing for this check
+        to object to). This is the complete, accurate statement of the
+        shared-magic guarantee's limit: renaming to match the lie reaches
+        extraction exactly like the extensionless case
+        test_xlsx_bytes_declared_as_docx_pass_the_byte_sniff already covers --
+        it is not a narrower or rarer case, it is the SAME reachable case
+        under a different, equally realistic filename. All six renamed pairs
+        among {docx, xlsx, pptx} behave identically (only docx<->xlsx is
+        spelled out here; the other four follow the same two-check argument
+        with no format-specific difference in either function)."""
+        docx_spec = get_spec_by_key("docx")
+        assert docx_spec is not None
+
+        # Genuine XLSX bytes, uploaded as "report.docx", declared as docx.
+        sniff_result = sniff_content_type(
+            b"PK\x03\x04 an actual xlsx workbook's bytes", docx_spec.mime_types[0]
+        )
+        assert sniff_result.key == "docx"  # passes -- resolves to the DECLARED type
+
+        check_extension_consistency("report.docx", docx_spec)  # must not raise -- ".docx" IS docx's own extension
+
+        # The mirror case: genuine DOCX bytes, uploaded as "sheet.xlsx",
+        # declared as xlsx -- same two-check pass, same underlying gap.
+        xlsx_spec = get_spec_by_key("xlsx")
+        assert xlsx_spec is not None
+        sniff_result_2 = sniff_content_type(
+            b"PK\x03\x04 an actual docx document's bytes", xlsx_spec.mime_types[0]
+        )
+        assert sniff_result_2.key == "xlsx"
+        check_extension_consistency("sheet.xlsx", xlsx_spec)  # must not raise
 
 
 # ---------------------------------------------------------------------------
