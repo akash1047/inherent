@@ -244,6 +244,48 @@ All notable changes to Inherent are documented here. The format follows
   (default `DEFAULT_RATE_LIMIT`/`RATE_LIMIT_DEFAULT`). No behavior change
   (#151).
 
+### Security
+
+- **⚠️ BREAKING (auth) — MCP now enforces workspace-scoped API key binding,
+  and REST/MCP document lookups no longer leak cross-workspace existence
+  (#138).** REST's `_resolve_workspace` binds a workspace-scoped key to
+  exactly its one workspace; MCP's `_get_workspace_ids` derived access from
+  the user's full owned-workspace set instead, letting a scoped key reach any
+  workspace its owner also owned via an MCP tool call — silently allowed
+  where REST 403'd the identical request. Both surfaces now share one rule
+  (`get_authorized_workspace_ids` in `src/services/auth.py`), which also
+  fails CLOSED if a key's bound workspace is no longer owned by its user
+  (e.g. deleted/transferred after the key was issued) instead of trusting a
+  stale binding. This check is a MONGO-ONLY membership lookup
+  (`DatabaseService.user_owns_workspace_in_mongo`) — deliberately not the
+  broader `get_user_workspace_ids` (which unions Mongo with a Postgres
+  upload-history fallback and would keep granting access via that fallback's
+  stale rows for a workspace transferred away from its original owner); a
+  Mongo failure during this check now raises instead of silently granting or
+  denying, so a scoped key's requests error rather than bypass revocation
+  during a Mongo outage. **Existing MCP callers using a workspace-scoped key
+  may see new errors**: a `workspace_id` argument naming a different (but
+  owner-owned) workspace now returns an `Error: ...` result instead of
+  succeeding, with wording that now matches REST's (`API key is scoped to
+  workspace 'X' and cannot access workspace 'Y'`) instead of a generic "you
+  don't have access". **The reverse also happens**: `upload_document` with no
+  `workspace_id` and a key scoped to one workspace out of several the owner
+  holds previously errored ("multiple workspaces; pass workspace_id") and now
+  succeeds directly into the bound workspace. Every document-scoped MCP tool
+  (`get_document`, `list_chunks`, `explain_lineage`, `delete_document`,
+  `refresh_stale_source`, `get_document_context`) now answers a document that
+  exists in an unauthorized workspace with the SAME undifferentiated
+  `Error: Document 'X' not found` used for a document that doesn't exist at
+  all — closing a cross-workspace existence oracle the previous distinct
+  "you don't have access to document" message created (REST's equivalent
+  routes were never affected: the workspace-scoped DB query already returned
+  `None`, hence `404`, in both cases). `search_documents` / `search_memory` /
+  `get_citations` / `list_documents` responses now state the actual set of
+  workspaces covered (never claim "all workspaces" when a scoped key narrowed
+  to one) and carry a `workspaces_searched` field in their structured JSON
+  payload so a caller can verify coverage programmatically; `list_documents`
+  gains a structured JSON block it did not have before.
+
 ## [0.5.0] — 2026-07-13
 
 Repository-level release tag, continuing from the last published tag

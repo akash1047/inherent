@@ -26,6 +26,7 @@ from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from fastapi import HTTPException
 from httpx import ASGITransport, AsyncClient
 from mcp.types import CallToolRequest, CallToolRequestParams
 
@@ -33,7 +34,12 @@ from src.main import create_app
 from src.mcp_server import server as mcp_server
 from src.models.api_key import APIKeyInfo
 from src.models.document import Document
-from src.services.auth import ResolvedAuth, resolve_workspace_write
+from src.services.auth import (
+    ResolvedAuth,
+    _resolve_workspace,
+    resolve_workspace_read,
+    resolve_workspace_write,
+)
 from src.services.database import get_database
 
 pytestmark = pytest.mark.asyncio
@@ -46,6 +52,19 @@ def _write_key() -> APIKeyInfo:
         key_id="key-1",
         user_id="user-1",
         workspace_id=None,
+        permissions=["read", "search", "write"],  # type: ignore[arg-type]
+        rate_limit=100,
+        expires_at=None,
+        status="active",
+    )
+
+
+def _scoped_key(workspace_id: str) -> APIKeyInfo:
+    """A workspace-scoped key (#138): bound to exactly ``workspace_id``."""
+    return APIKeyInfo(
+        key_id="key-scoped",
+        user_id="user-1",
+        workspace_id=workspace_id,
         permissions=["read", "search", "write"],  # type: ignore[arg-type]
         rate_limit=100,
         expires_at=None,
@@ -308,3 +327,177 @@ class TestRefreshDoubleFailureRecoveryParity:
         # Parity with REST: error surfaced AND the mark retried.
         assert "Error" in result[0].text
         assert db.mark_document_failed.await_count >= 2
+
+
+# ---------------------------------------------------------------------------
+# Workspace scoping: a workspace-scoped key must bind identically on REST and
+# MCP (#138)
+# ---------------------------------------------------------------------------
+
+
+class TestWorkspaceScopeParity:
+    """REST's ``_resolve_workspace`` (src/services/auth.py) binds a
+    workspace-scoped API key (``APIKeyInfo.workspace_id is not None``) to
+    exactly that workspace and 403s a request for any other workspace — even
+    one the owning user also owns (tests/security/test_workspace_isolation.py
+    ::test_workspace_scoped_key_cannot_cross_even_to_an_owned_workspace).
+
+    MCP's ``_get_workspace_ids`` had a SEPARATE implementation of this rule
+    that only checked ``database.get_user_workspace_ids`` — the user's FULL
+    owned set — and never consulted ``key_info.workspace_id`` at all. So a
+    scoped key's MCP calls could reach any workspace its owner owned, while
+    the identical REST request was rejected. This class pins both halves of
+    the contract so the two surfaces cannot drift again: same key, same
+    owned-workspace set, same foreign request, same rejection.
+    """
+
+    async def test_rest_scoped_key_rejects_other_owned_workspace(self):
+        key = _scoped_key("ws-a")
+        mock_db = AsyncMock()
+        # The key's binding (ws-a) is confirmed owned in Mongo; the request
+        # names a DIFFERENT workspace (ws-b), rejected on the header-mismatch
+        # check (#138 blocker-2: scoped-key validation consults ONLY
+        # user_owns_workspace_in_mongo, never get_user_workspace_ids).
+        mock_db.user_owns_workspace_in_mongo = AsyncMock(return_value=True)
+        with patch("src.services.auth.get_database", AsyncMock(return_value=mock_db)):
+            with pytest.raises(HTTPException) as exc_info:
+                await _resolve_workspace(key, "ws-b", required=False)
+        assert exc_info.value.status_code == 403
+        # Pinned so the MCP test below can assert byte-for-byte wording parity
+        # rather than re-deriving the expected string independently.
+        assert exc_info.value.detail == (
+            "API key is scoped to workspace 'ws-a' and cannot access workspace 'ws-b'"
+        )
+
+    async def test_mcp_scoped_key_rejects_other_owned_workspace(self):
+        """MCP twin of the REST test above: identical key and owned set, the
+        same foreign workspace requested through a real tool call — must also
+        be rejected, not silently served, AND with the exact same wording
+        REST uses (#138 fix-1 follow-up: outcome parity alone let the two
+        surfaces tell the caller different things — REST named the key's own
+        binding so it could retry; MCP said only "you don't have access",
+        indistinguishable from "workspace doesn't exist")."""
+        key = _scoped_key("ws-a")
+        db = _mock_db()
+        db.validate_api_key = AsyncMock(return_value=key)
+        # #138 blocker-2: scoped-key validation consults ONLY
+        # user_owns_workspace_in_mongo, never get_user_workspace_ids.
+        db.user_owns_workspace_in_mongo = AsyncMock(return_value=True)
+
+        result = await _call_mcp_tool(
+            "list_documents", {"api_key": "ink_k", "workspace_id": "ws-b"}, db
+        )
+
+        # Byte-for-byte the REST detail above, just "Error: "-prefixed per the
+        # MCP text convention.
+        assert result[0].text == (
+            "Error: API key is scoped to workspace 'ws-a' and cannot access workspace 'ws-b'"
+        )
+        # The foreign workspace must never be queried.
+        db.get_documents.assert_not_awaited()
+
+    async def test_mcp_scoped_key_with_no_workspace_arg_narrows_to_binding(self):
+        """Parity with REST's other half: omitting workspace_id must resolve
+        to exactly the key's bound workspace, never expand to the user's full
+        owned set (REST's _resolve_workspace never expands a scoped key's
+        access either)."""
+        key = _scoped_key("ws-a")
+        db = _mock_db()
+        db.validate_api_key = AsyncMock(return_value=key)
+        # #138 blocker-2: scoped-key validation consults ONLY
+        # user_owns_workspace_in_mongo, never get_user_workspace_ids.
+        db.user_owns_workspace_in_mongo = AsyncMock(return_value=True)
+        db.get_documents_multi_workspace = AsyncMock(return_value=([], 0))
+
+        await _call_mcp_tool("list_documents", {"api_key": "ink_k"}, db)
+
+        # Only the key's bound workspace was queried — ws-b was never touched.
+        db.get_documents_multi_workspace.assert_awaited_once_with(["ws-a"], 1, 20)
+
+
+# ---------------------------------------------------------------------------
+# Not-found vs permission-denied: REST's undifferentiated 404 must hold on
+# MCP too (#138 blocker-1)
+# ---------------------------------------------------------------------------
+
+
+class TestDocumentNotFoundVsPermissionDeniedParity:
+    """REST's ``GET /v1/documents/{id}`` (src/api/v1/documents.py) answers a
+    MISSING document and a document that EXISTS but is in a workspace the
+    caller isn't authorised for with the exact same ``404 "Document not
+    found"`` — the workspace-scoped DB query returns ``None`` in both cases,
+    so the two are structurally indistinguishable by construction. MCP's
+    ``get_document`` used to leak the difference via a separate "you don't
+    have access to document" message, which is a cross-workspace EXISTENCE
+    ORACLE: a scoped key could learn exactly which document ids exist in a
+    workspace it cannot read. This class pins that BOTH surfaces now treat
+    the two cases identically, and that a scoped key's genuinely-missing vs
+    genuinely-foreign requests are indistinguishable on each surface.
+    """
+
+    async def test_rest_missing_and_foreign_document_both_404_identically(self):
+        key = _scoped_key("ws-a")
+        foreign_doc = _document("doc-x")  # lives in WS ("ws-1"), not "ws-a"
+
+        async def _get_document(document_id: str, workspace_id: str):
+            # Simulates the real workspace-scoped query: only matches when
+            # queried with the document's OWN workspace.
+            return foreign_doc if workspace_id == foreign_doc.workspace_id else None
+
+        db = _mock_db()
+        db.get_document = AsyncMock(side_effect=_get_document)
+
+        application = create_app()
+        application.dependency_overrides[get_database] = lambda: db
+        application.dependency_overrides[resolve_workspace_read] = lambda: ResolvedAuth(
+            key_info=key, workspace_id="ws-a"
+        )
+        try:
+            transport = ASGITransport(app=application)
+            async with AsyncClient(transport=transport, base_url="http://test") as ac:
+                foreign_response = await ac.get(
+                    "/v1/documents/doc-x", headers={"X-API-Key": "ink_test_key"}
+                )
+                missing_response = await ac.get(
+                    "/v1/documents/doc-does-not-exist", headers={"X-API-Key": "ink_test_key"}
+                )
+        finally:
+            application.dependency_overrides.clear()
+
+        assert foreign_response.status_code == missing_response.status_code == 404
+        assert (
+            foreign_response.json()["detail"]
+            == missing_response.json()["detail"]
+            == "Document not found"
+        )
+
+    async def test_mcp_missing_and_foreign_document_both_not_found_identically(self):
+        """MCP twin: a scoped key's get_document for a document in a
+        different owned workspace, and for an id that does not exist at all,
+        must produce byte-for-byte the same error text (#138 blocker-1)."""
+        key = _scoped_key("ws-a")
+        foreign_doc = _document("doc-x")  # lives in WS ("ws-1"), not "ws-a"
+
+        db = _mock_db()
+        db.validate_api_key = AsyncMock(return_value=key)
+        # #138 blocker-2: scoped-key validation consults ONLY
+        # user_owns_workspace_in_mongo, never get_user_workspace_ids. The
+        # binding (ws-a) is owned; the document lives in WS ("ws-1") — a
+        # DIFFERENT workspace — so it's rejected on the mismatch regardless.
+        db.user_owns_workspace_in_mongo = AsyncMock(return_value=True)
+        db.get_document_by_id = AsyncMock(return_value=foreign_doc)
+        foreign_result = await _call_mcp_tool(
+            "get_document", {"api_key": "ink_k", "document_id": "doc-x"}, db
+        )
+
+        db.get_document_by_id = AsyncMock(return_value=None)
+        missing_result = await _call_mcp_tool(
+            "get_document", {"api_key": "ink_k", "document_id": "doc-does-not-exist"}, db
+        )
+
+        # Both name their OWN requested id (so the messages differ only in
+        # the id echoed back, never in whether the caller is told "you don't
+        # have access" vs "not found") — substitute doc-x for the missing
+        # one's id and the strings must match exactly.
+        assert foreign_result[0].text == "Error: Document 'doc-x' not found"
+        assert missing_result[0].text == "Error: Document 'doc-does-not-exist' not found"
