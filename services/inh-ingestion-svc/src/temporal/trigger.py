@@ -93,8 +93,34 @@ class TemporalWorkflowTrigger:
             return "fetch_failed"
         return "unknown"
 
-    @staticmethod
-    def _build_source_memo(upload_message: DocumentUploadMessage) -> dict[str, str]:
+    # Defensive cap on each memo value (#141 adversarial pass). source /
+    # connection_id / sync_id are unbounded strings on the wire (no max_length
+    # on the contract) but Temporal enforces a server-side blob size limit on
+    # memo. A oversized value would be rejected by start_workflow with a
+    # non-ValidationError exception, which trigger_workflow_async does NOT
+    # classify as poison (only PydanticValidationError is dead-lettered, see
+    # #6) -- so an unbounded memo value would redeliver forever, never
+    # succeeding and never getting dead-lettered. IDs/source labels are never
+    # legitimately long, so truncating is safe and keeps the memo purely a
+    # best-effort UI annotation (workflow input itself is untouched).
+    _MEMO_VALUE_MAX_LEN = 256
+
+    @classmethod
+    def _truncate_memo_value(cls, value: str) -> str:
+        """Cap a memo value's length so it can never trip Temporal's blob size
+        limit on its own (#141). Truncation is logged since it means the
+        upstream producer is sending unexpectedly large source-labeling data."""
+        if len(value) <= cls._MEMO_VALUE_MAX_LEN:
+            return value
+        logger.warning(
+            "Truncating oversized Temporal memo value",
+            original_length=len(value),
+            max_length=cls._MEMO_VALUE_MAX_LEN,
+        )
+        return value[: cls._MEMO_VALUE_MAX_LEN]
+
+    @classmethod
+    def _build_source_memo(cls, upload_message: DocumentUploadMessage) -> dict[str, str]:
         """Build the Temporal memo describing where an ingestion came from (#187).
 
         Memo needs no namespace search-attribute registration and renders
@@ -104,13 +130,17 @@ class TemporalWorkflowTrigger:
         Backward compatible: messages produced before the ``source`` field
         existed have it as None, which maps to "unknown" rather than crashing
         the consumer. ``connection_id``/``sync_id`` are omitted entirely when
-        absent (only set for connector-sourced uploads).
+        absent (only set for connector-sourced uploads). Every value is
+        length-capped (see ``_truncate_memo_value``) so a malformed/oversized
+        upstream field can't make the workflow start itself fail (#141).
         """
-        memo: dict[str, str] = {"source": upload_message.source or "unknown"}
+        memo: dict[str, str] = {
+            "source": cls._truncate_memo_value(upload_message.source or "unknown")
+        }
         if upload_message.connection_id:
-            memo["connection_id"] = upload_message.connection_id
+            memo["connection_id"] = cls._truncate_memo_value(upload_message.connection_id)
         if upload_message.sync_id:
-            memo["sync_id"] = upload_message.sync_id
+            memo["sync_id"] = cls._truncate_memo_value(upload_message.sync_id)
         return memo
 
     async def _record_dead_letter(

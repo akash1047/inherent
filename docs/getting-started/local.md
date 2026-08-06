@@ -346,6 +346,14 @@ Or list namespaces via the Temporal UI REST API:
 curl -s http://localhost:18233/api/v1/namespaces | jq .
 ```
 
+Each `DocumentIngestionWorkflow` execution carries a `source` memo
+(`connector:<provider>` | `public-api` | `manual`, or `unknown` for messages
+produced before the field existed) plus `connection_id`/`sync_id` when the
+document came from a connector sync. It shows in the workflow summary panel —
+no namespace search-attribute registration needed — so you can tell a
+connector sync apart from a manual/dashboard upload without opening the
+workflow input.
+
 ### Weaviate — vector store not indexing
 
 Check Weaviate readiness:

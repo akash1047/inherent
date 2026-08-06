@@ -8,6 +8,17 @@ import src.temporal.trigger as trigger_mod
 from src.models.document import DocumentUploadMessage
 from src.temporal.trigger import TemporalWorkflowTrigger, get_workflow_trigger
 
+
+# Override the package-level DB-dependent autouse fixture (tests/conftest.py)
+# with a no-op. This module's tests are pure/mocked (no real DatabaseService
+# interaction), so they must not skip when PostgreSQL is unavailable -- same
+# pattern as tests/test_contracts.py and tests/test_temporal_activities.py.
+@pytest.fixture(autouse=True)
+def cleanup_test_data():
+    """No-op override so this module's tests run without a live database."""
+    yield
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -280,6 +291,33 @@ class TestBuildSourceMemo:
         memo = TemporalWorkflowTrigger._build_source_memo(upload_message)
 
         assert memo == {"source": "unknown"}
+
+    def test_oversized_source_is_truncated_not_passed_through(self):
+        """A pathologically large `source` (no max_length on the wire contract,
+        see inh_contracts.events.DocumentUploadMessage) must not reach Temporal
+        unbounded -- start_workflow would reject an oversized memo, and that
+        rejection is NOT classified as poison by trigger_workflow_async (only
+        PydanticValidationError is), so it would redeliver forever (#141
+        adversarial pass). Truncating client-side avoids that failure mode."""
+        huge_source = "connector:" + ("x" * 10_000)
+        upload_message = _make_upload_message(source=huge_source)
+
+        memo = TemporalWorkflowTrigger._build_source_memo(upload_message)
+
+        assert len(memo["source"]) == TemporalWorkflowTrigger._MEMO_VALUE_MAX_LEN
+        assert memo["source"] == huge_source[: TemporalWorkflowTrigger._MEMO_VALUE_MAX_LEN]
+
+    def test_oversized_connector_ids_are_truncated(self):
+        upload_message = _make_upload_message(
+            source="connector:notion",
+            connection_id="c" * 5_000,
+            sync_id="s" * 5_000,
+        )
+
+        memo = TemporalWorkflowTrigger._build_source_memo(upload_message)
+
+        assert len(memo["connection_id"]) == TemporalWorkflowTrigger._MEMO_VALUE_MAX_LEN
+        assert len(memo["sync_id"]) == TemporalWorkflowTrigger._MEMO_VALUE_MAX_LEN
 
 
 class TestTriggerWorkflowAsyncMemoIntegration:
