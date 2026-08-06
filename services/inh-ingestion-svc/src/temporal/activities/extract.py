@@ -25,6 +25,7 @@ TestFileTypeRegistryDispatch``), never a silent lossy decode:
 import datetime
 import email
 import io
+import re
 import zipfile
 from collections.abc import Callable
 from email import policy
@@ -33,7 +34,7 @@ from xml.etree import ElementTree as ET
 
 import charset_normalizer
 import structlog
-from inh_contracts.file_types import all_mime_types, get_spec_for_mime
+from inh_contracts.file_types import all_mime_types, get_spec_for_upload
 from temporalio import activity
 from temporalio.exceptions import ApplicationError
 
@@ -121,8 +122,11 @@ async def _extract_text_inner(input: ExtractTextInput) -> ExtractTextOutput:
     # RuntimeError for either "no registry entry" or "registry entry with no
     # wired extractor"; there is deliberately no catch-all decode-as-text
     # fallback anymore -- an unrecognized type must fail the document, never
-    # silently produce garbled chunks.
-    extractor = _resolve_extractor(content_type)
+    # silently produce garbled chunks. `original_filename` is passed through
+    # so a generic/absent content type (e.g. "application/octet-stream")
+    # persisted by the #122 upload-time extension fallback resolves the same
+    # way here that it did at intake -- see `_resolve_extractor`.
+    extractor = _resolve_extractor(content_type, input.original_filename)
     text = extractor(content, input.original_filename)
 
     # Run data quality checks on extracted text
@@ -238,10 +242,17 @@ EXTRACTORS: dict[str, Callable[[bytes, str], str]] = {
     "epub": lambda content, filename: _extract_epub_text(content, filename),
     "rtf": lambda content, filename: _extract_rtf_text(content, filename),
     "odt": lambda content, filename: _extract_odt_text(content, filename),
+    # #121: XML shares HTML's tag-stripping path -- see `_extract_xml_text`
+    # for why `html.parser` (not an XML/DTD-aware parser) is the deliberate,
+    # XXE-safe choice.
+    "xml": lambda content, filename: _extract_xml_text(content),
+    # #127: SRT and WebVTT share one cue parser (see `_extract_subtitle_text`).
+    "srt": lambda content, filename: _extract_subtitle_text(content, filename),
+    "vtt": lambda content, filename: _extract_subtitle_text(content, filename),
 }
 
 
-def _resolve_extractor(content_type: str) -> Callable[[bytes, str], str]:
+def _resolve_extractor(content_type: str, filename: str = "") -> Callable[[bytes, str], str]:
     """Resolve the extractor function for `content_type`, or fail loudly.
 
     Two distinct, explicit failure modes -- both DETERMINISTIC (the same
@@ -257,14 +268,22 @@ def _resolve_extractor(content_type: str) -> Callable[[bytes, str], str]:
     policy.
 
     1. No FILE_TYPE_REGISTRY entry for this content type at all -- an
-       unsupported or unrecognized upload reaching extraction.
+       unsupported or unrecognized upload reaching extraction. `filename` is
+       consulted as a fallback for a generic/absent content type (e.g.
+       "application/octet-stream") via ``get_spec_for_upload`` (#122) -- the
+       SAME resolution `inh-public-api-svc`'s intake validation already
+       applied, so a document accepted at upload through that fallback does
+       not permanently fail here for the same reason it would have been
+       rejected there. Defaults to "" (no fallback) so every pre-#122 call
+       site -- including this module's own non-generic content types --
+       behaves exactly as before.
     2. A registry entry exists but its ``extractor`` key has no function
        wired into EXTRACTORS -- a wiring bug (a sibling format issue added a
        FileTypeSpec without its extractor), not a bad upload, but it must
        still fail the document with an actionable message instead of a bare
        KeyError crashing the Temporal worker.
     """
-    spec = get_spec_for_mime(content_type)
+    spec = get_spec_for_upload(content_type, filename)
     if spec is None:
         raise ApplicationError(
             f"No extractor registered for content type '{content_type}'. "
@@ -797,9 +816,7 @@ def _extract_pptx_text(content: bytes) -> str:
                 if shape == slide.shapes.title:
                     continue
                 for paragraph in shape.text_frame.paragraphs:
-                    paragraph_text = _pptx_bounded_text(
-                        "".join(run.text for run in paragraph.runs)
-                    )
+                    paragraph_text = _pptx_bounded_text("".join(run.text for run in paragraph.runs))
                     if paragraph_text.strip():
                         slide_lines.append(paragraph_text)
                         total_chars += len(paragraph_text)
@@ -1376,3 +1393,155 @@ def _extract_odt_text(content: bytes, filename: str) -> str:
     if not text:
         raise RuntimeError(f"'{filename}' produced no extractable text from content.xml")
     return text
+
+
+def _extract_xml_text(content: bytes) -> str:
+    """Extract text from XML content (#121) by reusing HTML's tag-stripping
+    path verbatim, on the same stdlib `html.parser` BeautifulSoup backend.
+
+    Deliberate parser choice, not an oversight: `html.parser` never resolves
+    DTDs or external entities at all, so it carries no XXE / billion-laughs
+    entity-expansion attack surface on untrusted uploaded content -- unlike
+    a naive `xml.etree.ElementTree.parse` or an `lxml`-backed parser with
+    entity resolution enabled. The trade-off is that it is not a strict,
+    validating XML parser: malformed XML degrades to best-effort text
+    extraction instead of raising, matching YAML/TOML's own "no parse step,
+    still searchable" policy (`text_passthrough`) rather than hard-failing
+    on a syntax error a human config author made. Attribute VALUES are
+    dropped along with their tags -- only element text content survives
+    `get_text()`, identical to HTML's existing behavior.
+
+    bs4 warns (``XMLParsedAsHTMLWarning``) when it detects an ``<?xml ...?>``
+    declaration being parsed by the HTML backend -- expected and harmless
+    given the deliberate choice above, so warnings are suppressed for this
+    call rather than left to print on every XML upload. Filtered by
+    `simplefilter` (not importing the specific warning class) so this stays
+    symmetric with `_extract_html_text`'s own defensive ``ImportError``
+    handling -- bs4 IS a core dependency of this service today, but this
+    function should degrade the same way that one does, not gain a harder
+    unconditional import of its own.
+    """
+    import warnings
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        return _extract_html_text(content)
+
+
+# ---------------------------------------------------------------------------
+# #127: SRT / WebVTT subtitle transcript extraction
+# ---------------------------------------------------------------------------
+
+# Matches an SRT ("HH:MM:SS,mmm --> HH:MM:SS,mmm") or WebVTT
+# ("HH:MM:SS.mmm --> HH:MM:SS.mmm") cue timestamp line. `search`ed against
+# each line rather than `match`ed at position 0 so WebVTT's optional cue
+# SETTINGS after the second timestamp (e.g. "align:start position:10%")
+# don't need special-casing -- they simply trail the match untouched.
+_TIMESTAMP_LINE_RE = re.compile(
+    r"(\d{2}:\d{2}:\d{2}[.,]\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2}[.,]\d{3})"
+)
+
+# A citation marker is re-inserted every Nth cue instead of every cue (which
+# would pollute embeddings with a numeric timestamp token per line -- exactly
+# the noise stripping cue numbers/timestamps was meant to remove) or never
+# (which would make a transcript un-citable -- the whole reason a transcript
+# beats a plain summary for an agent). 10 is a citable-but-not-noisy middle
+# ground: roughly one marker per 20-60s of realistic dialogue-paced cues,
+# close enough for an agent to locate a moment without scrubbing the entire
+# file.
+_TIMESTAMP_MARKER_EVERY_N_CUES = 10
+
+
+def _timestamp_to_marker(timestamp: str) -> str:
+    """Convert an 'HH:MM:SS[.,]mmm' cue timestamp to a coarse '[t=MM:SS]'
+    citation marker (#127's exact proposed format).
+
+    Hours fold into minutes (a 90-minute cue becomes "90:00", not
+    "01:30:00") rather than adding a third conditional format -- #127 asks
+    specifically for MM:SS, and a >99-minute source is an edge case this
+    folding handles correctly without extra branching.
+    """
+    hours, minutes, seconds = timestamp.replace(",", ".").split(":")
+    whole_seconds = seconds.split(".", 1)[0]
+    total_minutes = int(hours) * 60 + int(minutes)
+    return f"[t={total_minutes:02d}:{int(whole_seconds):02d}]"
+
+
+def _parse_subtitle_cues(text: str) -> list[tuple[str, str]]:
+    """Parse decoded SRT or WebVTT text into ``(start_timestamp, cue_text)``
+    pairs, one function for both formats.
+
+    Both share the same cue shape closely enough that one parser handles
+    both: a block of lines separated by a blank line, one of which is a
+    timestamp line (``_TIMESTAMP_LINE_RE`` accepts SRT's comma or WebVTT's
+    dot decimal separator), optionally preceded by a cue number (SRT) or
+    identifier (WebVTT), followed by one or more lines of cue text. A block
+    with NO timestamp line -- WebVTT's ``WEBVTT`` header, a ``NOTE`` comment
+    block, or any other non-cue content -- is simply not a cue and is
+    skipped, no special-casing needed for either format's extra bookkeeping.
+    """
+    # Mixed line endings (bare \r, \r\n, \n in the same file -- real-world
+    # subtitle files exported by different tools routinely mix these) must
+    # not fragment a single cue's text across a phantom blank-line split, so
+    # normalize once up front before splitting into blocks.
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+
+    cues: list[tuple[str, str]] = []
+    for block in re.split(r"\n\s*\n", normalized):
+        lines = [line for line in block.splitlines() if line.strip()]
+
+        timestamp_line_index = None
+        match = None
+        for index, line in enumerate(lines):
+            candidate = _TIMESTAMP_LINE_RE.search(line)
+            if candidate is not None:
+                timestamp_line_index, match = index, candidate
+                break
+        if match is None:
+            continue  # header / NOTE / cue-number-only / non-cue block
+
+        cue_text = " ".join(lines[timestamp_line_index + 1 :]).strip()
+        if cue_text:
+            cues.append((match.group(1), cue_text))
+
+    return cues
+
+
+def _extract_subtitle_text(content: bytes, filename: str) -> str:
+    """Extract prose from an SRT or WebVTT transcript (#127).
+
+    Cue numbers and per-cue timestamp lines are stripped entirely -- pure
+    retrieval noise, e.g. a ``00:00:04,500 --> 00:00:08,000`` line embeds as
+    meaningless numeric tokens -- but a coarse ``[t=MM:SS]`` marker is
+    reinserted every `_TIMESTAMP_MARKER_EVERY_N_CUES` cues (see that
+    constant's comment) so an agent reading the extracted text can still
+    cite roughly WHEN something was said. Timestamps are what makes a
+    transcript citable evidence rather than an anonymous paraphrase; losing
+    them entirely would make the extraction less useful to the end user
+    (an AI agent) than the raw file, and keeping every single one would
+    bury the actual spoken content in numeric noise -- this is the
+    deliberate middle ground.
+
+    Raises:
+        RuntimeError: no cue has a recognizable timestamp line at all (#127
+            failure path) -- distinct from the generic "empty extraction"
+            guard in `_extract_text_inner`: this is specifically "not a
+            valid SRT/WebVTT file", not "a valid one that happened to be
+            blank", so the message points at the actual problem.
+    """
+    text = _decode_text(content)
+    cues = _parse_subtitle_cues(text)
+
+    if not cues:
+        raise RuntimeError(
+            f"No subtitle cues with valid timestamps found in {filename}. Expected at least "
+            "one 'HH:MM:SS,mmm --> HH:MM:SS,mmm' (SRT) or 'HH:MM:SS.mmm --> HH:MM:SS.mmm' "
+            "(WebVTT) cue."
+        )
+
+    parts: list[str] = []
+    for index, (start_timestamp, cue_text) in enumerate(cues):
+        if index % _TIMESTAMP_MARKER_EVERY_N_CUES == 0:
+            parts.append(_timestamp_to_marker(start_timestamp))
+        parts.append(cue_text)
+    return " ".join(parts)

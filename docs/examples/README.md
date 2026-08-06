@@ -125,18 +125,24 @@ Allowed MIME types: `text/plain`, `text/markdown`, `text/csv`, `text/html`,
 `application/vnd.openxmlformats-officedocument.wordprocessingml.document` (DOCX),
 `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet` (XLSX),
 `application/vnd.openxmlformats-officedocument.presentationml.presentation` (PPTX),
-`image/png` (OCR) — see the full [supported file types](../reference/file-types.md)
-`application/vnd.openxmlformats-officedocument.wordprocessingml.document`,
 `image/png` (OCR), `message/rfc822` (EML), `application/epub+zip` (EPUB),
 `application/rtf` / `text/rtf` (RTF), `application/vnd.oasis.opendocument.text`
-(ODT) — see the full [supported file types](../reference/file-types.md)
-reference for extensions, chunking strategy, and optional-dependency notes.
+(ODT), `application/yaml`/`text/yaml`, `application/toml`,
+`application/xml`/`text/xml`, source code (`text/x-python` and other
+language-specific aliases — see the extension allowlist below),
+`application/x-subrip` (SRT), `text/vtt` (WebVTT) — see the full
+[supported file types](../reference/file-types.md) reference for extensions,
+chunking strategy, and optional-dependency notes.
 Max size: 50 MB. Binary formats are magic-byte sniffed against the declared
 `Content-Type` at upload; a mismatch (e.g. PNG bytes declared `text/plain`)
 is rejected with `400 Bad Request`. Legacy `application/msword` (.doc) and
 Outlook `application/vnd.ms-outlook` (.msg) are explicitly rejected with a
 `400` naming the supported replacement (.docx / .eml) rather than accepted
-and garbled.
+and garbled. A generic or absent `Content-Type` (`application/octet-stream`)
+falls back to the filename's extension when that extension is registered
+(e.g. uploading `main.py` with no declared type) — see
+[supported file types](../reference/file-types.md) for the full extension
+list this fallback consults.
 
 ### Upload plain text
 
@@ -287,10 +293,14 @@ curl -s -X POST "$API_BASE/v1/documents" \
   "type": "https://api.inherent.systems/errors/bad-request",
   "title": "Bad Request",
   "status": 400,
-  "detail": "Unsupported file type 'application/octet-stream'. Allowed types: text/plain, text/markdown, text/csv, text/html, application/pdf, application/json, application/vnd.openxmlformats-officedocument.wordprocessingml.document, application/vnd.openxmlformats-officedocument.spreadsheetml.sheet, application/vnd.openxmlformats-officedocument.presentationml.presentation, image/png"
-  "detail": "Unsupported file type 'application/octet-stream'. Allowed types: text/plain, text/markdown, text/csv, text/html, application/pdf, application/json, application/vnd.openxmlformats-officedocument.wordprocessingml.document, image/png, message/rfc822, application/epub+zip, application/rtf, text/rtf, application/vnd.oasis.opendocument.text"
+  "detail": "Unsupported file type 'application/octet-stream'. Allowed types: text/plain, text/markdown, text/csv, text/html, application/pdf, application/json, application/vnd.openxmlformats-officedocument.wordprocessingml.document, application/vnd.openxmlformats-officedocument.spreadsheetml.sheet, application/vnd.openxmlformats-officedocument.presentationml.presentation, image/png, message/rfc822, application/epub+zip, application/rtf, text/rtf, application/vnd.oasis.opendocument.text, application/yaml, text/yaml, application/toml, application/xml, text/xml, text/x-python, application/javascript, text/javascript, application/typescript, text/x-go, text/x-java-source, text/x-rustsrc, text/x-csrc, text/x-chdr, text/x-c++src, text/x-csharp, text/x-ruby, text/x-php, text/x-swift, text/x-kotlin, text/x-scala, application/x-sh, text/x-sh, application/sql, text/x-sql, text/x-r-source, text/x-lua, application/x-subrip, text/vtt"
 }
 ```
+
+Note: `application/octet-stream` above is what a missing `Content-Type` header
+resolves to by default; the 400 in this example comes from `/etc/hosts`
+having no filename extension the registry recognizes, so the fallback
+described above has nothing to consult either.
 
 **Mislabeled file — bytes don't match the declared type (400, #117):**
 
@@ -1077,6 +1087,11 @@ depend on it.
 | `sample.xlsx` | `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet` | `docs/examples/sample-documents/sample.xlsx` |
 | `sample.pptx` | `application/vnd.openxmlformats-officedocument.presentationml.presentation` | `docs/examples/sample-documents/sample.pptx` |
 | `sample.png` | `image/png` | `docs/examples/sample-documents/sample.png` |
+| `sample.yaml` | `application/yaml` | `docs/examples/sample-documents/sample.yaml` |
+| `sample.toml` | `application/toml` | `docs/examples/sample-documents/sample.toml` |
+| `sample.xml` | `application/xml` | `docs/examples/sample-documents/sample.xml` |
+| `sample.srt` | `application/x-subrip` | `docs/examples/sample-documents/sample.srt` |
+| `sample.vtt` | `text/vtt` | `docs/examples/sample-documents/sample.vtt` |
 
 ### Generate sample PDF (requires `enscript` + `ps2pdf`)
 

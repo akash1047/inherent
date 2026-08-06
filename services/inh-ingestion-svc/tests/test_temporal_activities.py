@@ -254,7 +254,9 @@ class TestExtractTextActivity:
             "DOCX extraction failed (report.docx): could not read the document (wrong OOXML content type (...)).",
         ]
         for message in messages:
-            assert DocumentIngestionWorkflow._classify_error(message) == "extraction_failed", message
+            assert (
+                DocumentIngestionWorkflow._classify_error(message) == "extraction_failed"
+            ), message
 
     def test_legacy_xls_content_type_is_unregistered(self):
         """#118: legacy .xls (application/vnd.ms-excel, OLE2 binary format --
@@ -276,6 +278,212 @@ class TestExtractTextActivity:
         with pytest.raises(ApplicationError, match="No extractor registered") as exc_info:
             _resolve_extractor("application/vnd.ms-powerpoint")
         assert exc_info.value.non_retryable
+
+    @patch("src.temporal.shared_services.get_staging_service")
+    @patch("src.temporal.shared_services.get_storage_service")
+    @pytest.mark.asyncio
+    async def test_extract_text_yaml_success(self, mock_get_storage, mock_get_staging):
+        """#121: YAML is decoded as plain text, no parse step."""
+        mock_storage = MagicMock()
+        mock_storage.read_file.return_value = b"service: inherent\nversion: 1\n"
+        mock_get_storage.return_value = mock_storage
+        mock_staging = MagicMock()
+        mock_get_staging.return_value = mock_staging
+
+        input_data = ExtractTextInput(
+            workflow_run_id="wf_yaml",
+            storage_backend="local",
+            storage_path="config.yaml",
+            content_type="application/yaml",
+            original_filename="config.yaml",
+        )
+
+        from src.temporal.activities.extract import extract_text
+
+        result = await extract_text(input_data)
+        assert result.text_length > 0
+        written_text = mock_staging.write_text.call_args[0][1]
+        assert "service: inherent" in written_text
+
+    @patch("src.temporal.shared_services.get_staging_service")
+    @patch("src.temporal.shared_services.get_storage_service")
+    @pytest.mark.asyncio
+    async def test_extract_text_malformed_yaml_still_extracts(
+        self, mock_get_storage, mock_get_staging
+    ):
+        """#121 deliberate design: YAML is never parsed, so a syntax error
+        does not reject the upload -- the raw (malformed) text is still
+        searchable. This is NOT a failure path; it documents the choice."""
+        mock_storage = MagicMock()
+        # Invalid YAML (unbalanced brackets / bad indentation) -- a real
+        # parser would raise; the passthrough extractor does not care.
+        mock_storage.read_file.return_value = b"key: [unclosed\n  bad indent: - -\n"
+        mock_get_storage.return_value = mock_storage
+        mock_staging = MagicMock()
+        mock_get_staging.return_value = mock_staging
+
+        input_data = ExtractTextInput(
+            workflow_run_id="wf_yaml_bad",
+            storage_backend="local",
+            storage_path="bad.yaml",
+            content_type="application/yaml",
+            original_filename="bad.yaml",
+        )
+
+        from src.temporal.activities.extract import extract_text
+
+        result = await extract_text(input_data)
+        assert result.text_length > 0
+
+    @patch("src.temporal.shared_services.get_staging_service")
+    @patch("src.temporal.shared_services.get_storage_service")
+    @pytest.mark.asyncio
+    async def test_extract_text_xml_strips_tags(self, mock_get_storage, mock_get_staging):
+        """#121: XML tags are stripped, element text survives."""
+        mock_storage = MagicMock()
+        mock_storage.read_file.return_value = (
+            b'<?xml version="1.0"?><service name="inherent">'
+            b"<description>Company knowledge backend</description></service>"
+        )
+        mock_get_storage.return_value = mock_storage
+        mock_staging = MagicMock()
+        mock_get_staging.return_value = mock_staging
+
+        input_data = ExtractTextInput(
+            workflow_run_id="wf_xml",
+            storage_backend="local",
+            storage_path="config.xml",
+            content_type="application/xml",
+            original_filename="config.xml",
+        )
+
+        from src.temporal.activities.extract import extract_text
+
+        result = await extract_text(input_data)
+        written_text = mock_staging.write_text.call_args[0][1]
+        assert "Company knowledge backend" in written_text
+        assert "<service" not in written_text
+        # Attribute-value policy (#121 acceptance criteria): the "inherent"
+        # attribute VALUE is dropped along with the tag it lived on -- only
+        # element text content survives, same as the existing HTML behavior.
+        assert "inherent" not in written_text
+        assert result.text_length > 0
+
+    @patch("src.temporal.shared_services.get_staging_service")
+    @patch("src.temporal.shared_services.get_storage_service")
+    @pytest.mark.asyncio
+    async def test_extract_text_code_success(self, mock_get_storage, mock_get_staging):
+        """#122: source code is decoded text, content_type an explicit alias."""
+        mock_storage = MagicMock()
+        mock_storage.read_file.return_value = b"def main():\n    print('hello')\n"
+        mock_get_storage.return_value = mock_storage
+        mock_staging = MagicMock()
+        mock_get_staging.return_value = mock_staging
+
+        input_data = ExtractTextInput(
+            workflow_run_id="wf_code",
+            storage_backend="local",
+            storage_path="main.py",
+            content_type="text/x-python",
+            original_filename="main.py",
+        )
+
+        from src.temporal.activities.extract import extract_text
+
+        result = await extract_text(input_data)
+        written_text = mock_staging.write_text.call_args[0][1]
+        assert "def main" in written_text
+        assert result.text_length > 0
+
+    @patch("src.temporal.shared_services.get_staging_service")
+    @patch("src.temporal.shared_services.get_storage_service")
+    @pytest.mark.asyncio
+    async def test_extract_text_code_via_octet_stream_extension_fallback(
+        self, mock_get_storage, mock_get_staging
+    ):
+        """#122: the extension-fallback contract must also hold at
+        EXTRACTION time, not just at REST/MCP upload validation -- a
+        document persisted with content_type='application/octet-stream'
+        (the fallback path's stored value, unchanged from what the client
+        declared) must still resolve an extractor via the filename."""
+        mock_storage = MagicMock()
+        mock_storage.read_file.return_value = b"console.log('hi');\n"
+        mock_get_storage.return_value = mock_storage
+        mock_staging = MagicMock()
+        mock_get_staging.return_value = mock_staging
+
+        input_data = ExtractTextInput(
+            workflow_run_id="wf_code_octet",
+            storage_backend="local",
+            storage_path="app.js",
+            content_type="application/octet-stream",
+            original_filename="app.js",
+        )
+
+        from src.temporal.activities.extract import extract_text
+
+        result = await extract_text(input_data)
+        written_text = mock_staging.write_text.call_args[0][1]
+        assert "console.log" in written_text
+        assert result.text_length > 0
+
+    @patch("src.temporal.shared_services.get_staging_service")
+    @patch("src.temporal.shared_services.get_storage_service")
+    @pytest.mark.asyncio
+    async def test_extract_text_srt_success(self, mock_get_storage, mock_get_staging):
+        """#127: SRT cue numbers/timestamps stripped, coarse marker kept."""
+        mock_storage = MagicMock()
+        mock_storage.read_file.return_value = (
+            b"1\n00:00:00,000 --> 00:00:03,000\nWelcome to Inherent.\n\n"
+            b"2\n00:00:03,500 --> 00:00:07,000\nLet's begin.\n"
+        )
+        mock_get_storage.return_value = mock_storage
+        mock_staging = MagicMock()
+        mock_get_staging.return_value = mock_staging
+
+        input_data = ExtractTextInput(
+            workflow_run_id="wf_srt",
+            storage_backend="local",
+            storage_path="talk.srt",
+            content_type="application/x-subrip",
+            original_filename="talk.srt",
+        )
+
+        from src.temporal.activities.extract import extract_text
+
+        result = await extract_text(input_data)
+        written_text = mock_staging.write_text.call_args[0][1]
+        assert "Welcome to Inherent." in written_text
+        assert "Let's begin." in written_text
+        assert "-->" not in written_text
+        assert "[t=00:00]" in written_text
+        assert result.text_length > 0
+
+    @patch("src.temporal.shared_services.get_staging_service")
+    @patch("src.temporal.shared_services.get_storage_service")
+    @pytest.mark.asyncio
+    async def test_extract_text_srt_no_timestamps_raises(self, mock_get_storage, mock_get_staging):
+        """#127 failure path: an SRT-labeled file with no cue timestamps at
+        all must fail the document, not silently emit garbage/empty text."""
+        mock_storage = MagicMock()
+        mock_storage.read_file.return_value = b"This is just prose, not a real SRT file.\n"
+        mock_get_storage.return_value = mock_storage
+        mock_staging = MagicMock()
+        mock_get_staging.return_value = mock_staging
+
+        input_data = ExtractTextInput(
+            workflow_run_id="wf_srt_bad",
+            storage_backend="local",
+            storage_path="not-really.srt",
+            content_type="application/x-subrip",
+            original_filename="not-really.srt",
+        )
+
+        from src.temporal.activities.extract import extract_text
+
+        with pytest.raises(RuntimeError, match="No subtitle cues"):
+            await extract_text(input_data)
+        mock_staging.write_text.assert_not_called()
 
     @patch("src.temporal.shared_services.get_storage_service")
     @pytest.mark.asyncio
@@ -341,6 +549,108 @@ class TestExtractHelpers:
 
 
 # =========================================================================
+# #127: SRT / WebVTT subtitle extraction
+# =========================================================================
+
+
+class TestExtractSubtitleText:
+    """Tests for `_extract_subtitle_text`, shared by the 'srt' and 'vtt'
+    EXTRACTORS entries -- both formats share the same cue shape (an
+    optional identifier line, a 'HH:MM:SS[.,]mmm --> HH:MM:SS[.,]mmm'
+    timestamp line, then text) closely enough for one parser."""
+
+    def test_srt_strips_cue_numbers_and_timestamps(self):
+        from src.temporal.activities.extract import _extract_subtitle_text
+
+        srt = (
+            b"1\n00:00:00,000 --> 00:00:03,000\nWelcome to Inherent.\n\n"
+            b"2\n00:00:03,500 --> 00:00:07,000\nLet's begin.\n"
+        )
+        result = _extract_subtitle_text(srt, "talk.srt")
+        assert "Welcome to Inherent." in result
+        assert "Let's begin." in result
+        # Zero cue-number noise (#127 acceptance criteria).
+        assert "1\n" not in result and result.strip() != "1"
+        assert "-->" not in result
+
+    def test_vtt_strips_header_and_cue_settings(self):
+        from src.temporal.activities.extract import _extract_subtitle_text
+
+        vtt = (
+            b"WEBVTT\n\n"
+            b"00:00:00.000 --> 00:00:03.000 align:start position:10%\n"
+            b"Welcome to Inherent.\n\n"
+            b"00:00:03.500 --> 00:00:07.000\n"
+            b"Let's begin.\n"
+        )
+        result = _extract_subtitle_text(vtt, "talk.vtt")
+        assert "Welcome to Inherent." in result
+        assert "Let's begin." in result
+        assert "WEBVTT" not in result
+        assert "align:start" not in result
+
+    def test_vtt_note_blocks_are_skipped(self):
+        from src.temporal.activities.extract import _extract_subtitle_text
+
+        vtt = (
+            b"WEBVTT\n\n"
+            b"NOTE This is a comment, not a cue.\n\n"
+            b"00:00:00.000 --> 00:00:03.000\n"
+            b"Real cue text.\n"
+        )
+        result = _extract_subtitle_text(vtt, "talk.vtt")
+        assert "Real cue text." in result
+        assert "This is a comment" not in result
+
+    def test_periodic_coarse_timestamp_markers(self):
+        """Every Nth cue gets a '[t=MM:SS]' marker; the rest don't -- coarse
+        citability without per-line timestamp noise polluting embeddings."""
+        from src.temporal.activities.extract import (
+            _TIMESTAMP_MARKER_EVERY_N_CUES,
+            _extract_subtitle_text,
+        )
+
+        cues = "".join(
+            f"{i + 1}\n00:00:{i:02d},000 --> 00:00:{i + 1:02d},000\nCue number {i}.\n\n"
+            for i in range(_TIMESTAMP_MARKER_EVERY_N_CUES + 1)
+        )
+        result = _extract_subtitle_text(cues.encode(), "long.srt")
+        assert result.count("[t=") == 2  # cue 0 and cue N both marked
+        assert "[t=00:00]" in result
+
+    def test_mixed_line_endings_do_not_break_cue_parsing(self):
+        """#127 failure-adjacent robustness case: CRLF, bare CR, and LF
+        mixed in the same file must not fragment a cue's text or hide a
+        cue behind a spurious blank-line split."""
+        from src.temporal.activities.extract import _extract_subtitle_text
+
+        srt = (
+            b"1\r\n00:00:00,000 --> 00:00:03,000\r\nWelcome to Inherent.\r\n\r\n"
+            b"2\r00:00:03,500 --> 00:00:07,000\rLet's begin.\r\r"
+            b"3\n00:00:07,500 --> 00:00:10,000\nAll done.\n"
+        )
+        result = _extract_subtitle_text(srt, "mixed.srt")
+        assert "Welcome to Inherent." in result
+        assert "Let's begin." in result
+        assert "All done." in result
+
+    def test_no_timestamps_raises(self):
+        """#127 failure path: content with no cue timestamps at all is not
+        a valid subtitle file -- fail loudly rather than emit nothing."""
+        from src.temporal.activities.extract import _extract_subtitle_text
+
+        with pytest.raises(RuntimeError, match="No subtitle cues"):
+            _extract_subtitle_text(b"just some prose, no cues here", "fake.srt")
+
+    def test_multiline_cue_text_is_joined(self):
+        from src.temporal.activities.extract import _extract_subtitle_text
+
+        srt = b"1\n00:00:00,000 --> 00:00:03,000\nLine one\nLine two\n"
+        result = _extract_subtitle_text(srt, "talk.srt")
+        assert "Line one Line two" in result
+
+
+# =========================================================================
 # set_document_status activity tests
 # =========================================================================
 
@@ -396,6 +706,26 @@ class TestFileTypeRegistryDispatch:
 
         extractor = _resolve_extractor("application/pdf")
         assert callable(extractor)
+
+    def test_octet_stream_resolves_via_filename_extension(self):
+        """#122: extraction must honor the SAME octet-stream + extension
+        fallback contract intake validation does (both call
+        `inh_contracts.get_spec_for_upload`) -- otherwise a document that
+        was ACCEPTED at upload via the fallback would permanently fail at
+        extraction, since 'application/octet-stream' alone has no registry
+        entry."""
+        from src.temporal.activities.extract import _resolve_extractor
+
+        extractor = _resolve_extractor("application/octet-stream", "main.py")
+        assert callable(extractor)
+
+    def test_octet_stream_without_filename_still_fails(self):
+        """No filename to fall back on -- the original #117 behavior for a
+        generic content type is preserved."""
+        from src.temporal.activities.extract import _resolve_extractor
+
+        with pytest.raises(ApplicationError, match="application/octet-stream"):
+            _resolve_extractor("application/octet-stream")
 
 
 class TestDecodeText:

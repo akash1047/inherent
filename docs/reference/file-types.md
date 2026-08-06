@@ -38,6 +38,12 @@ the build if this table and the registry ever disagree.
 | epub | `.epub` | `application/epub+zip` | rest | prose | — |
 | rtf | `.rtf` | `application/rtf`, `text/rtf` | rest | prose | — |
 | odt | `.odt` | `application/vnd.oasis.opendocument.text` | rest | prose | — |
+| yaml | `.yaml`, `.yml` | `application/yaml`, `text/yaml` | rest + mcp | structured | — |
+| toml | `.toml` | `application/toml` | rest + mcp | structured | — |
+| xml | `.xml` | `application/xml`, `text/xml` | rest + mcp | structured | — |
+| code | `.py`, `.js`, `.ts`, `.tsx`, `.jsx`, `.go`, `.java`, `.rs`, `.c`, `.h`, `.cpp`, `.cs`, `.rb`, `.php`, `.swift`, `.kt`, `.scala`, `.sh`, `.sql`, `.r`, `.lua` | `text/x-python`, `application/javascript`, `text/javascript`, `application/typescript`, `text/x-go`, `text/x-java-source`, `text/x-rustsrc`, `text/x-csrc`, `text/x-chdr`, `text/x-c++src`, `text/x-csharp`, `text/x-ruby`, `text/x-php`, `text/x-swift`, `text/x-kotlin`, `text/x-scala`, `application/x-sh`, `text/x-sh`, `application/sql`, `text/x-sql`, `text/x-r-source`, `text/x-lua` | rest + mcp | code | — |
+| srt | `.srt` | `application/x-subrip` | rest + mcp | prose | — |
+| vtt | `.vtt` | `text/vtt` | rest + mcp | prose | — |
 
 <!-- END GENERATED FILE TYPES TABLE -->
 

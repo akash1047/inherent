@@ -244,6 +244,79 @@ class TestIntakeDocumentExplicitlyRejectedLegacyFormats:
         mock_db.create_or_reset_pending_document.assert_not_awaited()
 
 
+class TestIntakeDocumentExtensionFallback:
+    """#122: `intake_document` resolves via `get_spec_for_upload`, which
+    consults `filename`'s extension ONLY when `content_type` is generic
+    (`application/octet-stream`) or absent -- completing the design
+    `FileTypeSpec.extensions` was reserved for at #117."""
+
+    async def test_octet_stream_with_registered_extension_accepted(
+        self, mock_db, mock_storage, mock_mq
+    ):
+        p1, p2 = _patches(mock_storage, mock_mq)
+        with p1, p2:
+            result = await document_intake.intake_document(
+                database=mock_db,
+                workspace_id="test-workspace-id",
+                user_id="test-user-id",
+                content_bytes=b"def main():\n    pass\n",
+                filename="main.py",
+                content_type="application/octet-stream",
+            )
+        assert result.status == "pending"
+        # The client-sent value is preserved verbatim (#122) -- the resolved
+        # 'code' spec validates the upload but never rewrites content_type.
+        assert result.mime_type == "application/octet-stream"
+
+    async def test_octet_stream_with_unregistered_extension_still_rejected(
+        self, mock_db, mock_storage, mock_mq
+    ):
+        p1, p2 = _patches(mock_storage, mock_mq)
+        with p1, p2, pytest.raises(BadRequestError):
+            await document_intake.intake_document(
+                database=mock_db,
+                workspace_id="test-workspace-id",
+                user_id="test-user-id",
+                content_bytes=b"whatever",
+                filename="notes.xyz",
+                content_type="application/octet-stream",
+            )
+
+    async def test_specific_unregistered_mime_not_widened_by_extension(
+        self, mock_db, mock_storage, mock_mq
+    ):
+        """SECURITY: a SPECIFIC (not generic) unregistered content type must
+        not be widened just because the filename carries a known
+        extension."""
+        p1, p2 = _patches(mock_storage, mock_mq)
+        with p1, p2, pytest.raises(BadRequestError):
+            await document_intake.intake_document(
+                database=mock_db,
+                workspace_id="test-workspace-id",
+                user_id="test-user-id",
+                content_bytes=b"def main(): pass",
+                filename="main.py",
+                content_type="application/x-something-made-up",
+            )
+
+    async def test_octet_stream_binary_content_with_code_extension_rejected(
+        self, mock_db, mock_storage, mock_mq
+    ):
+        """Failure path: the fallback resolves a spec to VALIDATE against --
+        it is not a bypass. PNG bytes behind a '.py' filename are still
+        caught by the magic-byte sniff."""
+        p1, p2 = _patches(mock_storage, mock_mq)
+        with p1, p2, pytest.raises(BadRequestError):
+            await document_intake.intake_document(
+                database=mock_db,
+                workspace_id="test-workspace-id",
+                user_id="test-user-id",
+                content_bytes=b"\x89PNG\r\n\x1a\n fake png bytes",
+                filename="malicious.py",
+                content_type="application/octet-stream",
+            )
+
+
 class TestIntakeDocumentMagicByteSniffing:
     """#117: MIME type is entirely client-supplied and, before this, was
     never checked against the actual bytes. These pin the closed hole --

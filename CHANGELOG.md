@@ -40,6 +40,36 @@ All notable changes to Inherent are documented here. The format follows
   reaches extraction instead, where the wrong OOXML part set fails to parse
   with a clear, filename-bearing, non-retryable error — never silently
   mis-read as another format.
+- **Structured text ingestion: YAML, TOML, XML (#121).** Registered in
+  `FILE_TYPE_REGISTRY` (`application/yaml`/`text/yaml`, `application/toml`,
+  `application/xml`/`text/xml`; `.yaml`/`.yml`/`.toml`/`.xml`), `rest+mcp`,
+  `chunking_hint="structured"`. YAML and TOML are ingested as decoded text
+  with no parse step, so malformed input is still searchable rather than
+  rejecting the upload. XML tags are stripped via the same BeautifulSoup
+  `html.parser` path as HTML — a deliberate, XXE-safe choice (no DTD/entity
+  resolution); attribute values are dropped, only element text survives.
+- **Source code: explicit extension contract (#122).** A 20-extension
+  allowlist (`.py .js .ts .tsx .jsx .go .java .rs .c .h .cpp .cs .rb .php
+  .swift .kt .scala .sh .sql .r .lua`) plus accepted MIME aliases
+  (`text/x-python`, `application/javascript`, `application/x-sh`,
+  `application/sql`, and more — see `docs/reference/file-types.md`) replace
+  the previous accidental `text/plain`-sniffing path. A generic or absent
+  `Content-Type` (`application/octet-stream`) now falls back to the
+  filename's extension when it's registered
+  (`inh_contracts.file_types.get_spec_for_upload`) — completing the
+  fallback-classifier design `FileTypeSpec.extensions` was reserved for at
+  #117. The fallback applies only to a GENERIC content type, never to a
+  specific-but-unrecognized one, so it cannot widen acceptance of arbitrary
+  unknown text files. `rest+mcp`, `chunking_hint="code"` (new
+  `ChunkingHint` value, not yet consumed pending #129).
+- **Transcripts: SRT and WebVTT subtitle extraction (#127).** Registered as
+  `application/x-subrip`/`.srt` and `text/vtt`/`.vtt`, `rest+mcp`,
+  `chunking_hint="prose"`. Cue numbers and per-cue timestamp lines are
+  stripped and cue text is joined into prose, with a coarse `[t=MM:SS]`
+  citation marker reinserted every 10 cues so an agent can still cite
+  roughly when something was said without per-line timestamp noise
+  polluting retrieval. A file with no recognizable cue timestamps fails
+  extraction explicitly rather than emitting empty/garbage text.
 - **Ingestion-source Temporal memo on `DocumentIngestionWorkflow` starts
   (#141).** `core.document.uploaded.v1` now optionally carries `source`
   (`connector:<provider>` | `public-api` | `manual`), `connection_id`, and
