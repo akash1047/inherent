@@ -35,12 +35,13 @@ explicit answer, not an implicit one:
    of ids inherits this exact hazard from scratch unless it reuses the
    mechanism #110 already built and proved.
 3. **Dedup is content- and filename-keyed, per workspace.** `intake_document`
-   (`services/inh-public-api-svc/src/services/document_intake.py:130-198`)
-   hashes the upload, looks up `get_document_id_by_content_hash` (workspace,
-   content_hash) first, then `get_document_id_by_filename`
-   (`services/inh-public-api-svc/src/services/database.py:293-364`), and
-   reuses the existing `document_id` — including a same-content short-circuit
-   that skips re-ingestion entirely
+   (`services/inh-public-api-svc/src/services/document_intake.py:36`) hashes
+   the upload and, in its dedup section
+   (`document_intake.py:130-198`), looks up `get_document_id_by_content_hash`
+   (workspace, content_hash) first, then `get_document_id_by_filename`
+   (`services/inh-public-api-svc/src/services/database.py:304-333` and
+   `:334-363` respectively), and reuses the existing `document_id` —
+   including a same-content short-circuit that skips re-ingestion entirely
    (`document_intake.py:160-190`). A fan-out design must say whether a member
    is a first-class participant in this dedup contract or a second, weaker
    one.
@@ -60,12 +61,13 @@ same ambiguity a member classifier must resolve.
 **Expansion happens once, synchronously, at REST intake — before any MQ
 message or Temporal workflow exists.** `POST /v1/archives` (new endpoint,
 REST-only per the issue's proposed surface) reads the uploaded ZIP's central
-directory, applies the limits below, and then calls the *existing*
-`intake_document` pipeline once per admitted member — unmodified. Each
-member becomes one ordinary `DocumentUploadMessage` and one ordinary
-`ingest-{document_id}` workflow. Nothing about a member's journey through MQ,
-Temporal, storage, or dedup is special-cased; only the intake step that
-produces those N calls is new.
+directory, applies the limits in §6, and then calls the *existing*
+`intake_document` function once per admitted member — its own source is not
+modified. Each member becomes one ordinary `DocumentUploadMessage` and one
+ordinary `ingest-{document_id}` workflow. The new code is the loop that
+drives those N calls and accounts for what each one does (§5) — not
+`intake_document` itself, and not MQ, Temporal, storage, or dedup, which stay
+exactly as they are for a standalone upload.
 
 ### 1. Fan-out: N ordinary messages, not one message that fans out inside the workflow
 
@@ -88,7 +90,7 @@ because:
   reaching back into public-api-svc from a Temporal activity — both worse
   than doing the lookup once, where it already lives, before any message is
   published.
-- Zip-bomb limits (below) are cheap to enforce against ZIP central-directory
+- Zip-bomb limits (§6) are cheap to enforce against ZIP central-directory
   metadata without inflating member bytes. Enforcing them matters most
   *before* paying for decompression, S3 upload, and a Temporal workflow
   start per member — i.e. at intake, not after a workflow has already been
@@ -98,7 +100,7 @@ because:
 Contract v1.0.0 stays byte-for-byte as it is; no `parent_document_id` field,
 no schema version bump. A member is indistinguishable, on the wire, from a
 document uploaded standalone. The only new persistent concept is the
-archive's own bookkeeping row (below), which never touches MQ or Temporal.
+archive's own bookkeeping (§4), which never touches MQ or Temporal.
 
 ### 2. Identity and dedup: a member is a full peer of a standalone upload
 
@@ -110,9 +112,10 @@ A member's `document_id` is resolved by calling the *same*
 archives containing the same file, uploaded into the same workspace, collapse
 onto the same document_id** — content-hash dedup does not know or care that
 the bytes arrived inside a ZIP. This is not a new policy; it is the existing
-#75 contract applied without exception. A member's `original_filename` is
-its full path *within* the archive (e.g. `notes/todo.md`, not `todo.md`), so
-two same-named members in different folders of one archive do not collide
+#75 contract applied without exception. A member's `original_filename` (the
+value stored on `processed_documents`, used for filename dedup and display)
+is its full path *within* the archive (e.g. `notes/todo.md`, not `todo.md`),
+so two same-named members in different folders of one archive do not collide
 against each other under filename dedup, and so provenance stays legible.
 
 Rejected alternative: archive-scoped dedup (a document identity keyed on
@@ -122,59 +125,131 @@ once per archive it happens to appear in — the exact duplication #75 exists
 to prevent — and because it requires a second dedup index with its own
 consistency rules alongside the one that already exists.
 
-### 3. The re-upload / #110 interaction — the sharpest edge, resolved by construction
+**Two members at different paths inside the *same* archive with identical
+bytes are not a special case either.** The first member's `intake_document`
+call creates a `pending` row and its `document_id`; the second member's
+content-hash lookup (`get_document_id_by_content_hash`,
+`database.py:334-363`, which has no status filter) finds that row and, since
+its status is not `'failed'`, takes the identical-content short-circuit
+(`document_intake.py:171-190`) — no second S3 object, no second pending-row
+reset, no second MQ publish. This is #75 dedup working exactly as designed,
+not a defect: the join table in §4 records **both** archive-member rows
+(one per path) against the **same** `document_id`, so the response is
+explicit about the collapse (`10 submitted_members`, two of them sharing one
+`document_id`) instead of silently presenting 8 rows for a 10-path archive.
 
-**What happens when a re-uploaded archive re-expands:** for every member
-whose bytes are unchanged between the two archive uploads, content-hash dedup
-resolves the *same* `document_id` both times
-(`document_intake.py:142-144`). Re-publishing `document.uploaded` for that
-`document_id` while its prior workflow is still open is **the identical race
-#110 already solved** — `TemporalWorkflowTrigger` supersedes the running
-`ingest-{document_id}` execution (`TERMINATE_EXISTING`,
-`trigger.py:290-299`), and the `active_run_id` / `active_run_claimed_at`
-fencing pair (`database.py:851-899`, `:1006-1109`) guarantees the terminated
-run's late store write is skipped rather than clobbering the new run's
-content. **No new fencing code is required at the member level** — a
-re-expanded archive's members hit exactly the same collision-and-supersede
-path an ordinary rapid re-upload or `/refresh` call already exercises today,
-covered by the existing `test_reindex_fencing.py` suite.
+### 3. The re-upload / #110 interaction — the sharpest edge, resolved by construction, but only for the members that actually reach it
 
-For a member whose bytes *changed* between the two archive uploads,
-content-hash dedup misses (a new hash), but *filename* dedup still resolves
-the same `document_id` (`document_intake.py:146-148`) — this is #60's
-edited-content-reindex behavior, again unmodified. For a member that is
-*new* in the second archive (added since the first upload), a fresh
-`document_id` is minted; there is no prior run to collide with.
+**What happens when a re-uploaded archive re-expands:** the majority case —
+a member whose bytes are byte-for-byte **unchanged** between the two archive
+uploads — never reaches #110's machinery at all. Content-hash dedup resolves
+the same `document_id` both times, and when the existing document's status
+is not `'failed'`, `intake_document`'s identical-content short-circuit
+(`document_intake.py:171-190`) returns immediately: **no MQ message is
+published, no workflow is started.** Re-uploading an unchanged member is a
+pure read (one dedup lookup) with zero write-side effects — #110's
+collision-and-supersede path is never exercised because there is nothing to
+collide with.
 
-**The archive's own bookkeeping row (Decision 4) never participates in this
-race at all**, because it is never given a Temporal workflow: it is written
-once at intake and re-derived (never mutated in place) on every read. A
-second upload of "the same" archive gets a brand-new `archive_id` — archive
-identity is not deduped in v1 (Decision 4) — so there is no archive-level
-collision to fence in the first place. All of the interesting concurrency
-this ADR has to answer for happens at the member/`document_id` layer, where
-#110 already owns it.
+The #110 collision genuinely arises for two narrower cases, both of which
+already re-publish and re-enqueue under **standalone** upload today, with no
+ZIP involved:
 
-### 4. Archive bookkeeping: a derived-status envelope, not a second state machine
+- A member whose bytes **changed** between the two archive uploads. Content-
+  hash dedup misses (a new hash), but filename dedup still resolves the same
+  `document_id` (`document_intake.py:146-148`) — #60's edited-content-reindex
+  behavior — and a fresh `document.uploaded` is published against a
+  `document_id` whose prior `ingest-{document_id}` workflow may still be
+  open.
+- A retry of a member whose prior run left it `status = 'failed'`. The
+  identical-content short-circuit explicitly excludes `'failed'` documents
+  (`document_intake.py:171-173`), so even byte-identical content re-publishes
+  and re-enqueues.
 
-A new `archive_uploads` table (additive migration, filed as a follow-up
-issue) stores, once, at intake: `archive_id` (uuid), `workspace_id`,
-`user_id`, `original_filename`, `admitted_member_document_ids` (JSONB array),
-`skipped_members` (JSONB array of `{path, reason}`), `created_at`. A new
-nullable `parent_archive_id` column on `processed_documents` (additive)
-links each admitted member's row back to its archive.
+For both, the fresh publish supersedes any still-open prior run exactly as
+#110 already guarantees for a standalone re-upload: `TERMINATE_EXISTING`
+(`trigger.py:290-299`) plus the `active_run_id` / `active_run_claimed_at`
+fencing pair (`database.py:851-899`, `:1006-1109`) stop the terminated run's
+late write from clobbering the new one. **No new fencing code is required at
+the member level** in either case — a re-expanded archive's changed-or-
+retried members hit exactly the collision-and-supersede path
+`test_reindex_fencing.py` already covers for a standalone document; they are
+not distinguishable from one, because nothing about how they were uploaded
+reaches the fencing layer.
 
-**Archive status is computed on every `GET /v1/archives/{archive_id}` from
-the current `status` of its member rows — it is never itself written.**
+**The archive's own bookkeeping (§4) never participates in this race at
+all**, because it is never given a Temporal workflow: it is written once at
+intake and re-derived (never mutated in place) on every read. A second
+upload of "the same" archive gets a brand-new `archive_id` — archive
+identity is not deduped in v1 (§4) — so there is no archive-level collision
+to fence in the first place. All of the interesting concurrency this ADR has
+to answer for happens at the member/`document_id` layer, where #110 already
+owns it.
 
-- Any admitted member `status = 'pending'` → archive `pending` (still in
-  flight; the response still lists each member's current status
-  individually, so a caller is never blind to an early failure just because
-  the archive as a whole isn't final).
-- No member `pending`, all `processed` → archive `complete`.
-- No member `pending`, all `failed` → archive `failed`.
-- No member `pending`, a mix of `processed` and `failed` → archive
-  `partial`.
+### 4. Archive bookkeeping: a many-to-many join, and a derived-status envelope
+
+A member can belong to more than one archive — the same file, unchanged,
+appears in `project-v1.zip` and `project-v2.zip` — and one
+`processed_documents` row cannot name more than one parent through a single
+column. **The schema is a join table, not a foreign key on the document
+row:**
+
+- `archive_uploads`: `archive_id` (uuid, PK), `workspace_id` (indexed),
+  `user_id`, `original_filename` (the ZIP's own filename), `skipped_members`
+  (JSONB array of `{path, reason}` — never admitted, §5), `failed_at_intake_members`
+  (JSONB array of `{path, reason}` — admitted-attempt, infra-caused failure
+  before a workflow ever started, §5), `created_at`.
+- `archive_members` (new join table): `archive_id` (FK → `archive_uploads`),
+  `document_id` (references `processed_documents.document_id`),
+  `member_path` (the member's full in-archive path). Primary key
+  `(archive_id, member_path)` — a path is unique within one archive's
+  listing; `document_id` is **not** unique within an archive (§2's
+  intra-archive-duplicate case) and **not** unique across archives (the
+  `v1.zip`/`v2.zip` case this section opens with). Indexed on `archive_id`
+  (rollup reads) and on `document_id` (reverse lookup: which archives a
+  document belongs to).
+
+No `processed_documents.parent_archive_id` column — the join table is the
+single source of the archive↔member relation, in both directions, for
+however many archives a member happens to belong to.
+
+**`GET /v1/archives/{archive_id}` reads `archive_members WHERE archive_id =
+:archive_id` and reports exactly what THAT archive admitted — `v1.zip`'s
+rollup is unaffected by anything `v2.zip` later did with the same file,**
+because the two are different rows keyed by different `archive_id`s, not
+different views over one shared column.
+
+**Archive status is computed on every read from the current `status` of its
+admitted members — it is never itself written:**
+
+- The `archive_members` row count for this `archive_id` is `0` (every
+  member was skipped or failed at intake, §5) → status `failed`. This guard
+  runs first and is checked against the row count, not the live document
+  count, so it cannot be affected by later deletions (below) — it answers
+  "was anything ever admitted," which is a historical fact, not a current
+  one.
+- Otherwise, over the *currently existing* member `processed_documents` rows
+  (see deletion handling below): any `status = 'pending'` → archive
+  `pending` (still in flight; the response still lists each member's current
+  status individually, so a caller is never blind to an early failure just
+  because the archive as a whole isn't final); no member `pending`, all
+  `processed` → `complete`; no member `pending`, all `failed` → `failed`; no
+  member `pending`, a mix → `partial`.
+
+**A member deleted after admission** (`DELETE /v1/documents/{id}`,
+`services/inh-public-api-svc/src/api/v1/documents.py:137`) has an
+`archive_members` row with no matching `processed_documents` row. It is
+reported in `submitted_members` as `status: "deleted"` and **excluded** from
+the pending/processed/failed tally above — an archive is not held `pending`
+forever, or reported `failed`, purely because a caller deliberately deleted
+one of its members. If every admitted member has since been deleted, status
+reports `complete` (the `archive_members` row count was `> 0`, so the
+`failed`-vacuous-truth guard above does not apply; this is a documented
+best-effort default, not a provably correct reconstruction of history — a
+derived-never-stored status cannot distinguish "all admitted members
+finished successfully, then were deleted" from a hypothetical it has no
+record of, and this ADR accepts that gap rather than inventing a stored
+audit trail to close it).
 
 Rejected alternative: maintain a stored `status` column on `archive_uploads`,
 updated by a new consumer of `document.processed` / `document.failed`.
@@ -188,31 +263,96 @@ CLAUDE.md's defect-prevention rules exist to keep out. A derived read has no
 divergence to have: it is definitionally always consistent with the member
 rows it just queried.
 
-### 5. Partial failure: 9 of 10 members succeed, 1 fails
+**Known cost of "derived, never stored":** there is no archive-level
+completion timestamp. `processed_documents.processed_at`
+(`services/inh-ingestion-svc/src/services/database.py:202`) exists per
+member but is not currently selected by any public-api-svc query — answering
+"when did this archive finish" needs `max(processed_at)` over its members,
+which `GET /v1/archives/{archive_id}` does not compute in v1. This is a
+response-shape addition (aggregate over rows the rollup already fetches,
+plus wiring `processed_at` into public-api-svc's `DatabaseService`, which
+does not read it today), not a schema change — left as a named follow-up,
+not required for v1's status correctness.
 
-The archive's status is `partial` (Decision 4). The response body from
-`GET /v1/archives/{archive_id}` enumerates all 10 admitted members with each
-one's own `document_id` and `status`; the caller reads exactly which member
-failed and can retry that document individually (`POST /v1/documents/{id}/refresh`,
-existing) without re-uploading the archive. **A failed member follows the
-existing single-document failure path unmodified**: its own workflow run
+### 5. Partial failure and per-member intake errors: a member is admitted, skipped, or failed-at-intake — never silently orphaned
+
+**Nine of ten members extract and ingest; one fails.** Its own workflow run
 marks it `failed` and publishes `document.failed`
 (`services/inh-ingestion-svc/src/temporal/workflows/document_ingestion.py:496`,
-`:534`, `:612`) — no new compensation code is needed because a member
-failure is not a new failure mode, it is document ingestion failing the way
-it already can, once per member instead of once per request.
+`:534`, `:612`) — the archive's derived status (§4) is `partial`, and
+`GET /v1/archives/{archive_id}` names the failed member's `document_id` and
+`path` so the caller can retry it individually
+(`POST /v1/documents/{id}/refresh`, existing) without re-uploading the
+archive. **This part follows the existing single-document failure path
+unmodified** — a member failure post-enqueue is not a new failure mode.
 
-**Skipped is not failed.** A member with an unsupported type, or a nested
-archive (Decision 6), is never admitted — it is recorded in
-`archive_uploads.skipped_members` at intake time and never gets a
-`document_id`, an S3 object, or a workflow. This mirrors the
-skip/fail distinction #117 already draws between "no registry entry" (a
-contract-level rejection) and "extraction raised" (an execution-level
-failure) — applied per member instead of per request, because fan-out
-changes the blast radius of one bad member from "the whole upload 400s" to
-"the archive admits 9 of 10 and says so."
+**The harder case is failure *inside* the intake loop itself, before a
+member ever reaches Temporal.** `intake_document` is called unmodified, but
+it is not unconditionally successful: it raises `BadRequestError` for
+conditions §8's classifier does not screen (a zero-byte member —
+`document_intake.py:108-109` — is ordinary in a docs bundle or repo export,
+passes the ratio check trivially, and resolves to a registered extension
+with `magic=None`, so §8 admits it; a per-member size over a format's
+`max_size_bytes` override — `:113-118`), and `ServiceUnavailableError` when
+S3, the database, or MQ is down (`:201-211`, `:218-242`). Calling
+`intake_document` per member **without** catching these turns one bad byte
+range or one infra blip into a request that 400s or 503s after members
+`1..k-1` already have S3 objects, pending rows, and published MQ messages —
+contradicting this section's own "admits 9 of 10 and says so" promise, and
+leaving those already-admitted documents with no archive record if the
+`archive_uploads` row is only written after the loop. **This was the ADR's
+own contradiction; it is decided here, not deferred:**
 
-### 6. Limits — zip-bomb guards, checked before decompression
+1. **`archive_uploads` is written FIRST**, before any member is touched —
+   `archive_id`, `workspace_id`, `user_id`, `original_filename`,
+   `created_at`, empty `skipped_members` / `failed_at_intake_members`. Every
+   member — admitted, skipped, or failed-at-intake — is therefore attributed
+   to an `archive_id` that exists in the response the caller already has, no
+   matter where in the loop anything goes wrong.
+2. **`archive_members` is written incrementally**, one row per admitted
+   member, immediately after `intake_document` returns a `document_id` —
+   not batched at the end of the loop. A document that has S3/DB/MQ side
+   effects always has a matching `archive_members` row committed in the same
+   step; there is no window where a document exists with no archive
+   attribution.
+3. **The loop catches `intake_document`'s two exception types, per member,
+   and classifies — this is where the archive path's new branching actually
+   lives** (§1's "not modified" claim is about `intake_document`'s own
+   source, not the calling loop):
+   - `BadRequestError` → the member is a **content-level** rejection,
+     discovered one step later than §8's classifier could catch it. Append
+     `{path, reason}` to `archive_uploads.skipped_members` (same bucket and
+     semantics as a classifier-level skip — "never admitted, contract-level
+     reason") and continue to the next member.
+   - `ServiceUnavailableError` → an **infra-level** failure, not specific to
+     this member's content, and likely to recur for every remaining member
+     too. Append `{path, reason}` to `failed_at_intake_members`, then **stop
+     the loop** rather than retrying a dependency that just failed against
+     every remaining path — every member not yet attempted is appended to
+     `failed_at_intake_members` too, with reason `"archive intake aborted:
+     <underlying error>"`, so no path is ever left unaccounted for in all
+     three buckets combined.
+4. **The endpoint always returns `201`** once `archive_uploads` exists (even
+   after an aborted loop), never a `4xx`/`5xx` that would hide the members
+   already admitted — the same precedent `intake_document` itself already
+   sets for a single upload (an MQ-publish failure after a successful S3
+   upload returns `201` with `status="failed"` in the body,
+   `document_intake.py:273-309`, "the file IS stored, so this is not a
+   request failure"). The archive-level analogue: once any member's side
+   effects exist, the only honest response is one that names them, not an
+   HTTP error that discards the fact they happened.
+
+**Skipped and failed-at-intake are not "failed" in the archive-status sense
+(§4).** Neither ever gets a `document_id`, an `archive_members` row, a
+workflow, or a chance to be retried via `/refresh` — they are a different
+question ("did this path become a document at all") from the one archive
+status answers ("did this path's document finish ingesting"). Both lists are
+always present in the response, independent of `status`, mirroring the
+skip/fail distinction #117 already draws between "no registry entry"
+(contract-level) and "extraction raised" (execution-level) — applied at two
+different layers (classification vs. intake) instead of one.
+
+### 6. Limits — zip-bomb guards, checked before decompression, enforced through decompression
 
 All four checked from ZIP central-directory metadata (`ZipInfo.file_size`,
 `ZipInfo.compress_size` — read without inflating any member) before any
@@ -223,14 +363,47 @@ limits exist to prevent:
 | Limit | Value | Why |
 |---|---|---|
 | Archive (compressed) size | 50 MB — the existing `MAX_UPLOAD_SIZE_BYTES` (`services/inh-public-api-svc/src/config/constants.py:75`) | No override; the archive itself is one REST upload and already subject to the global cap. |
-| Member count | 500 | Bounds the worst case of one REST request enqueueing 500 Temporal workflow starts + 500 MQ publishes; comfortably above a real docs-folder/repo-export bundle. |
+| Member count | 500 | Bounds the worst case of one REST request enqueueing 500 Temporal workflow starts + 500 MQ publishes, and bounds the synchronous request latency of §5's intake loop (see "Request latency" below) — comfortably above a real docs-folder/repo-export bundle. |
 | Total uncompressed size across all members | 500 MB (10x the compressed cap) | Bounds decompression amplification while allowing a legitimately large bundle; a 10x average ratio is far above what prose/code/PDF content compresses to. |
 | Per-member compression ratio | 100:1 (`file_size / compress_size`) | Standard zip-bomb heuristic; a single member exceeding it fails the whole archive before any bytes are inflated, not just that member. |
 
-Exceeding any limit rejects the whole upload with `400 Bad Request` before
-`archive_uploads` gets a row — this is an intake-time rejection like any
-other `BadRequestError` in `intake_document`, not a partial-failure archive
-state.
+**The central-directory check alone is necessary but not sufficient — it
+must be paired with a bounded reader at decompression time, or it is a
+property of one library function, not a guarantee.** A crafted ZIP can
+declare a small `file_size` and `compress_size` in both the local file
+header and the central directory while actually containing far more
+compressed data than declared (the declared numbers are metadata, not a
+constraint zlib enforces): the central-directory checks above pass, and a
+naive read of "the member's bytes" inflates however much the compressed
+stream actually contains. The reason CPython's `zipfile.ZipExtFile` happens
+to stop early in the common case — it tracks `_left` against the declared
+`file_size` and truncates the read there — is an implementation detail of
+one specific reader, not a documented contract; a bounded-total-size
+attacker who avoids that reader entirely (`shutil.unpack_archive`, an
+`unzip` subprocess, a streaming decoder, a non-seekable `ZipFile`) sees the
+declared-metadata checks above pass and gets uninflated decompression to
+whatever the stream actually contains. **Decision: member extraction reads
+through a bounded wrapper that aborts the member the instant *actual bytes
+emitted by the decompressor* exceed that member's own declared `file_size`,
+and aborts the whole request the instant the *actual, running* total across
+all members exceeds 500 MB — counting bytes the decompressor produced, never
+the declared/central-directory numbers.** This is a control on the
+inflation step itself, not a trust placed in any particular library's
+truncation behavior.
+
+**Request latency.** §5's intake loop performs one S3 PUT, one DB write, and
+one MQ publish per admitted member, synchronously, inside the HTTP request —
+at 500 members, even a conservative ~50-100ms per member serially is 25-50
+seconds inside one request, close to or past common gateway/client timeout
+defaults (30-60s). The 500-member cap above is set partly for this reason,
+not only for fan-out-storm containment. This ADR does not redesign the
+endpoint as async-accept-then-poll (that is a materially bigger decision —
+it would change the response contract from "the archive exists with an
+initial member list" to "poll before you know what was admitted," and
+deserves its own review) — the implementation issue must instead process
+members with bounded concurrency (e.g. a small semaphore, not a bare
+sequential loop) to keep the common case well under a typical timeout, and
+document that a near-cap archive can legitimately take tens of seconds.
 
 ### 7. Nesting: depth 0 — a ZIP member that is itself an archive is never expanded
 
@@ -261,6 +434,18 @@ ZIP (`file_types.py:233-241`), because extension resolves it before magic
 bytes are ever consulted — the exact ambiguity that comment flags is not
 reachable here.
 
+**Registered extensions today are `.txt .md .markdown .csv .html .htm .pdf
+.json .docx .png`** — a repo-export ZIP, the Context section's own opening
+example, skips every `.py .js .ts .yaml .toml .go`, so `skipped_members`
+would dominate that exact scenario if this shipped today. This is a timing
+gap, not a permanent one: sibling issues are adding several of these
+extractors concurrently with this ADR, and each new `FILE_TYPE_REGISTRY`
+entry (#117's stated design goal) makes every existing and future ZIP
+member-classification call site — this one included — pick it up with no
+change here. Stated plainly so it is not discovered as a surprise at launch:
+v1 archive support is honest about "docs/PDF/notes bundle," not yet "code
+repo export," until those extractors land.
+
 The registry itself needs one additive change, left to the follow-up issue:
 `FileTypeSpec` gains a way to mark an entry as a *container* (e.g. `zip`
 registered with `surfaces=frozenset({"rest"})`, no single-document
@@ -269,14 +454,15 @@ registered with `surfaces=frozenset({"rest"})`, no single-document
 (`services/inh-ingestion-svc/tests/test_temporal_activities.py`) is updated
 to exclude container entries — a ZIP archive is never itself dispatched to
 an ingestion-svc extractor, because it never becomes a `document_id` of its
-own (Decision 1).
+own (§1).
 
 ## Boundary: what this is not
 
 - **Not a new event contract.** `DocumentUploadMessage` v1.0.0 is unchanged;
   no consumer of that contract needs to change to support ZIP.
 - **Not a new fencing mechanism.** Member-level re-ingestion races are the
-  existing #110 collision, unmodified. The archive envelope has no fencing
+  existing #110 collision, unmodified, and only reached by changed or
+  previously-failed members (§3) — the archive envelope has no fencing
   because it has no workflow to fence.
 - **Not recursive.** A ZIP inside a ZIP is a skipped member, not a second
   level of fan-out.
@@ -284,42 +470,66 @@ own (Decision 1).
   `upload_document` tool is inline-UTF-8-text-only by construction
   (`file_types.py:66-70`) and cannot transport a ZIP's binary bytes at all.
 - **Not a change to single-document upload.** `POST /v1/documents` and
-  `intake_document` are called BY the archive path per member, unchanged;
-  nothing about a standalone upload's behavior differs after this ADR.
+  `intake_document`'s own source are called BY the archive path per member,
+  unmodified; nothing about a standalone upload's behavior differs after
+  this ADR. What IS new is the calling loop's handling of that function's
+  existing exceptions (§5) — a new caller's new branches, not a change to
+  the callee.
+- **Not an async job.** Intake stays synchronous, request-scoped, with
+  bounded member concurrency (§6) — not an accept-then-poll redesign.
 
 ## Consequences
 
-- `intake_document` gains exactly one new caller (the archive expansion
-  loop) and zero new branches — the dedup, storage, pending-row, and MQ-publish
-  logic a member goes through is the same code, same tests, same failure
-  modes as a standalone upload.
+- `intake_document`'s own source gains exactly one new caller (the archive
+  expansion loop) and is not modified — the dedup, storage, pending-row, and
+  MQ-publish logic a member goes through is the same code, same tests, same
+  failure modes as a standalone upload. The new branching is in the loop
+  that calls it (§5): catching `BadRequestError` as a content-level skip and
+  `ServiceUnavailableError` as an infra-level, loop-aborting failure.
 - The #110 fencing/supersede mechanism gets its guarantees exercised at
   higher volume (up to 500 concurrent member workflows per archive) but not
   extended — its existing test suite (`test_reindex_fencing.py`) is the
-  correctness bar a re-uploaded archive must clear, not a new one.
-- New schema surface: `archive_uploads` (new table) and
-  `processed_documents.parent_archive_id` (new nullable column), both
-  additive migrations, filed as follow-up issues below.
+  correctness bar a re-uploaded archive must clear, not a new one. Most
+  re-uploaded members never reach it at all (§3): the identical-content
+  short-circuit means an unchanged member publishes nothing.
+- New schema surface: `archive_uploads` and `archive_members` (two new
+  tables; no new column on `processed_documents`), additive migrations,
+  filed as follow-up issues below. The join table, not a single foreign key,
+  is required because a member can belong to more than one archive (§4).
 - New failure-parity obligation: the archive intake path is a new upload
   surface and must be added to
   `services/inh-public-api-svc/tests/contract/test_failure_parity.py`
   (CLAUDE.md dual-surface rule) — though its only surface is REST, so parity
-  here means "the archive path's own failure branches (limit-exceeded,
-  S3-down, MQ-down per member) leave the same state/response pairing
-  `intake_document`'s existing branches already guarantee," not a
-  REST/MCP comparison.
+  here means the archive path's own three failure branches (limit-exceeded
+  at intake with no `archive_uploads` row yet, a per-member `BadRequestError`
+  routed to `skipped_members`, and a per-member `ServiceUnavailableError`
+  routed to `failed_at_intake_members` and aborting the loop) each leave the
+  state/response pairing §5 specifies — not a REST/MCP comparison.
 - Operators get a bounded, auditable answer to "why didn't file X in my ZIP
-  show up": `skipped_members` names it and says why, and a `partial` archive
-  status makes a member-level failure visible without forcing a re-upload of
-  the whole bundle.
+  show up": every path in the archive resolves to exactly one of admitted
+  (`archive_members`), `skipped_members`, or `failed_at_intake_members` —
+  never silently absent — and a `partial` archive status makes a
+  post-enqueue member failure visible without forcing a re-upload of the
+  whole bundle.
+- **Known, accepted gaps, not silently deferred:** no archive-level
+  completion timestamp without adding `max(processed_at)` to the rollup
+  query and wiring `processed_at` into public-api-svc's `DatabaseService`
+  (§4); a deleted member's effect on a fully-deleted archive's derived
+  status is a best-effort default, not a reconstruction of history (§4);
+  registered `FILE_TYPE_REGISTRY` extensions do not yet cover the
+  Context section's own code-repo-export motivating example (§8, expected to
+  close as sibling extractor issues land); synchronous per-member intake
+  latency is bounded by the 500-member cap and bounded concurrency, not
+  eliminated (§6).
 - **Revisit when:** a real caller needs nested archives, needs MCP-surfaced
-  archive upload, or member counts/sizes routinely approach the v1 limits —
-  each is a scoped follow-up against this ADR's decisions, not a reason to
-  reopen the fan-out/dedup/fencing model itself.
+  archive upload, member counts/sizes routinely approach the v1 limits, or
+  the accepted gaps above start causing real operator confusion — each is a
+  scoped follow-up against this ADR's decisions, not a reason to reopen the
+  fan-out/dedup/fencing model itself.
 
 ## Follow-up issues
 
-- #186 — `archive_uploads` table + `processed_documents.parent_archive_id` migration.
+- #186 — `archive_uploads` + `archive_members` migration.
 - #187 — `FILE_TYPE_REGISTRY` container support (`zip` entry) + member classification helper.
-- #188 — `POST /v1/archives`: intake, limits, member fan-out through `intake_document`.
-- #189 — `GET /v1/archives/{archive_id}`: derived status rollup.
+- #188 — `POST /v1/archives`: bounded-concurrency intake, limits (incl. bounded-reader decompression), per-member skip/fail-at-intake classification, member fan-out through `intake_document`.
+- #189 — `GET /v1/archives/{archive_id}`: derived status rollup over `archive_members`, including the empty-admitted-set and deleted-member rules.
