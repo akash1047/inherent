@@ -157,6 +157,13 @@ All notable changes to Inherent are documented here. The format follows
   `inh-public-api-svc` (DB access is async-only via `asyncpg`; no circuit
   breaker or sync driver is imported), and `packaging` from
   `inh-ingestion-svc` (not imported anywhere). No behavior change.
+- **Dead `PLAN_RATE_LIMITS` pricing-tier constant removed** from
+  `inh-public-api-svc/src/config/constants.py` (and its `config/__init__`
+  re-export). It hardcoded commercial plan pricing (`starter`/`pro`/`team`/
+  `enterprise`, `$149`–`$2K+`/month) that this OSS repo has no billing system
+  for and that was read nowhere — per-key limits come from `ApiKey.rate_limit`
+  (default `DEFAULT_RATE_LIMIT`/`RATE_LIMIT_DEFAULT`). No behavior change
+  (#151).
 
 ## [0.5.0] — 2026-07-13
 

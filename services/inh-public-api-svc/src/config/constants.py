@@ -5,15 +5,7 @@ from typing import Final, Literal
 # API version
 API_VERSION: Final[str] = "v1"
 
-# Rate limits by pricing tier (requests per minute)
-PLAN_RATE_LIMITS: Final[dict[str, int]] = {
-    "starter": 100,  # $149/month
-    "pro": 500,  # $349/month
-    "team": 2000,  # $799/month
-    "enterprise": 10000,  # $2K+/month
-}
-
-# Default rate limit for keys without tier info
+# Default rate limit for keys without an explicit limit (see ApiKey.rate_limit)
 DEFAULT_RATE_LIMIT: Final[int] = 100
 
 # Rate limit window in seconds
