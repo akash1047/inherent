@@ -112,6 +112,55 @@ All notable changes to Inherent are documented here. The format follows
   `AWS_S3_REGION` changes its S3 signing region on upgrade (`nbg1` /
   `eu-central-1` → `us-east-1`); set the var explicitly before upgrading if
   your bucket lives elsewhere.
+- **⚠️ BREAKING (behavior) — re-indexing a document while its prior ingestion
+  workflow was still open stalled ~10min instead of completing (#110).**
+  `DocumentIngestionWorkflow` is started with a fixed id
+  (`ingest-{document_id}`) so status queries can address a run by
+  document_id. A re-index/refresh enqueued while the prior run for that
+  document_id was still open (edited-content re-upload, or the
+  `/documents/{id}/refresh` endpoint under load) collided on that id:
+  Temporal's default `id_conflict_policy` raised `WorkflowAlreadyStartedError`,
+  which propagated out of the MQ handler
+  (`TemporalWorkflowTrigger.trigger_workflow_async`,
+  `services/inh-ingestion-svc/src/temporal/trigger.py`) so the message was
+  never ACKed. Every `RedisMQService` redelivery hit the same still-open run
+  and failed again, so the caller waited out however long the stale run took
+  to close on its own (~10min observed in CI run 29222060795 — not a fixed
+  timeout). The MQ upload/refresh path now passes
+  `id_conflict_policy=WorkflowIDConflictPolicy.TERMINATE_EXISTING`, so a
+  fresh re-index/refresh always supersedes a stale in-flight run instead of
+  colliding with it — the newest content wins immediately instead of after a
+  stall. **This changes two caller-visible behaviors**: (1) rapid successive
+  re-index/refresh requests for the same document now mean only the LAST one
+  completes — an in-flight ingestion can be terminated by an unrelated
+  actor's re-index/refresh for the same document, where previously both ran
+  to completion in sequence; (2) `POST /ingest?wait=true` can now return
+  `409 {"status": "superseded_by_newer_request"}` if a concurrent
+  upload/refresh for the same document terminates the run it was waiting on,
+  where previously that call always blocked until its own run finished.
+  Termination does not stop an already-dispatched Temporal ACTIVITY (only the
+  workflow) — a fencing token (`processed_documents.active_run_id`, migration
+  016) on the store activities stops a superseded run's late write from
+  clobbering the newer run's already-committed content; a dead-letter retry
+  (`POST /dead-letter/{id}/retry`) deliberately keeps the OLD
+  reject-on-collision behavior instead, since it may be replaying stale
+  content. A background sweep (`worker.py::_periodic_staging_cleanup`, every
+  15 min) now also cleans `ingestion_staging` rows a terminated run orphans,
+  since termination skips the workflow's own cleanup step. The claim itself
+  (`create_pending_document`) is ordered by each run's Temporal start time
+  (`active_run_claimed_at`, migration 017), not by which claim write commits
+  last — otherwise an earlier-starting, terminated run's still-in-flight
+  claim could land after, and overwrite, a later-starting run's claim,
+  fencing the legitimate newest run out of its own store step (found in
+  follow-up review). `update_document_status` is fenced the same way, so a
+  terminated run's stale status write can't leave `status='processing'`
+  stuck forever on a document whose content is otherwise correct.
+  **Upgrade:** run migrations `016_active_run_fencing.sql` and
+  `017_active_run_claim_ordering.sql` (`scripts/migrations/`, applied
+  automatically by `postgres-init` / `run_migrations.sh`) before deploying —
+  the store and status-write activities depend on the `active_run_id` /
+  `active_run_claimed_at` columns existing. No configuration changes
+  required.
 
 - **Retrieval-eval baseline ratchet silently never ran (#139 follow-up).**
   `eval-baseline-ratchet` pushed its ratchet commit straight to `main`, but

@@ -189,7 +189,10 @@ class FakeWorkflowModule:
         return datetime.now(UTC)
 
     def info(self):
-        return SimpleNamespace(run_id="run-1")
+        # start_time (#110 follow-up): the real workflow.info().start_time is
+        # used to make the fencing claim monotonic (see
+        # DocumentIngestionWorkflow.run / DatabaseService.create_pending_document).
+        return SimpleNamespace(run_id="run-1", start_time=datetime.now(UTC))
 
     def execute_activity(self, activity_fn, arg, **kwargs):
         name = getattr(activity_fn, "__name__", str(activity_fn))

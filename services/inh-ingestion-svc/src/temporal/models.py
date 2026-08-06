@@ -11,6 +11,7 @@ and avoids the 4MB Temporal limit.
 """
 
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Literal
 
 
@@ -246,11 +247,24 @@ class StoreDocumentInput:
 
 @dataclass
 class StoreDocumentOutput:
-    """Output from store_document activities."""
+    """Output from store_document activities.
+
+    superseded (#110): True when this activity's write was skipped because
+    active_run_id no longer matched workflow_run_id -- a newer workflow run
+    claimed the document in the meantime (TERMINATE_EXISTING supersession,
+    see src/services/database.py::store_processed_document). Distinct from a
+    plain success=False: this is not an error to retry or dead-letter, it is
+    the fencing check working as intended. The workflow that owns this
+    activity call has, by definition, already been terminated by the time
+    this can happen, so nothing acts on the distinction at the call site
+    today -- it exists for observability (logs/metrics) and so tests can
+    assert the fenced path was taken rather than a genuine failure.
+    """
 
     success: bool
     chunks_stored: int
     error: str | None = None
+    superseded: bool = False
 
 
 @dataclass
@@ -260,12 +274,20 @@ class SetDocumentStatusInput:
     Used to write best-effort 'processing'/'failed' status transitions
     during the workflow. ``status`` is a plain string ("processing",
     "failed", etc.) so it serializes cleanly across Temporal's gRPC.
+
+    workflow_run_id (#110 follow-up): fences this write the same way the
+    store activities are fenced (DatabaseService.update_document_status) --
+    a terminated (superseded) run's in-flight status write must not be able
+    to land after a newer run finished and leave status='processing' with no
+    self-heal. Optional so a caller without a run context (none exist today,
+    but keeps the DB method's signature backward compatible) still works.
     """
 
     document_id: str
     workspace_id: str
     status: str
     error_message: str | None = None
+    workflow_run_id: str | None = None
 
 
 @dataclass
@@ -286,11 +308,23 @@ class UpdateStatsInput:
 
 @dataclass
 class CreatePendingDocumentInput:
-    """Input for the create_pending_document activity (#10).
+    """Input for the create_pending_document activity (#10, #110).
 
     Creates a minimal 'processing' processed_documents row at workflow start so
     a failure during fetch/extract/chunk is observable via the status API
     instead of returning 'not found'. The store step later upserts the full row.
+
+    workflow_run_id (#110): also claims the document's fencing token (see
+    DatabaseService.create_pending_document / migration 016) so a later
+    store commit from a DIFFERENT, superseded run for the same document_id
+    can detect it's been superseded and skip its write instead of clobbering
+    this run's content.
+
+    workflow_start_time (#110 follow-up, migration 017): this run's Temporal
+    start time (workflow.info().start_time -- deterministic, safe inside
+    @workflow.run), used to make the claim monotonic in START order rather
+    than commit order. See DatabaseService.create_pending_document's
+    docstring for the failure this closes.
     """
 
     document_id: str
@@ -302,6 +336,8 @@ class CreatePendingDocumentInput:
     size_bytes: int
     storage_backend: str
     storage_path: str
+    workflow_run_id: str
+    workflow_start_time: datetime
     storage_bucket: str | None = None
     storage_url: str | None = None
 

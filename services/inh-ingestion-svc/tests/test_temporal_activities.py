@@ -287,10 +287,13 @@ class TestSetDocumentStatusActivity:
         )
 
         assert result is True
+        # workflow_run_id defaults to None (unfenced) when the caller doesn't
+        # supply one -- the real workflow always supplies it (#110 follow-up).
         mock_db.update_document_status.assert_awaited_once_with(
             document_id="doc_1",
             status=DocumentStatus.PROCESSING,
             error_message=None,
+            workflow_run_id=None,
         )
 
     @patch("src.temporal.shared_services.get_db_service")
@@ -317,6 +320,37 @@ class TestSetDocumentStatusActivity:
             document_id="doc_1",
             status=DocumentStatus.FAILED,
             error_message="boom",
+            workflow_run_id=None,
+        )
+
+    @patch("src.temporal.shared_services.get_db_service")
+    @pytest.mark.asyncio
+    async def test_set_status_forwards_workflow_run_id_for_fencing(self, mock_get_db):
+        """(#110 follow-up) When the caller supplies workflow_run_id (the
+        real workflow always does), it must reach update_document_status so
+        the write is fenced -- a terminated run's stale status write must
+        not be able to land after a newer run finished."""
+        from src.services.database import DocumentStatus
+        from src.temporal.activities.status import set_document_status
+
+        mock_db = MagicMock()
+        mock_db.update_document_status = AsyncMock(return_value=True)
+        mock_get_db.return_value = mock_db
+
+        await set_document_status(
+            SetDocumentStatusInput(
+                document_id="doc_1",
+                workspace_id="ws_1",
+                status="processing",
+                workflow_run_id="run-xyz",
+            )
+        )
+
+        mock_db.update_document_status.assert_awaited_once_with(
+            document_id="doc_1",
+            status=DocumentStatus.PROCESSING,
+            error_message=None,
+            workflow_run_id="run-xyz",
         )
 
     @patch("src.temporal.shared_services.get_db_service")
@@ -396,6 +430,9 @@ class TestStoreInWeaviateReindex:
 
         mock_db = MagicMock()
         mock_db.record_ingestion_event = AsyncMock(return_value=None)
+        # (#110) fencing pre-check must pass so the test's actual concern
+        # (delete-before-store ordering) is reached at all.
+        mock_db.is_active_run = AsyncMock(return_value=True)
         mock_get_db.return_value = mock_db
 
         result = await store_in_weaviate(self._store_input())
@@ -444,6 +481,9 @@ class TestStoreInWeaviateReindex:
 
         mock_db = MagicMock()
         mock_db.record_ingestion_event = AsyncMock(return_value=None)
+        # (#110) fencing pre-check must pass so the test's actual concern
+        # (delete-unavailable still proceeds to store) is reached at all.
+        mock_db.is_active_run = AsyncMock(return_value=True)
         mock_get_db.return_value = mock_db
 
         result = await store_in_weaviate(self._store_input())
@@ -536,6 +576,9 @@ class TestStoreAndTenantRaiseOnFailure:
 
         mock_db = MagicMock()
         mock_db.record_ingestion_event = AsyncMock(return_value=None)
+        # (#110) fencing pre-check must pass so the test reaches the actual
+        # store call whose failure it's asserting on.
+        mock_db.is_active_run = AsyncMock(return_value=True)
         mock_get_db.return_value = mock_db
 
         with pytest.raises(RuntimeError, match="weaviate 503"):
@@ -575,6 +618,147 @@ class TestStoreAndTenantRaiseOnFailure:
                 )
         # Failure lineage still recorded before re-raising.
         mock_db.record_ingestion_event.assert_awaited()
+
+
+# =========================================================================
+# Superseded-run handling (#110 blocker 1)
+# =========================================================================
+#
+# When a fenced write is rejected (a newer workflow run has since claimed
+# the document -- see DatabaseService.store_processed_document /
+# is_active_run), the store activities must return normally with
+# StoreDocumentOutput(success=False, superseded=True) rather than raise.
+# Raising would trigger Temporal's RetryPolicy to retry an outcome that can
+# never change (the newer run's claim doesn't go away), and by the time this
+# happens the owning workflow has typically already been terminated anyway,
+# so nothing is listening for a retry to matter.
+
+
+class TestStoreActivitiesSupersededHandling:
+    def _store_input(self):
+        return StoreDocumentInput(
+            workflow_run_id="wf_stale",
+            document_id="doc_1",
+            workspace_id="ws_1",
+            user_id="user_1",
+            filename="f.txt",
+            original_filename="f.txt",
+            content_type="text/plain",
+            size_bytes=10,
+            storage_backend="local",
+            storage_path="storage/f.txt",
+            text_length=10,
+            processing_time_ms=5,
+        )
+
+    def _one_chunk(self):
+        return [
+            {
+                "document_id": "doc_1",
+                "content": "chunk text",
+                "chunk_index": 0,
+                "start_char": 0,
+                "end_char": 10,
+            }
+        ]
+
+    @patch("src.temporal.shared_services.get_db_service")
+    @patch("src.temporal.shared_services.get_staging_service")
+    @pytest.mark.asyncio
+    async def test_store_in_postgresql_returns_superseded_without_raising(
+        self, mock_get_staging, mock_get_db
+    ):
+        """store_processed_document returning None (fenced out) must produce
+        a normal, non-raising StoreDocumentOutput(superseded=True) -- NOT an
+        exception (which would trigger a pointless RetryPolicy retry, #110)."""
+        from src.temporal.activities.store import store_in_postgresql
+
+        mock_staging = MagicMock()
+        mock_staging.read_chunks.return_value = self._one_chunk()
+        mock_get_staging.return_value = mock_staging
+
+        mock_db = MagicMock()
+        mock_db.store_processed_document = AsyncMock(return_value=None)  # fenced out
+        mock_db.record_ingestion_event = AsyncMock(return_value=None)
+        mock_get_db.return_value = mock_db
+
+        result = await store_in_postgresql(self._store_input())
+
+        assert result.success is False
+        assert result.superseded is True
+        assert result.error == "superseded_by_newer_workflow_run"
+        # Lineage still recorded, as "superseded" not "failed" -- this is
+        # not an error condition, just a benign no-op.
+        mock_db.record_ingestion_event.assert_awaited_once()
+        assert mock_db.record_ingestion_event.await_args.kwargs["status"] == "superseded"
+
+    @patch("src.temporal.shared_services.get_db_service")
+    @patch("src.temporal.shared_services.get_weaviate_service")
+    @patch("src.temporal.shared_services.get_staging_service")
+    @pytest.mark.asyncio
+    async def test_store_in_weaviate_skips_write_when_fenced_out(
+        self, mock_get_staging, mock_get_weaviate, mock_get_db
+    ):
+        """is_active_run() returning False must skip the destructive
+        delete+write entirely -- this is the check that narrows Weaviate's
+        TOCTOU window (it has no transactional WHERE-on-write like
+        Postgres's conditional UPSERT)."""
+        from src.temporal.activities.store import store_in_weaviate
+
+        mock_staging = MagicMock()
+        mock_staging.read_chunks.return_value = self._one_chunk()
+        mock_get_staging.return_value = mock_staging
+
+        weaviate = MagicMock()
+        weaviate.is_connected.return_value = True
+        weaviate.delete_document_chunks_graceful = AsyncMock(return_value=(True, 0))
+        weaviate.store_chunks_with_tenant = AsyncMock(return_value=None)
+        mock_get_weaviate.return_value = weaviate
+
+        mock_db = MagicMock()
+        mock_db.is_active_run = AsyncMock(return_value=False)  # fenced out
+        mock_db.record_ingestion_event = AsyncMock(return_value=None)
+        mock_get_db.return_value = mock_db
+
+        result = await store_in_weaviate(self._store_input())
+
+        assert result.success is False
+        assert result.superseded is True
+        # The whole point: neither the delete nor the write happened.
+        weaviate.delete_document_chunks_graceful.assert_not_awaited()
+        weaviate.store_chunks_with_tenant.assert_not_awaited()
+
+    @patch("src.temporal.shared_services.get_db_service")
+    @patch("src.temporal.shared_services.get_weaviate_service")
+    @patch("src.temporal.shared_services.get_staging_service")
+    @pytest.mark.asyncio
+    async def test_store_in_weaviate_proceeds_when_not_fenced_out(
+        self, mock_get_staging, mock_get_weaviate, mock_get_db
+    ):
+        """Sanity check for the happy path: is_active_run() True (the
+        normal, non-superseded case) must not block the write."""
+        from src.temporal.activities.store import store_in_weaviate
+
+        mock_staging = MagicMock()
+        mock_staging.read_chunks.return_value = self._one_chunk()
+        mock_get_staging.return_value = mock_staging
+
+        weaviate = MagicMock()
+        weaviate.is_connected.return_value = True
+        weaviate.delete_document_chunks_graceful = AsyncMock(return_value=(True, 0))
+        weaviate.store_chunks_with_tenant = AsyncMock(return_value=None)
+        mock_get_weaviate.return_value = weaviate
+
+        mock_db = MagicMock()
+        mock_db.is_active_run = AsyncMock(return_value=True)
+        mock_db.record_ingestion_event = AsyncMock(return_value=None)
+        mock_get_db.return_value = mock_db
+
+        result = await store_in_weaviate(self._store_input())
+
+        assert result.success is True
+        assert result.superseded is False
+        weaviate.store_chunks_with_tenant.assert_awaited_once()
 
 
 # =========================================================================

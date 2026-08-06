@@ -390,3 +390,117 @@ class TestSyncTriggerWorkflowMemoIntegration:
             "connection_id": "conn_123",
             "sync_id": "sync_456",
         }
+
+
+# Workflow-id-collision supersession tests (#110)
+# ---------------------------------------------------------------------------
+#
+# Both start_workflow call sites use a *fixed* id (f"ingest-{document_id}").
+# Before this fix, a re-index enqueued while the prior run for that
+# document_id was still open raised WorkflowAlreadyStartedError with the
+# default id_conflict_policy (UNSPECIFIED). On the async (MQ) path that
+# exception propagates out of trigger_workflow_async, so the message is never
+# ACKed; RedisMQService only retries it once XAUTOCLAIM reclaims it (idle >=
+# 30s, see src/services/mq/redis_mq.py:46) — and only after a *new* message
+# also arrives, since the reclaim call is skipped whenever a poll iteration
+# reads no fresh entries (redis_mq.py:216-233). Every retry collides with the
+# same still-open run and fails again, so the caller effectively waits out
+# however long the stale run takes to close on its own — the ~10min observed
+# in CI run 29222060795, not a fixed timeout constant.
+#
+# Fix: pass id_conflict_policy=TERMINATE_EXISTING so Temporal supersedes the
+# stale run with the fresh one at start time instead of raising. This is the
+# right call for an AI-agent caller that will retry: re-index/refresh always
+# means "the current content should win", so terminating a stale run in
+# favor of a fresh one is correct, not a race to avoid — and it turns the
+# ~10 minute stall into a normal, fast run.
+
+
+class TestWorkflowIdConflictPolicySupersedesStaleRun:
+    """A re-index/refresh under an open prior run must supersede it, not
+    collide and stall (#110)."""
+
+    def _ready_trigger(self):
+        """Trigger with a mocked Temporal client whose start_workflow succeeds
+        and whose handle resolves to a completed WorkflowResult."""
+        settings = _make_settings()
+        trigger = TemporalWorkflowTrigger(settings)
+        trigger._initialized = True
+        trigger._client = MagicMock()
+
+        handle = MagicMock()
+        handle.result = AsyncMock(
+            return_value=MagicMock(
+                document_id="test_doc_12345",
+                success=True,
+                chunks_created=1,
+                error=None,
+                processing_time_ms=1,
+            )
+        )
+        trigger._client.start_workflow = AsyncMock(return_value=handle)
+        return trigger
+
+    @pytest.mark.asyncio
+    async def test_async_trigger_passes_terminate_existing_conflict_policy(
+        self, sample_upload_message
+    ):
+        """trigger_workflow_async (the MQ-driven re-index/refresh path) must
+        ask Temporal to terminate-and-supersede a same-id run in flight,
+        instead of relying on the default (raise) behavior."""
+        from temporalio.common import WorkflowIDConflictPolicy
+
+        trigger = self._ready_trigger()
+
+        await trigger.trigger_workflow_async(sample_upload_message)
+
+        _, kwargs = trigger._client.start_workflow.call_args
+        assert kwargs.get("id_conflict_policy") == WorkflowIDConflictPolicy.TERMINATE_EXISTING
+
+    @pytest.mark.asyncio
+    async def test_sync_trigger_passes_terminate_existing_conflict_policy(
+        self, sample_upload_message
+    ):
+        """trigger_workflow (the blocking twin) carries the same fixed-id
+        exposure and must use the same supersession policy."""
+        from temporalio.common import WorkflowIDConflictPolicy
+
+        trigger = self._ready_trigger()
+
+        await trigger.trigger_workflow(sample_upload_message)
+
+        _, kwargs = trigger._client.start_workflow.call_args
+        assert kwargs.get("id_conflict_policy") == WorkflowIDConflictPolicy.TERMINATE_EXISTING
+
+    @pytest.mark.asyncio
+    async def test_async_trigger_supersedes_a_still_open_prior_run(
+        self, sample_upload_message
+    ):
+        """Behavioral regression guard for the actual stall (#110).
+
+        Fakes the real Temporal server contract: a start_workflow call for an
+        id with an open run raises WorkflowAlreadyStartedError *unless* the
+        caller opted into conflict resolution via
+        id_conflict_policy=TERMINATE_EXISTING, in which case the server
+        terminates the stale run and starts the new one instead of raising.
+        This fails against the pre-fix code (no id_conflict_policy kwarg ->
+        the fake raises, same as the real server) and passes once the fix
+        sets it -- unlike a mock that always succeeds, this actually exercises
+        the collision branch that caused the MQ redelivery stall."""
+        from temporalio.common import WorkflowIDConflictPolicy
+        from temporalio.exceptions import WorkflowAlreadyStartedError
+
+        trigger = self._ready_trigger()
+
+        async def fake_start_workflow(*args, **kwargs):
+            if kwargs.get("id_conflict_policy") != WorkflowIDConflictPolicy.TERMINATE_EXISTING:
+                raise WorkflowAlreadyStartedError(kwargs["id"], "test-run-id")
+            return MagicMock()
+
+        trigger._client.start_workflow = AsyncMock(side_effect=fake_start_workflow)
+
+        # Must resolve fast with the new run's id, not raise and leave the
+        # MQ message unacked for redelivery.
+        workflow_id = await trigger.trigger_workflow_async(sample_upload_message)
+
+        assert workflow_id == "ingest-test_doc_12345"
