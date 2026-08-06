@@ -142,11 +142,13 @@ dev-seed: bootstrap
 ## check: Run validation, lint, formatting, typing, security checks, and tests.
 check: validate lint format-check type-check security-check test
 
-## test: Run tests for both services.
+## test: Run tests for both services, inh-contracts, and the root-level suite.
 test:
 	@cd $(INGESTION_DIR) && uv run pytest
 	@cd $(PUBLIC_API_DIR) && uv run pytest
 	@cd $(CONTRACTS_DIR) && uv run pytest
+	@echo "==> root tests/ (repo-level pins, e.g. Postgres init -- #183)"
+	@uvx 'pytest==9.0.2' tests/ -q
 
 ## test-fast: Fast offline unit profile for both services (no compose/slow/benchmark).
 ##            inh-contracts has no such markers, so it always runs in full --

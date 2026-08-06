@@ -1,11 +1,17 @@
 # Testing
 
 This repository is a monorepo of three Python packages, each with its own test
-suite and `pytest` configuration:
+suite and `pytest` configuration, plus a small root-level suite for artifacts
+that don't belong to any one package:
 
 - `services/inh-public-api-svc` — customer-facing API + MCP server
 - `services/inh-ingestion-svc` — document ingestion service
 - `services/inh-contracts` — shared event + naming contracts
+- `tests/` (repo root) — pins repo-level artifacts (e.g. `docker-compose.yml`'s
+  Postgres init behavior, the initial migration in
+  `services/inh-ingestion-svc/scripts/migrations/`). No project dependencies
+  (stdlib only), so it isn't part of any service's `uv sync` — run it via
+  `uvx 'pytest==9.0.2' tests/` or `make test` (#183).
 
 Every test command below assumes you have synced dev dependencies first:
 
@@ -57,7 +63,7 @@ uv run pytest -m 'not compose'
 Repo-wide shortcut:
 
 ```bash
-make test             # pytest for both services
+make test             # pytest for both services, inh-contracts, and root tests/
 ```
 
 ### End-to-end / Compose
