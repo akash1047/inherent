@@ -37,9 +37,9 @@ from src.models.document import Document
 from src.services.auth import (
     ResolvedAuth,
     _resolve_workspace,
-    resolve_workspace_read,
     get_api_key_info,
     get_write_permission,
+    resolve_workspace_read,
     resolve_workspace_write,
 )
 from src.services.database import get_database
