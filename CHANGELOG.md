@@ -226,12 +226,18 @@ All notable changes to Inherent are documented here. The format follows
 - **Two more cross-service config defaults single-sourced: bucket name and
   mongodb_uri (#176).** Same drift shape #132 fixed for the S3 region:
   `inh-ingestion-svc`'s `storage_bucket` defaulted to `""` while
-  `inh-public-api-svc`'s `aws_s3_bucket` defaulted to `"inherent-documents"`
-  — a deployment setting neither `STORAGE_BUCKET` nor `AWS_S3_BUCKET` had
-  ingestion writing to an empty bucket name while public-api read from
-  `"inherent-documents"`. Both now default from the shared
-  `inh_contracts.defaults.DEFAULT_S3_BUCKET` (`"inherent-documents"`) —
-  ingestion's default changes from `""` to that value. Both services'
+  `inh-public-api-svc`'s `aws_s3_bucket` defaulted to `"inherent-documents"`.
+  Public-api is the writer (it stamps its own bucket into both the DB row
+  and the MQ upload payload); ingestion only reads (`BaseStorageBackend`
+  exposes `read_file`/`file_exists`/`get_size`, no write path), falling back
+  to its own `storage_bucket` default only for a bucket-less event. So the
+  empty default didn't misdirect a write — it made ingestion unable to
+  resolve ANY bucket for such an event, raising `RuntimeError("No bucket
+  specified")` and leaving the document stuck `failed`. Both now default
+  from the shared `inh_contracts.defaults.DEFAULT_S3_BUCKET`
+  (`"inherent-documents"`) — ingestion's default changes from `""` to that
+  value, so a bucket-less event now resolves instead of failing. Both
+  services'
   `mongodb_uri` defaults (`.../27017` vs `.../27017/main`) are now also
   single-sourced (`DEFAULT_MONGODB_URI`, no path segment); functionally a
   no-op either way since both services select the database explicitly via
@@ -350,14 +356,14 @@ All notable changes to Inherent are documented here. The format follows
 
 ### Fixed
 
-- **⚠️ BREAKING (config) — `HEALTH_CHECK_TIMEOUT_SECONDS` was declared but
-  had zero call sites; setting it silently did nothing (#203).**
-  `inh-public-api-svc`'s `/health/ready` endpoint read hardcoded
-  `DATABASE_HEALTH_CHECK_TIMEOUT` / `WEAVIATE_HEALTH_CHECK_TIMEOUT`
-  constants instead of `settings.health_check_timeout_seconds` — an operator
-  raising the timeout to stop a liveness/readiness probe from flapping
-  against a slow Postgres or Weaviate changed nothing; the probe kept timing
-  out at the hardcoded 5.0s. Replaced with two independent knobs,
+- **`HEALTH_CHECK_TIMEOUT_SECONDS` was declared but had zero call sites;
+  setting it silently did nothing (#203).** `inh-public-api-svc`'s
+  `/health/ready` endpoint read hardcoded `DATABASE_HEALTH_CHECK_TIMEOUT` /
+  `WEAVIATE_HEALTH_CHECK_TIMEOUT` constants instead of
+  `settings.health_check_timeout_seconds` — an operator raising the timeout
+  to stop a liveness/readiness probe from flapping against a slow Postgres
+  or Weaviate changed nothing; the probe kept timing out at the hardcoded
+  5.0s. Replaced with two independent knobs,
   `database_health_check_timeout_seconds` (env
   `DATABASE_HEALTH_CHECK_TIMEOUT_SECONDS`) and
   `weaviate_health_check_timeout_seconds` (env
@@ -366,16 +372,16 @@ All notable changes to Inherent are documented here. The format follows
   dependencies as having different latency tolerances (100ms vs 500ms
   "high latency" thresholds; Weaviate vector search is expected to be
   slower), so one shared timeout would force one dependency's probe to
-  inherit the other's budget. Both default to `5.0` (unchanged behavior at
-  the shipped default). Also fixes a deeper instance of the same defect
-  found while wiring this up: `SearchService.is_connected()` hardcoded its
-  own 5.0s `httpx` timeout independently of the wait_for wrapping it in
-  `health.py`, so raising the new Weaviate setting above 5.0 still would not
-  have worked — it now accepts and is passed the configured timeout.
-  **Upgrade:** replace `HEALTH_CHECK_TIMEOUT_SECONDS` in `.env` /
-  deployment config with `DATABASE_HEALTH_CHECK_TIMEOUT_SECONDS` and
-  `WEAVIATE_HEALTH_CHECK_TIMEOUT_SECONDS` if you had set it to a non-default
-  value — the old var is no longer read.
+  inherit the other's budget. No behavior change: both new knobs default to
+  `5.0`, identical to the two constants they replace, and the removed
+  `HEALTH_CHECK_TIMEOUT_SECONDS` had no reader to begin with (both
+  services' `model_config` uses `extra="ignore"`, so a value an operator had
+  set for it is silently dropped, not an error). Also fixes a deeper
+  instance of the same defect found while wiring this up:
+  `SearchService.is_connected()` hardcoded its own 5.0s `httpx` timeout
+  independently of the `wait_for` wrapping it in `health.py`, so raising the
+  new Weaviate setting above 5.0 still would not have worked; `timeout` is
+  now a required parameter the caller must supply explicitly.
 - **⚠️ BREAKING (deploy) — S3 region default drift between inh-ingestion-svc
   and inh-public-api-svc (#132).** public-api's `AWS_S3_REGION` defaulted to
   `eu-central-1` while ingestion's `AWS_REGION` defaulted to `nbg1` (a Hetzner

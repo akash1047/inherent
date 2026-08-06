@@ -185,7 +185,7 @@ def test_health_endpoints_read_settings_not_hardcoded_constants() -> None:
     assert "settings.weaviate_health_check_timeout_seconds" in source
 
 
-def test_weaviate_is_connected_accepts_an_explicit_timeout_param() -> None:
+def test_weaviate_is_connected_requires_an_explicit_timeout_param() -> None:
     """#203 (deeper instance): SearchService.is_connected must take a timeout arg.
 
     ``asyncio.wait_for(search_service.is_connected(), timeout=...)`` alone
@@ -196,6 +196,13 @@ def test_weaviate_is_connected_accepts_an_explicit_timeout_param() -> None:
     #203 exists to fix, just one call deeper than the constant it started
     from. See ``tests/unit/test_health_readiness.py`` for the behavioral test
     that the configured value actually reaches the call.
+
+    The parameter must have NO default. A default (even one that happens to
+    equal the current shipped 5.0) is itself a third copy of the health-check
+    timeout: any future caller that forgets the kwarg silently falls back to
+    a hardcoded literal instead of erroring, reintroducing this exact defect
+    one layer down. Requiring it makes that mistake fail loudly (TypeError)
+    instead of silently.
     """
     import inspect
 
@@ -203,3 +210,4 @@ def test_weaviate_is_connected_accepts_an_explicit_timeout_param() -> None:
 
     sig = inspect.signature(SearchService.is_connected)
     assert "timeout" in sig.parameters
+    assert sig.parameters["timeout"].default is inspect.Parameter.empty

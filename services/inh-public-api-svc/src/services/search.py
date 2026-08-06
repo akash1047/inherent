@@ -186,18 +186,21 @@ class SearchService:
             finally:
                 self._client = None
 
-    async def is_connected(self, timeout: float = 5.0) -> bool:
+    async def is_connected(self, timeout: float) -> bool:
         """Check if Weaviate is reachable.
 
         Args:
             timeout: Per-request timeout (seconds) for the readiness call.
-                Defaults to 5.0 for callers that don't care, but the health
-                endpoint (the only real caller) passes
-                ``settings.weaviate_health_check_timeout_seconds`` explicitly
-                (#203) -- without an explicit param here, an operator raising
-                that setting would still be capped by this method's own
-                internal timeout, which is exactly the "setting is accepted
-                but ignored" defect #203 exists to fix.
+                REQUIRED, not defaulted -- this used to hardcode its own 5.0s
+                fallback, a third copy of the health-check timeout alongside
+                the two `constants.py` used to carry (#203). A default here
+                would silently reintroduce exactly that: any future caller
+                that omits the kwarg gets a hardcoded value instead of an
+                error, so an operator's configured
+                ``WEAVIATE_HEALTH_CHECK_TIMEOUT_SECONDS`` would again not
+                reach this call. The one real caller
+                (``api/v1/health.py::_check_weaviate``) always passes
+                ``settings.weaviate_health_check_timeout_seconds`` explicitly.
         """
         try:
             client = await self._get_client()

@@ -203,12 +203,9 @@ Consumed by compose interpolation or upstream images, not the Python services:
 ## Not configurable via environment
 
 Hard-coded in `services/inh-public-api-svc/src/config/constants.py` (change
-requires a code change): max upload size (50 MB), allowed MIME types,
-search/pagination bounds. Per-key rate limits are set on the `ApiKey` record
-itself (`rate_limit`, default 100 — see `RATE_LIMIT_DEFAULT` above), not via
-a plan/tier table.
-requires a code change): plan rate limits (starter 100 / pro 500 / team 2000 /
-enterprise 10000), max upload size (50 MB), search/pagination bounds.
+requires a code change): max upload size (50 MB), search/pagination bounds.
+Per-key rate limits are set on the `ApiKey` record itself (`rate_limit`,
+default 100 — see `RATE_LIMIT_DEFAULT` above), not via a plan/tier table.
 Allowed MIME types are derived from the
 [file-type registry](file-types.md) (`services/inh-contracts`) rather than
 hard-coded in `constants.py` directly — add a format there, not here.
