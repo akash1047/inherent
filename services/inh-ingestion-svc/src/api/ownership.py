@@ -46,10 +46,27 @@ exact cross-tenant harvesting the #177 fix was supposed to close. Every
 ``require_workspace_id`` FIRST, which rejects blank/whitespace-only values
 at the boundary -- see that function's own docstring for the full story and
 why this is a SEPARATE check from "does workspace_id own this row".
+
+#210: ``POST /ingest`` was scoped OUT of #175/#177 on the reasoning that it
+is "a creation endpoint with nothing to own yet" -- true of the ROW
+(``processed_documents`` doesn't have one until this request creates it),
+false of the OBJECT the request names. The pipeline fetches whatever bytes
+live at the caller-supplied ``storage_path`` and files the result into the
+caller-supplied ``workspace_id`` with no check that the two are related, so
+a caller holding the one shared ``INGESTION_API_KEY`` can pair a victim's
+``storage_path`` with their OWN ``workspace_id`` and read the victim's
+document afterwards through their own legitimate key. There is no row to
+resolve this against (see the other two functions below) --
+``require_storage_path_workspace_prefix`` checks the one thing that IS
+knowable up front: the storage layout is workspace-prefixed, so
+``storage_path`` must name the claimed workspace as its own path prefix.
+That is necessary, not sufficient -- see that function's docstring for what
+it does NOT prove.
 """
 
 from __future__ import annotations
 
+import posixpath
 from typing import Any
 
 import structlog
@@ -204,3 +221,101 @@ async def resolve_owned_dead_letter_job(
             detail=f"Dead-letter job {job_id} not found in workspace {workspace_id}.",
         )
     return job
+
+
+def require_storage_path_workspace_prefix(storage_path: str, workspace_id: str) -> str:
+    """Verify a caller-supplied ``storage_path`` names an object under the
+    claimed ``workspace_id`` before ``POST /ingest`` ever reads it (#210).
+
+    ``POST /ingest`` is the one route in this module with no existing
+    ``processed_documents`` row to resolve ownership against -- it CREATES
+    that row. That is exactly the reasoning #175/#177 used to scope this
+    route out ("a creation endpoint with nothing to own yet"), and exactly
+    what makes that reasoning wrong: the endpoint doesn't just create a row,
+    it READS an object the caller names. Without this check, a caller
+    holding the single shared ``INGESTION_API_KEY`` can submit another
+    tenant's ``storage_path`` next to their OWN ``workspace_id``; the
+    pipeline fetches those bytes, extracts, chunks, embeds, and files the
+    result into the attacker's own Weaviate tenant -- readable afterwards
+    through their own legitimate key, via ordinary search.
+
+    The storage layout is workspace-prefixed, so this checks that
+    ``storage_path``'s first meaningful path segment IS ``workspace_id``.
+    Two prefix conventions are both live in this codebase and both accepted:
+    ``workspaces/{workspace_id}/...`` (the historical intg-svc/GCS layout --
+    see ``inh_contracts.events.DocumentUploadMessage``'s example, and this
+    module's own callers in ``tests/test_api.py``) and ``{workspace_id}/...``
+    (``inh-public-api-svc``'s current ``StorageService.generate_key``, which
+    drops the ``workspaces/`` literal). ``storage_path`` is normalized with
+    ``posixpath.normpath`` FIRST so a ``..`` component can't nominally
+    satisfy the prefix check while actually resolving elsewhere (e.g.
+    ``workspaces/attacker/../victim/f.pdf`` collapses to
+    ``workspaces/victim/f.pdf`` before the prefix is read off it, so it's
+    correctly rejected against a claimed ``workspace_id`` of ``attacker``).
+
+    NOT tenant-safety -- say this explicitly wherever this function's result
+    is relied on (route docstrings, CHANGELOG, code review), because #210
+    was filed precisely because the opposite claim ("scoped out, nothing to
+    own") was made about this route once already. ``verify_api_key`` has no
+    key->workspace binding (#177): every tenant presents the identical
+    secret, so this proves ``storage_path`` is CONSISTENT with the
+    ``workspace_id`` the caller CLAIMS, never that the caller is ENTITLED to
+    claim that ``workspace_id``. A caller who knows (or guesses) a genuine
+    ``workspaces/{victim}/...`` path can still pair it with
+    ``workspace_id={victim}`` and pass this check -- only the key->workspace
+    binding tracked as the #177 follow-up closes that. Until then this route
+    must not be described as tenant-safe.
+
+    Deliberately no try/except: this is a pure, in-process string check with
+    no I/O, so there is nothing here that can fail closed OR open -- but it
+    is written match-or-deny like ``resolve_owned_document`` /
+    ``resolve_owned_dead_letter_job`` above for the same reason: a caller
+    that fails this check gets denied, never silently let through because
+    something downstream couldn't be reached.
+
+    Args:
+        storage_path: The raw, caller-supplied storage path.
+        workspace_id: The raw, caller-supplied workspace_id claimed for this
+            ingestion. Validated via ``require_workspace_id`` first -- a
+            blank/whitespace-only claim is rejected before the path is even
+            looked at, same boundary-first posture as the other two
+            functions in this module.
+
+    Returns:
+        The stripped, validated workspace_id (never the raw caller value --
+        matches the pattern every other resolver in this module follows).
+
+    Raises:
+        HTTPException: 422 if ``workspace_id`` is blank/whitespace-only.
+            403 if ``storage_path``, once normalized, is not prefixed by
+            ``workspace_id`` (optionally after a literal ``workspaces/``
+            component).
+    """
+    workspace_id = require_workspace_id(workspace_id)
+
+    # Collapse ".."/"."/redundant slashes BEFORE reading off the prefix, so a
+    # nominally-matching first segment can't smuggle a traversal past this
+    # check (see docstring example). posixpath.normpath never touches the
+    # filesystem -- pure string manipulation, safe to run unconditionally.
+    normalized = posixpath.normpath((storage_path or "").strip().lstrip("/"))
+    segments = [] if normalized in ("", ".") else normalized.split("/")
+    if segments and segments[0] == "workspaces":
+        segments = segments[1:]
+    prefix = segments[0] if segments else None
+
+    if prefix != workspace_id:
+        # Denial visibility -- see resolve_owned_document's identical comment.
+        # storage_path is caller-supplied and already known to the caller
+        # (it's their own request body), so logging it carries no existence
+        # leak the way document_id/job_id lookups above have to avoid.
+        logger.warning(
+            "workspace_access_denied",
+            reason="storage_path_workspace_mismatch",
+            requested_workspace_id=workspace_id,
+            storage_path=storage_path,
+        )
+        raise HTTPException(
+            status_code=403,
+            detail=f"storage_path does not belong to workspace {workspace_id}.",
+        )
+    return workspace_id

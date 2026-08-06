@@ -278,6 +278,100 @@ class TestIngestTrigger:
         )
         assert resp.status_code == 422
 
+    # -------------------------------------------------------------------
+    # Security (#210): storage_path must belong to the claimed workspace_id.
+    # See tests/test_ingestion_ownership.py::TestRequireStoragePathWorkspacePrefix
+    # for the underlying helper's full matrix; these pin the check is
+    # actually WIRED into this route (a passing unit test for the helper
+    # proves nothing if the route never calls it).
+    # -------------------------------------------------------------------
+
+    def test_cross_tenant_storage_path_rejected_with_403(self, client: TestClient):
+        """The #210 exploit payload end-to-end: attacker's own workspace_id
+        paired with a victim's genuine storage_path. Must 403 and never
+        reach Temporal -- start_workflow must not be called at all."""
+        payload = {
+            **_INGEST_PAYLOAD,
+            "workspace_id": "ws_attacker",
+            "storage_path": "workspaces/ws_victim/secret.pdf",
+        }
+        resp = client.post(
+            "/ingest",
+            json=payload,
+            headers={"X-API-Key": VALID_API_KEY},
+        )
+        assert resp.status_code == 403
+        client._mock_temporal_client.start_workflow.assert_not_called()
+
+    def test_own_storage_path_still_accepted(self, client: TestClient):
+        """Sanity check on the fix: a genuinely-owned storage_path (the
+        happy path every other test in this class exercises) must keep
+        working -- the fix is a mismatch check, not a blanket new
+        restriction."""
+        resp = client.post(
+            "/ingest",
+            json=_INGEST_PAYLOAD,
+            headers={"X-API-Key": VALID_API_KEY},
+        )
+        assert resp.status_code == 202
+        client._mock_temporal_client.start_workflow.assert_called_once()
+
+    def test_bare_workspace_prefix_convention_also_accepted(self, client: TestClient):
+        """inh-public-api-svc's current StorageService.generate_key layout
+        (no 'workspaces/' literal) must be accepted too -- the check isn't
+        hardcoded to one historical layout."""
+        payload = {
+            **_INGEST_PAYLOAD,
+            "storage_path": "ws_001/550e8400-e29b/document.pdf",
+        }
+        resp = client.post(
+            "/ingest",
+            json=payload,
+            headers={"X-API-Key": VALID_API_KEY},
+        )
+        assert resp.status_code == 202
+
+    def test_blank_workspace_id_rejected_with_422(self, client: TestClient):
+        payload = {**_INGEST_PAYLOAD, "workspace_id": "   "}
+        resp = client.post(
+            "/ingest",
+            json=payload,
+            headers={"X-API-Key": VALID_API_KEY},
+        )
+        assert resp.status_code == 422
+        client._mock_temporal_client.start_workflow.assert_not_called()
+
+    def test_empty_workspace_id_rejected_with_422(self, client: TestClient):
+        """Field(..., min_length=1) layer: a fully-empty workspace_id must
+        be rejected at the Pydantic boundary before ownership.py even runs
+        (falsy-vs-absent trap -- Field(...) alone enforces PRESENCE, not
+        non-emptiness)."""
+        payload = {**_INGEST_PAYLOAD, "workspace_id": ""}
+        resp = client.post(
+            "/ingest",
+            json=payload,
+            headers={"X-API-Key": VALID_API_KEY},
+        )
+        assert resp.status_code == 422
+        client._mock_temporal_client.start_workflow.assert_not_called()
+
+    # -------------------------------------------------------------------
+    # #178: workflow starts from this route must carry the source memo.
+    # -------------------------------------------------------------------
+
+    def test_workflow_start_carries_api_direct_source_memo(self, client: TestClient):
+        """POST /ingest is inherently a direct/manual trigger -- no
+        connector to attribute it to -- so it carries a hardcoded
+        source='api-direct' memo, consistent with the trigger.py MQ-path
+        convention (#141) rather than showing no memo at all."""
+        client.post(
+            "/ingest",
+            json=_INGEST_PAYLOAD,
+            headers={"X-API-Key": VALID_API_KEY},
+        )
+        _, kwargs = client._mock_temporal_client.start_workflow.call_args
+        assert kwargs["memo"] == {"source": "api-direct"}
+
 
 # ---------------------------------------------------------------------------
 # Status Tests

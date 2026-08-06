@@ -657,6 +657,13 @@ Use when you need to re-ingest a file already in S3 without going through the up
 Ingestion runs as a Temporal workflow, so this endpoint is **asynchronous by default**: it returns
 **202 Accepted** immediately with a `workflow_id`. Poll progress with section 8.
 
+`storage_path` must be prefixed by this same request's `workspace_id`
+(`workspaces/{workspace_id}/...` or `{workspace_id}/...`) — **403** if it isn't (#210). This
+endpoint has no existing PostgreSQL row to check ownership against (it creates one), so it checks
+the one thing that IS knowable up front: that the two claims in the same request are consistent
+with each other. It does **not** prove the caller is entitled to `workspace_id` — `INGESTION_API_KEY`
+is one shared secret with no key-to-workspace binding (#177 follow-up).
+
 ```bash
 curl -s -X POST "$INGEST_BASE/ingest" \
   -H "X-API-Key: $INGEST_KEY" \
@@ -720,7 +727,8 @@ curl -s -X POST "$INGEST_BASE/ingest?wait=true" \
 }
 ```
 
-Returns **409** if a workflow is already running for this `document_id`, **503** if Temporal is unavailable.
+Returns **403** if `storage_path` isn't prefixed by `workspace_id` (#210), **409** if a workflow is
+already running for this `document_id`, **503** if Temporal is unavailable.
 
 ---
 

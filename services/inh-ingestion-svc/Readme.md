@@ -88,7 +88,7 @@ PostgreSQL and Weaviate. All protected routes authenticate with `X-API-Key: $ING
 |---|---|---|---|
 | `GET` | `/health` | none | Liveness + Temporal worker status |
 | `GET` | `/metrics` | none | Prometheus metrics |
-| `POST` | `/ingest` | yes | Trigger ingestion. Async: **202** + `workflow_id`; `?wait=true` → **200** result; **409** if already running |
+| `POST` | `/ingest` | yes | Trigger ingestion. Async: **202** + `workflow_id`; `?wait=true` → **200** result; **403** if `storage_path` isn't prefixed by this request's own `workspace_id` (#210 — consistency check, not caller entitlement, see #177); **409** if already running |
 | `GET` | `/ingest/{document_id}/status?workspace_id=` | yes | Real-time workflow progress (`step`, `progress`, `chunks_created`). 404 if `document_id` isn't owned by `workspace_id` (#177) |
 | `PATCH` | `/chunks/{document_id}/{chunk_index}?workspace_id=` | yes | Edit a chunk (updates PG + re-embeds in Weaviate). 404 if `document_id` isn't owned by `workspace_id` or `chunk_index` is out of range (#134); 500 if PG updated but the Weaviate re-embed didn't (recorded via `GET /lineage`) |
 | `DELETE` | `/documents/{document_id}?workspace_id=&user_id=` | yes | Delete a document from PG + Weaviate (best-effort). 404 if `document_id` isn't owned by `workspace_id` (#175) |

@@ -23,6 +23,7 @@ from temporalio.service import RPCError
 
 from src.api.auth import verify_api_key
 from src.api.ownership import (
+    require_storage_path_workspace_prefix,
     require_workspace_id,
     resolve_owned_dead_letter_job,
     resolve_owned_document,
@@ -35,10 +36,21 @@ from src.temporal.models import (
     DocumentIngestionInput,
     WorkflowResult,
 )
+from src.temporal.trigger import build_ingestion_source_memo
 from src.temporal.worker import TemporalWorkerManager
 from src.temporal.workflows import ChunkEditWorkflow, DocumentIngestionWorkflow
 
 logger = structlog.get_logger(__name__)
+
+# #178: POST /ingest is inherently a direct/manual trigger -- it has no
+# connector to attribute an ingestion to, unlike the MQ-driven paths in
+# trigger.py that carry a real source/connection_id/sync_id from the
+# upstream DocumentUploadMessage. Hardcoding this label (rather than adding
+# unused source/connection_id/sync_id fields to IngestRequest -- there is no
+# connector-provided value to put in them on this path) is the design
+# decision #178 asked for; see build_ingestion_source_memo's docstring for
+# why the memo SHAPE itself still comes from one shared function.
+_DIRECT_API_INGESTION_SOURCE = "api-direct"
 
 
 # =============================================================================
@@ -50,7 +62,15 @@ class IngestRequest(BaseModel):
     """Request body for triggering document ingestion."""
 
     document_id: str = Field(..., description="Unique document identifier")
-    workspace_id: str = Field(..., description="Workspace identifier")
+    # Security (#210): min_length=1 is layer 1 of the falsy-vs-absent fix --
+    # Field(...) alone enforces PRESENCE, not non-emptiness, so a bare
+    # `"workspace_id": ""` would otherwise slip past this model entirely and
+    # reach require_storage_path_workspace_prefix's internal
+    # require_workspace_id call as the FIRST line of defense instead of a
+    # cheap 422 at the boundary. Layer 2 (require_workspace_id, which also
+    # rejects whitespace-only) and layer 3 (require_storage_path_workspace_prefix
+    # itself raising, never silently widening) are in the route body below.
+    workspace_id: str = Field(..., min_length=1, description="Workspace identifier")
     user_id: str = Field(..., description="User who uploaded the document")
     filename: str = Field(..., description="Storage filename (generated)")
     original_filename: str = Field(..., description="Original filename from upload")
@@ -59,7 +79,7 @@ class IngestRequest(BaseModel):
     storage_backend: Literal["local", "s3", "gcs", "azure"] = Field(
         ..., description="Storage backend"
     )
-    storage_path: str = Field(..., description="Path to file in storage")
+    storage_path: str = Field(..., min_length=1, description="Path to file in storage")
     storage_bucket: str | None = Field(None, description="Storage bucket name")
     storage_url: str | None = Field(None, description="Direct URL to the file")
 
@@ -238,6 +258,13 @@ def create_app(settings: Settings) -> FastAPI:
         response_model=IngestAcceptedResponse,
         responses={
             200: {"model": IngestResultResponse, "description": "Completed (wait=true)"},
+            403: {
+                "description": (
+                    "storage_path does not belong to the claimed workspace_id (#210). "
+                    "NOT a tenant-entitlement check -- see IngestRequest.workspace_id's "
+                    "field description and CHANGELOG.md for the limitation this leaves."
+                )
+            },
             409: {
                 "description": (
                     "Workflow already running for this document, OR (wait=true only) "
@@ -258,14 +285,39 @@ def create_app(settings: Settings) -> FastAPI:
         By default returns **202 Accepted** immediately with the workflow ID.
         Pass `?wait=true` to block until the workflow finishes and receive
         the full result as a **200 OK** response.
+
+        Security (#210): before this fix, ``storage_path`` and
+        ``workspace_id`` were both caller-supplied with no check that either
+        one belonged to the other -- a caller holding the shared
+        ``INGESTION_API_KEY`` could pair a VICTIM's ``storage_path`` with
+        their OWN ``workspace_id`` and the pipeline would fetch, chunk,
+        embed, and file the victim's content into the attacker's own
+        tenant, readable afterwards through the attacker's own legitimate
+        key. There is no existing PostgreSQL row to resolve this against
+        (this endpoint CREATES one) -- see
+        ``src.api.ownership.require_storage_path_workspace_prefix`` for the
+        prefix check this route now runs first, and its docstring for what
+        this does NOT prove (``INGESTION_API_KEY`` has no key->workspace
+        binding, so this is workspace<->path CONSISTENCY, not caller
+        entitlement -- see #177, and CHANGELOG.md).
         """
         client: Client = request.app.state.temporal_client
         settings: Settings = request.app.state.settings
         task_queue: str = settings.temporal_task_queue
 
+        # Security (#210): verify storage_path is prefixed by the CLAIMED
+        # workspace_id before the pipeline ever reads it -- must run BEFORE
+        # DocumentIngestionInput/start_workflow, not after, since the whole
+        # point is to refuse dispatching the workflow at all on a mismatch.
+        # Returns the stripped/validated workspace_id; every field below
+        # uses THIS value, never body.workspace_id directly, matching the
+        # "never forward the raw caller value" pattern the other routes in
+        # this module already follow (see ownership.py).
+        workspace_id = require_storage_path_workspace_prefix(body.storage_path, body.workspace_id)
+
         workflow_input = DocumentIngestionInput(
             document_id=body.document_id,
-            workspace_id=body.workspace_id,
+            workspace_id=workspace_id,
             user_id=body.user_id,
             filename=body.filename,
             original_filename=body.original_filename,
@@ -286,6 +338,11 @@ def create_app(settings: Settings) -> FastAPI:
                 workflow_input,
                 id=workflow_id,
                 task_queue=task_queue,
+                # #178: this direct/manual trigger path had no memo at all
+                # pre-fix, unlike the two MQ-driven start sites #141 covered
+                # -- see _DIRECT_API_INGESTION_SOURCE's module-level comment
+                # for why the source is hardcoded rather than derived.
+                memo=build_ingestion_source_memo(source=_DIRECT_API_INGESTION_SOURCE),
             )
         except WorkflowAlreadyStartedError:
             logger.info("Workflow already running", workflow_id=workflow_id)

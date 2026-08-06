@@ -58,6 +58,7 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from src.api.ownership import (
+    require_storage_path_workspace_prefix,
     require_workspace_id,
     resolve_owned_dead_letter_job,
     resolve_owned_document,
@@ -217,6 +218,97 @@ class TestResolveOwnedDeadLetterJob:
             await resolve_owned_dead_letter_job(mock_db, 1, "   ")
         assert exc_info.value.status_code == 422
         mock_db.get_dead_letter_job.assert_not_called()
+
+
+class TestRequireStoragePathWorkspacePrefix:
+    """require_storage_path_workspace_prefix -- the #210 fix.
+
+    POST /ingest has no PostgreSQL row to resolve ownership against (it
+    CREATES the row), so unlike the two resolve_owned_* classes above this
+    checks a pure string invariant: storage_path's first path segment must
+    be workspace_id. Both layout conventions live in this codebase
+    (workspaces/{id}/... and {id}/...) and both must be accepted; a
+    mismatched, blank, or traversal-disguised path must be denied.
+    """
+
+    def test_workspaces_prefix_convention_allowed(self):
+        """The historical intg-svc/GCS layout: workspaces/{workspace_id}/...
+        (inh_contracts.events.DocumentUploadMessage's own example)."""
+        result = require_storage_path_workspace_prefix(
+            "workspaces/ws1/1234-document.pdf", "ws1"
+        )
+        assert result == "ws1"
+
+    def test_bare_workspace_id_prefix_convention_allowed(self):
+        """inh-public-api-svc's current StorageService.generate_key layout:
+        {workspace_id}/{uuid}/{filename}, no 'workspaces/' literal."""
+        result = require_storage_path_workspace_prefix(
+            "ws1/550e8400-e29b/document.pdf", "ws1"
+        )
+        assert result == "ws1"
+
+    def test_mismatched_workspace_prefix_denied(self):
+        """The core #210 exploit payload: attacker's own workspace_id paired
+        with a victim's genuine storage_path."""
+        with pytest.raises(HTTPException) as exc_info:
+            require_storage_path_workspace_prefix(
+                "workspaces/ws_victim/secret.pdf", "ws_attacker"
+            )
+        assert exc_info.value.status_code == 403
+
+    def test_mismatched_bare_prefix_denied(self):
+        with pytest.raises(HTTPException) as exc_info:
+            require_storage_path_workspace_prefix("ws_victim/uuid/secret.pdf", "ws_attacker")
+        assert exc_info.value.status_code == 403
+
+    def test_path_with_no_workspace_segment_at_all_denied(self):
+        """A storage_path that isn't workspace-prefixed at all (e.g. a
+        legacy/malformed value) must be denied, not treated as a wildcard
+        match -- there is no valid workspace_id it could equal by omission."""
+        with pytest.raises(HTTPException) as exc_info:
+            require_storage_path_workspace_prefix("document.pdf", "ws1")
+        assert exc_info.value.status_code == 403
+
+    def test_empty_storage_path_denied(self):
+        with pytest.raises(HTTPException) as exc_info:
+            require_storage_path_workspace_prefix("", "ws1")
+        assert exc_info.value.status_code == 403
+
+    def test_traversal_disguised_prefix_is_normalized_before_comparison(self):
+        """The nominal first segment is the CLAIMED workspace, but '..'
+        components make the path actually resolve into a DIFFERENT
+        workspace's subtree. posixpath.normpath must collapse this BEFORE
+        the prefix is read off, so the mismatch is still caught rather than
+        a traversal trick passing the check on the nominal segment alone."""
+        with pytest.raises(HTTPException) as exc_info:
+            require_storage_path_workspace_prefix(
+                "workspaces/ws_attacker/../ws_victim/secret.pdf", "ws_attacker"
+            )
+        assert exc_info.value.status_code == 403
+
+    def test_traversal_that_genuinely_resolves_into_claimed_workspace_allowed(self):
+        """The flip side of the traversal test above: '..' components that
+        collapse back into the CLAIMED workspace's own subtree are fine --
+        this function only cares about the final, normalized prefix."""
+        result = require_storage_path_workspace_prefix(
+            "workspaces/ws1/sub/../document.pdf", "ws1"
+        )
+        assert result == "ws1"
+
+    def test_blank_workspace_id_rejected_before_path_is_even_read(self):
+        """Same boundary-first posture as the two resolve_owned_* helpers:
+        a blank workspace_id claim is invalid regardless of what
+        storage_path says, and must 422 (not 403) to distinguish 'malformed
+        request' from 'mismatched but well-formed request'."""
+        with pytest.raises(HTTPException) as exc_info:
+            require_storage_path_workspace_prefix("workspaces/ws1/document.pdf", "   ")
+        assert exc_info.value.status_code == 422
+
+    def test_leading_slash_and_workspaces_prefix_both_tolerated(self):
+        """A caller-supplied leading '/' (e.g. '/workspaces/ws1/doc.pdf')
+        must not defeat the prefix match."""
+        result = require_storage_path_workspace_prefix("/workspaces/ws1/document.pdf", "ws1")
+        assert result == "ws1"
 
 
 # ---------------------------------------------------------------------------
