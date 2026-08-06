@@ -336,6 +336,39 @@ All notable changes to Inherent are documented here. The format follows
 
 ### Fixed
 
+- **PDF and JSON extractors retried deterministic (unfixable) failures 3x
+  (#195).** `_extract_pdf_text`/`_extract_json_text`
+  (`services/inh-ingestion-svc/src/temporal/activities/extract.py`) left
+  `pypdf.PdfReader`/page iteration and `json.loads` completely unwrapped — a
+  corrupt/truncated/password-protected PDF or malformed JSON upload raised
+  the library's raw exception directly, and Temporal's default 3-attempt
+  `RetryPolicy` retried it 3x before giving up on an outcome already known
+  at attempt 1 (the same defect the #118/#119 review fixed for XLSX/PPTX/
+  DOCX). Both now raise a non-retryable `ApplicationError` naming the likely
+  cause (corrupt/truncated/password-protected/wrong format), never leaking
+  the raw library exception into the document's `error_message` /
+  dead-letter row. Pattern sweep found the same defect, unfixed, in EPUB,
+  RTF, ODT, and SRT/WebVTT extraction — filed separately as #206 (out of
+  this issue's scope).
+- **MCP upload labelled every source-code file `text/x-python` when
+  `content_type` was omitted (#197).** `_default_upload_content_type`
+  (`services/inh-public-api-svc/src/mcp_server/server.py`) took
+  `spec.mime_types[0]` as "the" MIME type for a resolved spec — correct for
+  every format registered before #122, each of which describes exactly one
+  format, but the `code` spec (#122) pools 22 MIME aliases across 21
+  distinct languages under one registry entry, so `mime_types[0]` was always
+  `"text/x-python"` regardless of the real language: `app.js`, `lib.go`,
+  `Main.java`, `q.sql`, `s.sh`, and `x.rs` all resolved to `text/x-python`.
+  `inh_contracts.file_types.FileTypeSpec` gained a `mime_type_by_extension`
+  override (populated for the `code` spec only) and a
+  `mime_type_for_extension` helper that consults it, falling back to
+  `mime_types[0]` unchanged for every single-format spec. Functionally
+  harmless (every code MIME routes to the same extractor) but a wrong
+  language label on a retrieved code chunk is an integrity problem for an
+  agent citing search results. Pinned cross-surface in
+  `tests/contract/test_failure_parity.py::TestUploadCodeContentTypeLabelParity`
+  (REST's client-declared `Content-Type` and MCP's now-fixed default must
+  store the identical label for the same file).
 - **⚠️ BREAKING (deploy) — S3 region default drift between inh-ingestion-svc
   and inh-public-api-svc (#132).** public-api's `AWS_S3_REGION` defaulted to
   `eu-central-1` while ingestion's `AWS_REGION` defaulted to `nbg1` (a Hetzner

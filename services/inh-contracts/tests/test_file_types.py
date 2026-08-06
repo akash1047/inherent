@@ -27,6 +27,7 @@ from inh_contracts.file_types import (
     get_spec_for_mime,
     get_spec_for_upload,
     mcp_mime_types,
+    mime_type_for_extension,
     render_markdown_table,
     sniff_content_type,
 )
@@ -442,6 +443,123 @@ class TestSourceCodeSpec:
 
     def test_no_magic_signature(self):
         assert get_spec_by_key("code").magic is None
+
+
+# ---------------------------------------------------------------------------
+# #197: `mime_types[0]` is a fine stand-in for "the" MIME type of a spec that
+# describes exactly ONE format (every spec except "code") -- it is NOT a
+# stand-in for a SPECIFIC extension when a spec's `mime_types` is actually a
+# POOL of aliases spanning many distinct languages. Before this fix, every
+# code file uploaded over MCP with `content_type` omitted resolved to
+# `mime_types[0]` == "text/x-python" regardless of its real language --
+# verified in the issue: app.js, lib.go, Main.java, q.sql, s.sh, x.rs all
+# labelled "text/x-python". `mime_type_for_extension` is the fix: it
+# consults `FileTypeSpec.mime_type_by_extension` (a per-extension override,
+# populated only for the "code" spec) instead of blindly taking index 0.
+# ---------------------------------------------------------------------------
+
+
+class TestMimeTypeForExtension:
+    # The issue's own repro list, verbatim (#197 "Verified: app.js, lib.go,
+    # Main.java, q.sql, s.sh, x.rs all resolve to text/x-python"), plus one
+    # representative entry for every other registered extension so a future
+    # addition to the code spec can't silently reintroduce the bug for just
+    # the NEW extension while this test keeps passing for the old ones.
+    EXTENSION_TO_MIME = {
+        ".py": "text/x-python",
+        ".js": "text/javascript",
+        ".ts": "application/typescript",
+        ".tsx": "application/typescript",
+        ".jsx": "text/javascript",
+        ".go": "text/x-go",
+        ".java": "text/x-java-source",
+        ".rs": "text/x-rustsrc",
+        ".c": "text/x-csrc",
+        ".h": "text/x-chdr",
+        ".cpp": "text/x-c++src",
+        ".cs": "text/x-csharp",
+        ".rb": "text/x-ruby",
+        ".php": "text/x-php",
+        ".swift": "text/x-swift",
+        ".kt": "text/x-kotlin",
+        ".scala": "text/x-scala",
+        ".sh": "application/x-sh",
+        ".sql": "application/sql",
+        ".r": "text/x-r-source",
+        ".lua": "text/x-lua",
+    }
+
+    @pytest.mark.parametrize("extension,expected_mime", list(EXTENSION_TO_MIME.items()))
+    def test_code_extension_resolves_to_its_own_specific_mime(self, extension, expected_mime):
+        spec = get_spec_by_key("code")
+        assert mime_type_for_extension(spec, extension) == expected_mime
+
+    def test_go_file_no_longer_mislabelled_as_python(self):
+        """The exact regression named in the issue title."""
+        spec = get_spec_by_key("code")
+        assert mime_type_for_extension(spec, ".go") == "text/x-go"
+        assert mime_type_for_extension(spec, ".go") != "text/x-python"
+
+    def test_every_code_extension_has_an_override(self):
+        """The override map must cover every extension the spec declares --
+        a future extension added to `extensions` without a matching
+        `mime_type_by_extension` entry would silently fall back to
+        `mime_types[0]`, quietly reintroducing #197 for just that one new
+        extension."""
+        spec = get_spec_by_key("code")
+        assert spec.mime_type_by_extension is not None
+        for extension in spec.extensions:
+            assert extension in spec.mime_type_by_extension, (
+                f"{extension} has no mime_type_by_extension override"
+            )
+
+    def test_every_override_value_is_itself_an_accepted_alias(self):
+        """Every resolved MIME must still be one of the spec's own declared
+        `mime_types` -- the override narrows WHICH alias is canonical for a
+        given extension, it must never invent a value REST/MCP validation
+        would then reject if the caller declared it explicitly."""
+        spec = get_spec_by_key("code")
+        for extension in spec.extensions:
+            resolved = mime_type_for_extension(spec, extension)
+            assert resolved in spec.mime_types
+
+    def test_extension_without_leading_dot_is_tolerated(self):
+        """Matches `get_spec_for_extension`'s own with-or-without-dot
+        tolerance."""
+        spec = get_spec_by_key("code")
+        assert mime_type_for_extension(spec, "go") == mime_type_for_extension(spec, ".go")
+
+    def test_extension_is_case_insensitive(self):
+        spec = get_spec_by_key("code")
+        assert mime_type_for_extension(spec, ".GO") == "text/x-go"
+
+    def test_single_format_spec_falls_back_to_mime_types_zero(self):
+        """A spec with no override (every format except "code") keeps its
+        pre-#197 behaviour exactly: `mime_types[0]` unconditionally."""
+        pdf_spec = get_spec_by_key("pdf")
+        assert pdf_spec.mime_type_by_extension is None
+        assert mime_type_for_extension(pdf_spec, ".pdf") == pdf_spec.mime_types[0]
+
+    def test_unmapped_extension_on_a_multi_mime_spec_falls_back_to_index_zero(self):
+        """Defensive: an extension the spec DOES declare but whose override
+        map (hypothetically) omits it must not raise -- it degrades to the
+        pre-#197 behaviour for that one extension rather than crashing the
+        upload path."""
+        spec = get_spec_by_key("code")
+        assert spec.mime_type_by_extension is not None
+        trimmed = dict(spec.mime_type_by_extension)
+        trimmed.pop(".py")
+        stub = FileTypeSpec(
+            key="code-stub",
+            mime_types=spec.mime_types,
+            extensions=spec.extensions,
+            magic=None,
+            surfaces=spec.surfaces,
+            extractor=spec.extractor,
+            chunking_hint=spec.chunking_hint,
+            mime_type_by_extension=trimmed,
+        )
+        assert mime_type_for_extension(stub, ".py") == stub.mime_types[0]
 
 
 # ---------------------------------------------------------------------------

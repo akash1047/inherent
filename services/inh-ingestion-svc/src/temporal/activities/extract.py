@@ -209,10 +209,31 @@ def _extract_json_text(content: bytes) -> str:
 
     ``json.loads`` accepts bytes directly (auto-detecting UTF-8/16/32 via any
     BOM present, per the JSON spec), so this needs no separate decode step.
+
+    Raises:
+        ApplicationError (non_retryable=True): `content` is not valid JSON
+            (malformed syntax, or not JSON at all -- e.g. a mislabeled
+            upload reaching this extractor). Deterministic given fixed
+            `content` bytes -- retrying cannot change the outcome (#195,
+            same reasoning as the XLSX/PPTX/DOCX/PDF open failures in this
+            module), so this is non-retryable rather than burning
+            Temporal's default 3-attempt retry budget on a guaranteed-repeat
+            failure. `json.JSONDecodeError`'s own message is already clean
+            (no heap addresses, unlike python-docx's -- see
+            `_extract_docx_text`), so it is safe to include directly.
     """
     import json
 
-    data = json.loads(content)
+    try:
+        data = json.loads(content)
+    except json.JSONDecodeError as e:
+        raise ApplicationError(
+            f"JSON extraction failed: could not parse the document ({e}). "
+            f"The file may be corrupt, truncated, or not actually JSON "
+            f"despite its declared type.",
+            type="JsonParseFailed",
+            non_retryable=True,
+        ) from e
     return json.dumps(data, indent=2)
 
 
@@ -308,8 +329,26 @@ def _resolve_extractor(content_type: str, filename: str = "") -> Callable[[bytes
 def _extract_pdf_text(content: bytes) -> str:
     """Extract text from PDF content.
 
-    Raises on failure so Temporal retries the activity instead of
-    silently producing an empty document.
+    Deterministic given fixed `content` bytes -- retrying cannot change the
+    outcome, so both failure modes below raise a non-retryable
+    ``ApplicationError`` instead of a bare exception (#195, same reasoning
+    already applied to XLSX/PPTX/DOCX in this module -- see
+    `_extract_xlsx_text`/`_extract_pptx_text`/`_extract_docx_text`). Before
+    this fix, `pypdf.PdfReader(...)` and the page-iteration loop were
+    completely unwrapped: a corrupt/truncated/password-protected PDF raised
+    pypdf's raw exception type (``PdfReadError``, ``PdfStreamError``, ...)
+    directly, and Temporal's default 3-attempt RetryPolicy retried it 3x
+    before giving up on an outcome already known at attempt 1.
+
+    Raises:
+        ApplicationError (non_retryable=True): neither pypdf nor PyPDF2 is
+            installed (deterministic per worker/image -- retrying the same
+            build can never succeed), or pypdf can't open/read `content` at
+            all (corrupt/truncated bytes, password-protected file, or a
+            different binary format entirely reaching this extractor despite
+            its declared PDF type). One clear, actionable message either
+            way -- never a bare pypdf exception type leaking into the
+            document's ``error_message`` / dead-letter row.
     """
     try:
         import pypdf
@@ -317,15 +356,35 @@ def _extract_pdf_text(content: bytes) -> str:
         try:
             import PyPDF2 as pypdf  # type: ignore[no-redef]  # noqa: N813
         except ImportError:
-            raise RuntimeError("PDF extraction libraries not available (pypdf or PyPDF2)")
+            raise ApplicationError(
+                "PDF extraction libraries not available (pypdf or PyPDF2)",
+                type="MissingExtractionDependency",
+                non_retryable=True,
+            )
 
-    reader = pypdf.PdfReader(io.BytesIO(content))
-    text_parts = []
-    for page in reader.pages:
-        text = page.extract_text()
-        if text:
-            text_parts.append(text)
-    return "\n\n".join(text_parts)
+    try:
+        reader = pypdf.PdfReader(io.BytesIO(content))
+        text_parts = []
+        for page in reader.pages:
+            text = page.extract_text()
+            if text:
+                text_parts.append(text)
+        return "\n\n".join(text_parts)
+    except Exception as e:
+        # Covers corrupt/truncated PDFs (pypdf.errors.PdfReadError,
+        # PdfStreamError, EmptyFileError, ...), password-protected files
+        # (reading pages without decrypting raises), and any other "pypdf
+        # couldn't make sense of this" failure -- one clear message instead
+        # of a library-specific exception type leaking out, same contract as
+        # XLSX/PPTX's own open-failure wrapping above.
+        raise ApplicationError(
+            f"PDF extraction failed: could not read the document "
+            f"({type(e).__name__}: {e}). The file may be corrupt, truncated, "
+            f"password-protected, or not actually a PDF despite its "
+            f"declared type.",
+            type="PdfOpenFailed",
+            non_retryable=True,
+        ) from e
 
 
 def _extract_docx_text(content: bytes, filename: str = "") -> str:

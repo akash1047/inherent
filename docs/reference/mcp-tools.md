@@ -59,7 +59,11 @@ The `upload_document` accepted `content_type` set is the `surfaces` field of
 the [file-type registry](file-types.md) entries that include `mcp` — see that
 page for the full list of REST-only (binary) formats. Omitting
 `content_type` defaults to the type implied by `filename`'s extension when
-recognized, falling back to `text/markdown` otherwise (#117).
+recognized, falling back to `text/markdown` otherwise (#117). For an
+extension whose registry entry covers several distinct languages (source
+code — `.py`, `.go`, `.java`, ...), the default resolves to that specific
+extension's own MIME type, not a fixed first entry (#197: a `.go` upload
+with `content_type` omitted now defaults to `text/x-go`, not `text/x-python`).
 
 ## Notes
 
