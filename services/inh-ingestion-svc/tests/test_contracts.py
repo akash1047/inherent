@@ -40,7 +40,7 @@ CANONICAL_UPLOAD_KEYS_V1 = {
     "storage_url",
     "timestamp",
     "contract_version",
-    # Ingestion source labeling (#187) — additive, optional, backward compatible.
+    # Ingestion source labeling (inherent-systems/prime#187) — additive, optional, backward compatible.
     "source",
     "connection_id",
     "sync_id",

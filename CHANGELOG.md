@@ -11,15 +11,19 @@ All notable changes to Inherent are documented here. The format follows
   (#141).** `core.document.uploaded.v1` now optionally carries `source`
   (`connector:<provider>` | `public-api` | `manual`), `connection_id`, and
   `sync_id` (`inh_contracts.events.DocumentUploadMessage`, additive/backward
-  compatible — legacy messages without these fields still validate). Both
-  `TemporalWorkflowTrigger` start paths (`trigger_workflow`,
-  `trigger_workflow_async` in `services/inh-ingestion-svc/src/temporal/trigger.py`)
-  attach a Temporal memo built from these fields so the Temporal UI workflow
-  summary shows where an ingestion came from; a message with no `source`
-  memos as `"unknown"` rather than failing the start. Memo values are
-  length-capped (256 chars) so an oversized upstream field can't make the
-  workflow start itself fail. Memo only — no namespace search-attribute
-  registration required; workflow input itself is untouched.
+  compatible, `max_length=500` each — legacy messages without these fields
+  still validate; an oversized value is rejected as a validation error rather
+  than silently truncated, so it hits the existing poison/dead-letter path
+  instead of ever reaching Temporal). Both `TemporalWorkflowTrigger` start
+  paths (`trigger_workflow`, `trigger_workflow_async` in
+  `services/inh-ingestion-svc/src/temporal/trigger.py`) attach a Temporal
+  memo built from these fields so the Temporal UI workflow summary shows
+  where an ingestion came from; a message with no `source` memos as
+  `"unknown"` rather than failing the start. `inh-public-api-svc` (both the
+  REST upload route and the `upload_document` MCP tool — the only in-repo
+  publisher of this event) always sets `"source": "public-api"`. Memo only —
+  no namespace search-attribute registration required; workflow input itself
+  is untouched.
 
 - **Retrieval-eval hard gate, baseline ratcheting, and trend history (#139).**
   Implements the "v2" items ADR 0003 deferred (run-over-run regression deltas,

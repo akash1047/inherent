@@ -35,7 +35,7 @@ def _make_settings():
 
 def _make_upload_message(**overrides) -> DocumentUploadMessage:
     """Build a minimal valid DocumentUploadMessage, with overrides for the
-    ingestion-source fields under test (#187)."""
+    ingestion-source fields under test (inherent-systems/prime#187)."""
     base = {
         "event_type": "document.uploaded",
         "document_id": "doc-1",
@@ -249,12 +249,12 @@ class TestAsyncTriggerPoisonHandling:
 
 
 # ---------------------------------------------------------------------------
-# Ingestion-source Temporal memo tests (#187)
+# Ingestion-source Temporal memo tests (inherent-systems/prime#187)
 # ---------------------------------------------------------------------------
 
 
 class TestBuildSourceMemo:
-    """Unit tests for TemporalWorkflowTrigger._build_source_memo (#187).
+    """Unit tests for TemporalWorkflowTrigger._build_source_memo (inherent-systems/prime#187).
 
     Memo needs no namespace search-attribute registration and surfaces
     directly in the Temporal UI workflow summary panel.
@@ -283,8 +283,8 @@ class TestBuildSourceMemo:
         assert "sync_id" not in memo
 
     def test_legacy_message_without_source_defaults_to_unknown(self):
-        # Legacy/in-flight messages produced before #187 have no source field
-        # at all, which Pydantic leaves as None.
+        # Legacy/in-flight messages produced before inherent-systems/prime#187
+        # have no source field at all, which Pydantic leaves as None.
         upload_message = _make_upload_message()
         assert upload_message.source is None
 
@@ -292,32 +292,14 @@ class TestBuildSourceMemo:
 
         assert memo == {"source": "unknown"}
 
-    def test_oversized_source_is_truncated_not_passed_through(self):
-        """A pathologically large `source` (no max_length on the wire contract,
-        see inh_contracts.events.DocumentUploadMessage) must not reach Temporal
-        unbounded -- start_workflow would reject an oversized memo, and that
-        rejection is NOT classified as poison by trigger_workflow_async (only
-        PydanticValidationError is), so it would redeliver forever (#141
-        adversarial pass). Truncating client-side avoids that failure mode."""
-        huge_source = "connector:" + ("x" * 10_000)
-        upload_message = _make_upload_message(source=huge_source)
-
-        memo = TemporalWorkflowTrigger._build_source_memo(upload_message)
-
-        assert len(memo["source"]) == TemporalWorkflowTrigger._MEMO_VALUE_MAX_LEN
-        assert memo["source"] == huge_source[: TemporalWorkflowTrigger._MEMO_VALUE_MAX_LEN]
-
-    def test_oversized_connector_ids_are_truncated(self):
-        upload_message = _make_upload_message(
-            source="connector:notion",
-            connection_id="c" * 5_000,
-            sync_id="s" * 5_000,
-        )
-
-        memo = TemporalWorkflowTrigger._build_source_memo(upload_message)
-
-        assert len(memo["connection_id"]) == TemporalWorkflowTrigger._MEMO_VALUE_MAX_LEN
-        assert len(memo["sync_id"]) == TemporalWorkflowTrigger._MEMO_VALUE_MAX_LEN
+    # Oversized source/connection_id/sync_id handling (#141 adversarial pass)
+    # is NOT tested here: it is enforced by `max_length=500` on
+    # DocumentUploadMessage itself (services/inh-contracts, see
+    # test_oversized_source_fields_are_rejected in
+    # services/inh-contracts/tests/test_events.py), so an oversized value can
+    # never reach a valid `upload_message` for this method to build a memo
+    # from in the first place -- there is nothing for _build_source_memo to
+    # guard against.
 
 
 class TestTriggerWorkflowAsyncMemoIntegration:
@@ -360,10 +342,51 @@ class TestTriggerWorkflowAsyncMemoIntegration:
     @pytest.mark.asyncio
     async def test_legacy_message_without_source_passes_unknown_memo(self, sample_upload_message):
         # sample_upload_message has no "source" key at all — simulates an
-        # in-flight message produced before #187 shipped on the intg-svc side.
+        # in-flight message produced before inherent-systems/prime#187 shipped on the intg-svc side.
         trigger = self._ready_trigger()
 
         await trigger.trigger_workflow_async(sample_upload_message)
 
         _, kwargs = trigger._client.start_workflow.call_args
         assert kwargs["memo"] == {"source": "unknown"}
+
+
+class TestSyncTriggerWorkflowMemoIntegration:
+    """Verify trigger_workflow (the synchronous, wait-for-result path) also
+    threads the memo through to client.start_workflow (#141 follow-up: the
+    async-path test class above does not exercise this method, and deleting
+    only the async-path memo= line left this one uncovered).
+
+    trigger_workflow has no production caller today (grep confirms nothing
+    outside this test file and its own definition calls it) -- the MQ
+    consumer uses trigger_workflow_async exclusively. This test exists so the
+    memo stays correct here too if/when it grows a caller, not because it is
+    presently load-bearing.
+    """
+
+    def _ready_trigger(self) -> TemporalWorkflowTrigger:
+        from src.temporal.models import WorkflowResult
+
+        trigger = TemporalWorkflowTrigger(_make_settings())
+        trigger._initialized = True
+        trigger._mq_service = AsyncMock()
+        trigger._client = MagicMock()
+        handle = MagicMock()
+        handle.result = AsyncMock(return_value=WorkflowResult(document_id="doc-1", success=True))
+        trigger._client.start_workflow = AsyncMock(return_value=handle)
+        return trigger
+
+    @pytest.mark.asyncio
+    async def test_connector_sourced_message_passes_full_memo(
+        self, sample_upload_message_connector_sourced
+    ):
+        trigger = self._ready_trigger()
+
+        await trigger.trigger_workflow(sample_upload_message_connector_sourced)
+
+        _, kwargs = trigger._client.start_workflow.call_args
+        assert kwargs["memo"] == {
+            "source": "connector:notion",
+            "connection_id": "conn_123",
+            "sync_id": "sync_456",
+        }

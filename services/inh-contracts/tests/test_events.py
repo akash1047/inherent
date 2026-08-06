@@ -1,5 +1,8 @@
 """Event round-trip / contract tests for the shared event schemas (#17)."""
 
+import pytest
+from pydantic import ValidationError
+
 from inh_contracts.events import (
     CONTRACT_VERSION,
     DocumentCompletionMessage,
@@ -21,7 +24,8 @@ CANONICAL_UPLOAD_KEYS_V1 = {
     "storage_url",
     "timestamp",
     "contract_version",
-    # Ingestion source labeling (#187) — additive, optional, backward compatible.
+    # Ingestion source labeling (inherent-systems/prime#187) — additive,
+    # optional, backward compatible.
     "source",
     "connection_id",
     "sync_id",
@@ -83,7 +87,7 @@ def test_upload_event_unwraps_avro_union() -> None:
 
 
 def test_upload_event_without_source_defaults_to_none() -> None:
-    """Legacy/in-flight messages produced before #187 have no source field at
+    """Legacy/in-flight messages produced before inherent-systems/prime#187 have no source field at
     all — must still validate, with source/connection_id/sync_id all None."""
     event = _canonical_upload_event()
     del event["source"]
@@ -121,6 +125,21 @@ def test_upload_event_unwraps_avro_union_for_source_fields() -> None:
     assert msg.source == "connector:notion"
     assert msg.connection_id == "conn_123"
     assert msg.sync_id is None
+
+
+@pytest.mark.parametrize("field", ["source", "connection_id", "sync_id"])
+def test_oversized_source_fields_are_rejected(field: str) -> None:
+    """A pathologically oversized source/connection_id/sync_id must fail
+    validation (#141 adversarial pass) rather than being silently accepted
+    and later truncated downstream. Rejecting here means the ingestion-svc
+    trigger's existing PydanticValidationError -> dead-letter poison path
+    (see services/inh-ingestion-svc, #6) already handles it uniformly across
+    both trigger paths and every future consumer of this contract."""
+    event = _canonical_upload_event()
+    event[field] = "x" * 501  # one over max_length=500
+
+    with pytest.raises(ValidationError, match=field):
+        DocumentUploadMessage(**event)
 
 
 def test_completion_message_round_trip() -> None:

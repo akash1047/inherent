@@ -81,7 +81,7 @@ def sample_upload_message() -> dict:
 
 @pytest.fixture
 def sample_upload_message_connector_sourced() -> dict:
-    """Upload message from a connector sync (#187): source + connection/sync IDs."""
+    """Upload message from a connector sync (inherent-systems/prime#187): source + connection/sync IDs."""
     return {
         "event_type": "document.uploaded",
         "document_id": "test_doc_connector_001",
@@ -104,7 +104,7 @@ def sample_upload_message_connector_sourced() -> dict:
 
 @pytest.fixture
 def sample_upload_message_public_api() -> dict:
-    """Upload message from the public API (#187): source only, no connector IDs."""
+    """Upload message from the public API (inherent-systems/prime#187): source only, no connector IDs."""
     return {
         "event_type": "document.uploaded",
         "document_id": "test_doc_public_api_001",
