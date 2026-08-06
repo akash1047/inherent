@@ -170,8 +170,15 @@ All notable changes to Inherent are documented here. The format follows
   (`get_authorized_workspace_ids` in `src/services/auth.py`), which also
   fails CLOSED if a key's bound workspace is no longer owned by its user
   (e.g. deleted/transferred after the key was issued) instead of trusting a
-  stale binding. **Existing MCP callers using a workspace-scoped key may see
-  new errors**: a `workspace_id` argument naming a different (but
+  stale binding. This check is a MONGO-ONLY membership lookup
+  (`DatabaseService.user_owns_workspace_in_mongo`) — deliberately not the
+  broader `get_user_workspace_ids` (which unions Mongo with a Postgres
+  upload-history fallback and would keep granting access via that fallback's
+  stale rows for a workspace transferred away from its original owner); a
+  Mongo failure during this check now raises instead of silently granting or
+  denying, so a scoped key's requests error rather than bypass revocation
+  during a Mongo outage. **Existing MCP callers using a workspace-scoped key
+  may see new errors**: a `workspace_id` argument naming a different (but
   owner-owned) workspace now returns an `Error: ...` result instead of
   succeeding, with wording that now matches REST's (`API key is scoped to
   workspace 'X' and cannot access workspace 'Y'`) instead of a generic "you

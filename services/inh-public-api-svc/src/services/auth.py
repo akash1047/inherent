@@ -151,35 +151,40 @@ async def get_authorized_workspace_ids(
     shared by REST (``_resolve_workspace`` below) and MCP
     (``src/mcp_server/server.py``) so the two surfaces cannot drift.
 
-    Always consults ``database.get_user_workspace_ids`` — current ownership,
-    backed by Mongo (the canonical source, see ``database.py:770``) — even
-    for a workspace-scoped key (#138 blocker-2 follow-up). The first #138 cut
-    trusted ``key_info.workspace_id`` unconditionally for a scoped key, which
-    reopened a narrower hole: the Postgres ``api_keys`` row is not kept in
-    sync with Mongo, so if a workspace is deleted or transferred away from
-    the key's owner after the key was issued, the stale row's
-    ``workspace_id`` / ``status='active'`` never gets revoked and the key
-    would still be served that workspace. This costs one extra ownership
-    lookup per scoped-key request; correctness here outweighs it (the lookup
-    is a single indexed query, not a fan-out).
-
-    - A *workspace-scoped* key (``key_info.workspace_id`` set) is authorised
-      for AT MOST that one workspace, and only while its owner still owns
-      it — the INTERSECTION of the key's binding and current ownership. If
-      the owner no longer owns it, the key is authorised for NOTHING: fail
-      closed, never fall back to the user's other workspaces (that fallback
-      is exactly the scope-expansion #138 exists to prevent).
+    - A *workspace-scoped* key (``key_info.workspace_id`` set) is validated
+      against ``database.user_owns_workspace_in_mongo`` — a MONGO-ONLY
+      membership check (#138 blocker-2 fix) — NOT
+      ``database.get_user_workspace_ids``. The first #138 cut trusted
+      ``key_info.workspace_id`` unconditionally; the immediate follow-up
+      "fixed" that by intersecting it with ``get_user_workspace_ids``, but
+      that method UNIONS Mongo with a Postgres ``processed_documents``
+      fallback (any workspace the user has EVER ingested into), so a
+      workspace transferred away from the key's owner in Mongo kept being
+      served whenever the owner had ever uploaded to it — the realistic
+      case, since a workspace worth protecting has content. This costs one
+      extra Mongo round-trip per scoped-key request, on top of REST/MCP's
+      existing DB call; see ``user_owns_workspace_in_mongo`` for why it must
+      NOT fall back to the union, and why a Mongo failure here RAISES rather
+      than silently granting or denying (revocation must not silently stop
+      being enforced during an outage — this call is NOT wrapped in
+      try/except, so callers see the exception).
     - A *user-scoped* key (``workspace_id is None``) may act on every
-      workspace its owning user currently owns.
+      workspace its owning user currently owns, via
+      ``database.get_user_workspace_ids`` (Mongo UNION Postgres fallback) —
+      unchanged from before this fix. This is a listing convenience, not a
+      binding validation: these keys have no narrower claim than the user's
+      full set to begin with, so the union's "which workspaces might this
+      user plausibly reach" answer is the right question here, unlike for a
+      scoped key's binding above.
     """
-    owned = await database.get_user_workspace_ids(key_info.user_id)
     if key_info.workspace_id:
         # Truthy, not `is not None`: an empty-string workspace_id (no
         # issuance path produces one today) is treated as unscoped rather
         # than as a binding to "", matching _resolve_workspace's truthiness
         # checks elsewhere in this module (#138 follow-up).
-        return [key_info.workspace_id] if key_info.workspace_id in owned else []
-    return owned
+        owns = await database.user_owns_workspace_in_mongo(key_info.user_id, key_info.workspace_id)
+        return [key_info.workspace_id] if owns else []
+    return await database.get_user_workspace_ids(key_info.user_id)
 
 
 def describe_workspace_denial(key_info: APIKeyInfo, requested_workspace_id: str) -> str:
@@ -198,7 +203,12 @@ def describe_workspace_denial(key_info: APIKeyInfo, requested_workspace_id: str)
     generic "you don't have access" message, since there is no one workspace
     to point back to — the caller must consult its own owned set.
     """
-    if key_info.workspace_id is not None:
+    if key_info.workspace_id:
+        # Truthy, matching get_authorized_workspace_ids's and
+        # _resolve_workspace's checks (#138 follow-up): a "" workspace_id
+        # (no issuance path produces one) is treated as unscoped everywhere
+        # in this module, consistently — not "scoped to ''" in the message
+        # while every authorization site treats it as unscoped.
         return (
             f"API key is scoped to workspace '{key_info.workspace_id}' "
             f"and cannot access workspace '{requested_workspace_id}'"
