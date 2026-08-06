@@ -186,11 +186,25 @@ class SearchService:
             finally:
                 self._client = None
 
-    async def is_connected(self) -> bool:
-        """Check if Weaviate is reachable."""
+    async def is_connected(self, timeout: float) -> bool:
+        """Check if Weaviate is reachable.
+
+        Args:
+            timeout: Per-request timeout (seconds) for the readiness call.
+                REQUIRED, not defaulted -- this used to hardcode its own 5.0s
+                fallback, a third copy of the health-check timeout alongside
+                the two `constants.py` used to carry (#203). A default here
+                would silently reintroduce exactly that: any future caller
+                that omits the kwarg gets a hardcoded value instead of an
+                error, so an operator's configured
+                ``WEAVIATE_HEALTH_CHECK_TIMEOUT_SECONDS`` would again not
+                reach this call. The one real caller
+                (``api/v1/health.py::_check_weaviate``) always passes
+                ``settings.weaviate_health_check_timeout_seconds`` explicitly.
+        """
         try:
             client = await self._get_client()
-            response = await client.get("/v1/.well-known/ready", timeout=5.0)
+            response = await client.get("/v1/.well-known/ready", timeout=timeout)
             return response.status_code == 200
         except Exception:
             return False

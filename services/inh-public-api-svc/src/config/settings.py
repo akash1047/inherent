@@ -3,7 +3,7 @@
 from functools import lru_cache
 from typing import Literal
 
-from inh_contracts.defaults import DEFAULT_S3_REGION
+from inh_contracts.defaults import DEFAULT_MONGODB_URI, DEFAULT_S3_BUCKET, DEFAULT_S3_REGION
 from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -45,8 +45,14 @@ class Settings(BaseSettings):
     database_url: str = f"postgresql://postgres:postgres@localhost:5432/{DEFAULT_DATABASE_NAME}"
 
     # MongoDB (Read-only — for workspace ownership lookups; control-plane truth)
+    # Default: see inh_contracts.defaults.DEFAULT_MONGODB_URI (#176) -- the
+    # single source of truth shared with ingestion-svc's mongodb_uri field.
+    # The URI carries no database path segment on purpose: mongodb_db_name
+    # below is what actually selects the database (client[mongodb_db_name],
+    # see services/mongo_client.py), so the path is not a second source of
+    # truth that needs to independently agree with it.
     mongodb_uri: str = Field(
-        default="mongodb://localhost:27017/main",
+        default=DEFAULT_MONGODB_URI,
         alias="MONGODB_URI",
         description="MongoDB connection URI; reads workspaces collection for ownership checks",
     )
@@ -111,7 +117,9 @@ class Settings(BaseSettings):
     )
     aws_access_key_id: str = Field(default="", description="S3 access key ID")
     aws_secret_access_key: str = Field(default="", description="S3 secret access key")
-    aws_s3_bucket: str = Field(default="inherent-documents", description="S3 bucket for documents")
+    # Default: see inh_contracts.defaults.DEFAULT_S3_BUCKET (#176) -- the
+    # single source of truth shared with ingestion-svc's storage_bucket field.
+    aws_s3_bucket: str = Field(default=DEFAULT_S3_BUCKET, description="S3 bucket for documents")
     # Default: see inh_contracts.defaults.DEFAULT_S3_REGION (#132) -- the single
     # source of truth shared with ingestion-svc's s3_region field.
     #
@@ -327,8 +335,27 @@ class Settings(BaseSettings):
         """Parse the opt-out CSV into a set (whitespace/empty entries dropped)."""
         return {w.strip() for w in self.eval_capture_disabled_workspaces.split(",") if w.strip()}
 
-    # Health Checks
-    health_check_timeout_seconds: float = 5.0
+    # Health Checks (#203)
+    # Two independent knobs, not one: the readiness probe already treats
+    # Postgres and Weaviate as having different tolerances (see
+    # api/v1/health.py's 100ms-vs-500ms "high latency" thresholds -- Weaviate
+    # vector search is expected to be slower than a Postgres round-trip), so
+    # a shared single timeout would force one dependency's probe to inherit
+    # the other's budget. The previous single `health_check_timeout_seconds`
+    # knob was declared but had ZERO call sites -- health.py read hardcoded
+    # DATABASE_HEALTH_CHECK_TIMEOUT / WEAVIATE_HEALTH_CHECK_TIMEOUT constants
+    # instead, so setting it silently did nothing (#203). Deleted rather than
+    # kept alongside these two, to avoid leaving a second unread knob.
+    database_health_check_timeout_seconds: float = Field(
+        default=5.0,
+        alias="DATABASE_HEALTH_CHECK_TIMEOUT_SECONDS",
+        description="Timeout for the Postgres health-check query used by GET /health/ready",
+    )
+    weaviate_health_check_timeout_seconds: float = Field(
+        default=5.0,
+        alias="WEAVIATE_HEALTH_CHECK_TIMEOUT_SECONDS",
+        description="Timeout for the Weaviate health-check call used by GET /health/ready",
+    )
 
     # Audit Logging
     audit_log_enabled: bool = True

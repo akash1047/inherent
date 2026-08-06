@@ -33,12 +33,12 @@ and binds all datastore ports to `127.0.0.1`.
 | Variable | Default | Effect | Secret |
 | --- | --- | --- | --- |
 | `DATABASE_URL` | `postgresql://postgres:postgres@localhost:5432/knowledge_base` | PostgreSQL connection (reads + document/eval writes) | yes |
-| `MONGODB_URI` | `mongodb://localhost:27017/main` | Read-only Mongo for workspace/user ownership | yes |
+| `MONGODB_URI` | `mongodb://localhost:27017` | Read-only Mongo for workspace/user ownership. Path segment is not the source of truth for the database — `MONGODB_DB_NAME` is | yes |
 | `MONGODB_DB_NAME` | `main` | Mongo database name | no |
 | `WEAVIATE_URL` | unset | Full Weaviate URL; overrides host/port below | no |
 | `WEAVIATE_HOST` / `WEAVIATE_PORT` | `localhost` / `8080` | Weaviate address when `WEAVIATE_URL` unset | no |
 | `WEAVIATE_API_KEY` | unset | Bearer key for Weaviate auth (required by the release stack) | yes |
-| `AWS_S3_ENDPOINT` / `AWS_S3_BUCKET` / `AWS_S3_REGION` | `""` / `inherent-documents` / `us-east-1` | S3-compatible document storage. Region must match ingestion's `AWS_REGION` (#132) — `AWS_S3_REGION` overrides it here if set, but a lone `AWS_REGION` configures this service too | no |
+| `AWS_S3_ENDPOINT` / `AWS_S3_BUCKET` / `AWS_S3_REGION` | `""` / `inherent-documents` / `us-east-1` | S3-compatible document storage. Bucket must match ingestion's `STORAGE_BUCKET` (#176); region must match ingestion's `AWS_REGION` (#132) — `AWS_S3_REGION` overrides it here if set, but a lone `AWS_REGION` configures this service too | no |
 | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | `""` | S3 credentials | yes |
 
 ### MQ & rate limiting
@@ -87,7 +87,8 @@ and binds all datastore ports to `127.0.0.1`.
 | `CORS_ORIGINS` | inherent.systems origins | Allowed origins (wildcard in dev if unchanged) |
 | `CORS_ALLOW_CREDENTIALS` / `CORS_ALLOW_METHODS` / `CORS_ALLOW_HEADERS` | `true` / all standard / `*` | CORS details (credentials forced off with wildcard origin) |
 | `METRICS_ENABLED` / `METRICS_PATH` | `true` / `/metrics` | Prometheus endpoint |
-| `HEALTH_CHECK_TIMEOUT_SECONDS` | `5.0` | Dependency health-check timeout |
+| `DATABASE_HEALTH_CHECK_TIMEOUT_SECONDS` | `5.0` | Postgres health-check timeout, used by `GET /health/ready` (#203; replaces the dead `HEALTH_CHECK_TIMEOUT_SECONDS`) |
+| `WEAVIATE_HEALTH_CHECK_TIMEOUT_SECONDS` | `5.0` | Weaviate health-check timeout, used by `GET /health/ready` (#203; replaces the dead `HEALTH_CHECK_TIMEOUT_SECONDS`) |
 | `AUDIT_LOG_ENABLED` / `AUDIT_LOG_TOPIC` | `true` / `audit.log.write` | Audit logging + MQ topic |
 
 ## inh-ingestion-svc
@@ -111,7 +112,7 @@ and binds all datastore ports to `127.0.0.1`.
 | Variable | Default | Effect | Secret |
 | --- | --- | --- | --- |
 | `STORAGE_BACKEND` | `s3` | `s3` / `gcs` / `local` | no |
-| `STORAGE_BUCKET` | `""` | Bucket name | no |
+| `STORAGE_BUCKET` | `inherent-documents` | Bucket name; must match public-api's `AWS_S3_BUCKET` (#176) — mostly a fallback, since uploads carry their own bucket in the event payload | no |
 | `AWS_S3_ENDPOINT` / `AWS_REGION` | unset / `us-east-1` | S3-compatible endpoint + region. Region must match public-api's `AWS_S3_REGION` (#132) — public-api also reads this var directly | no |
 | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | unset | S3 credentials | yes |
 
@@ -202,12 +203,9 @@ Consumed by compose interpolation or upstream images, not the Python services:
 ## Not configurable via environment
 
 Hard-coded in `services/inh-public-api-svc/src/config/constants.py` (change
-requires a code change): max upload size (50 MB), allowed MIME types,
-search/pagination bounds. Per-key rate limits are set on the `ApiKey` record
-itself (`rate_limit`, default 100 — see `RATE_LIMIT_DEFAULT` above), not via
-a plan/tier table.
-requires a code change): plan rate limits (starter 100 / pro 500 / team 2000 /
-enterprise 10000), max upload size (50 MB), search/pagination bounds.
+requires a code change): max upload size (50 MB), search/pagination bounds.
+Per-key rate limits are set on the `ApiKey` record itself (`rate_limit`,
+default 100 — see `RATE_LIMIT_DEFAULT` above), not via a plan/tier table.
 Allowed MIME types are derived from the
 [file-type registry](file-types.md) (`services/inh-contracts`) rather than
 hard-coded in `constants.py` directly — add a format there, not here.

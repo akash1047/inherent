@@ -96,6 +96,10 @@ MIN_SEARCH_SCORE: Final[float] = 0.0
 MAX_PAGE_SIZE: Final[int] = 100
 DEFAULT_PAGE_SIZE: Final[int] = 20
 
-# Timeouts (in seconds)
-DATABASE_HEALTH_CHECK_TIMEOUT: Final[float] = 5.0
-WEAVIATE_HEALTH_CHECK_TIMEOUT: Final[float] = 5.0
+# Health-check timeouts (#203): moved to Settings
+# (database_health_check_timeout_seconds / weaviate_health_check_timeout_seconds)
+# so the operator-facing env vars actually reach the health endpoints. These
+# constants used to shadow that Settings field completely -- api/v1/health.py
+# read them instead, so the setting had zero call sites and setting it did
+# nothing. Do not reintroduce a hardcoded timeout constant here; add a new
+# Settings field instead.

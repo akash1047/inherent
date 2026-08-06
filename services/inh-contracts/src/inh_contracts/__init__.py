@@ -7,7 +7,7 @@ event schemas (#17), and the file-type support registry (#117). See
 ``inh_contracts.naming``, ``inh_contracts.events`` and ``inh_contracts.file_types``.
 """
 
-from inh_contracts.defaults import DEFAULT_S3_REGION
+from inh_contracts.defaults import DEFAULT_MONGODB_URI, DEFAULT_S3_BUCKET, DEFAULT_S3_REGION
 from inh_contracts.events import (
     CONTRACT_VERSION,
     DocumentCompletionMessage,
@@ -46,6 +46,8 @@ __all__ = [
     "WORKSPACE_COLLECTION_PREFIX",
     "USER_TENANT_PREFIX",
     "DEFAULT_S3_REGION",
+    "DEFAULT_S3_BUCKET",
+    "DEFAULT_MONGODB_URI",
     "FILE_TYPE_REGISTRY",
     "FileTypeSpec",
     "UnknownContentTypeError",
