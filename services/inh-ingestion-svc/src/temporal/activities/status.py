@@ -39,6 +39,7 @@ async def create_pending_document(input: CreatePendingDocumentInput) -> bool:
         storage_backend=input.storage_backend,
         storage_path=input.storage_path,
         workflow_run_id=input.workflow_run_id,
+        workflow_start_time=input.workflow_start_time,
         storage_bucket=input.storage_bucket,
         storage_url=input.storage_url,
     )
@@ -60,10 +61,13 @@ async def set_document_status(input: SetDocumentStatusInput) -> bool:
     (UPDATE affects 0 rows), this is a safe no-op.
 
     Args:
-        input: document_id, workspace_id, status string, optional error_message
+        input: document_id, workspace_id, status string, optional
+            error_message, optional workflow_run_id (fences the write, #110
+            follow-up -- see DatabaseService.update_document_status)
 
     Returns:
-        True if a row was updated, False otherwise (e.g. row not yet present).
+        True if a row was updated, False otherwise (e.g. row not yet present,
+        or (#110) fenced out because a newer run has since claimed the doc).
     """
     from src.services.database import DocumentStatus
     from src.temporal.shared_services import get_db_service
@@ -74,6 +78,7 @@ async def set_document_status(input: SetDocumentStatusInput) -> bool:
         document_id=input.document_id,
         status=DocumentStatus(input.status),
         error_message=input.error_message,
+        workflow_run_id=input.workflow_run_id,
     )
 
     logger.info(

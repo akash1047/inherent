@@ -86,12 +86,18 @@ class DocumentIngestionWorkflow:
         document_id: str,
         workspace_id: str,
         status: str,
+        workflow_run_id: str,
         error_message: str | None = None,
     ) -> None:
         """Write a document status transition without failing the workflow.
 
         Status writes ('processing'/'failed') are observability signals, not
         the source of truth, so a failure here is swallowed and logged.
+
+        workflow_run_id (#110 follow-up): fences the write so a terminated
+        (superseded) run's status write can't land after a newer run
+        finished and leave a stale status with no self-heal -- see
+        DatabaseService.update_document_status.
         """
         try:
             await workflow.execute_activity(
@@ -101,6 +107,7 @@ class DocumentIngestionWorkflow:
                     workspace_id=workspace_id,
                     status=status,
                     error_message=error_message,
+                    workflow_run_id=workflow_run_id,
                 ),
                 start_to_close_timeout=timedelta(seconds=10),
                 retry_policy=RetryPolicy(
@@ -253,23 +260,39 @@ class DocumentIngestionWorkflow:
         """
         start_time = workflow.now()
         workflow_run_id = workflow.info().run_id
+        # Deterministic, workflow-supplied (safe inside @workflow.run, unlike
+        # datetime.now()) -- used to make the fencing CLAIM monotonic in
+        # START order rather than commit order (#110 follow-up, migration
+        # 017). See CreatePendingDocumentInput / DatabaseService
+        # .create_pending_document's docstrings for the failure this closes.
+        workflow_start_time = workflow.info().start_time
 
         try:
             # Create a minimal 'processing' row up front so the document is
             # observable via the status API before the store step; a failure in
             # fetch/extract/chunk then shows as 'failed', not 'not found' (#10).
-            # ALSO claims this run's fencing token (active_run_id, #110) --
-            # this must run as early as possible so a fresh run that just
-            # superseded a stale one (TERMINATE_EXISTING) claims the document
-            # before the stale run's own store step can commit. Best-effort:
-            # a create/claim failure must not fail the workflow (unchanged
-            # from #10) -- residual risk this accepts: if the claim itself
-            # fails AND a stale run's write is in flight, the stale write
-            # could still land, since nothing re-claimed to block it. Judged
-            # acceptable because (a) this is a single lightweight UPDATE with
-            # its own 2-attempt retry, and (b) a DB failure here is very
-            # likely to also fail this run's own later store step, which
-            # would fail the run and dead-letter it either way.
+            # ALSO claims this run's fencing token (active_run_id +
+            # active_run_claimed_at, #110) -- this must run as early as
+            # possible so a fresh run that just superseded a stale one
+            # (TERMINATE_EXISTING) claims the document before the stale run's
+            # own store step can commit. Best-effort: a create/claim failure
+            # must not fail the workflow (unchanged from #10) -- but note the
+            # residual risk this now carries is NOT symmetric with before
+            # (#110 follow-up): pre-#110, a failed claim write was harmless
+            # (nothing depended on it). Now, if THIS call's claim never lands
+            # (both retry attempts fail) while an OLDER run's claim is still
+            # on the row, THIS run's own later store commit will find
+            # active_run_id pointing at that older, dead run and be fenced
+            # out -- turning a ~15s transient DB blip at the very start of a
+            # run into a guaranteed hard failure of a run that would
+            # otherwise have succeeded minutes later. Only bites on a
+            # RE-INDEX (a first-ever ingest has no prior claim to lose to;
+            # active_run_id/active_run_claimed_at start NULL, which the fence
+            # permits). Accepted for the same reason as before: a DB outage
+            # severe enough to fail two lightweight single-row writes in a
+            # row is very likely to also fail this run's later store step on
+            # its own merits, so the dead-letter outcome is not novel, just
+            # earlier.
             try:
                 await workflow.execute_activity(
                     create_pending_document,
@@ -284,6 +307,7 @@ class DocumentIngestionWorkflow:
                         storage_backend=input.storage_backend,
                         storage_path=input.storage_path,
                         workflow_run_id=workflow_run_id,
+                        workflow_start_time=workflow_start_time,
                         storage_bucket=input.storage_bucket,
                         storage_url=input.storage_url,
                     ),
@@ -304,6 +328,7 @@ class DocumentIngestionWorkflow:
                 document_id=input.document_id,
                 workspace_id=input.workspace_id,
                 status="processing",
+                workflow_run_id=workflow_run_id,
             )
 
             # Step 1: Ensure tenant infrastructure is ready (10%)
@@ -469,6 +494,7 @@ class DocumentIngestionWorkflow:
                     document_id=input.document_id,
                     workspace_id=input.workspace_id,
                     status="failed",
+                    workflow_run_id=workflow_run_id,
                     error_message=pg_error,
                 )
                 await self._record_dead_letter_best_effort(
@@ -506,6 +532,7 @@ class DocumentIngestionWorkflow:
                     document_id=input.document_id,
                     workspace_id=input.workspace_id,
                     status="failed",
+                    workflow_run_id=workflow_run_id,
                     error_message=wv_error,
                 )
                 await self._record_dead_letter_best_effort(
@@ -583,6 +610,7 @@ class DocumentIngestionWorkflow:
                 document_id=input.document_id,
                 workspace_id=input.workspace_id,
                 status="failed",
+                workflow_run_id=workflow_run_id,
                 error_message=str(e),
             )
 

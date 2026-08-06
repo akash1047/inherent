@@ -263,10 +263,21 @@ async def store_in_weaviate(input: StoreDocumentInput) -> StoreDocumentOutput:
         # below -- as close to the mutation as possible to minimize the window.
         # Weaviate has no transactional WHERE-on-write like the Postgres upsert
         # in store_processed_document, so this is a plain check-then-write with
-        # an inherent (but now much smaller) race: previously a superseded run
-        # could clobber a newer one any time in this activity's full duration
-        # (dominated by the embedding batch call, tens of seconds); now only in
-        # the gap between this check and the write immediately following it.
+        # an inherent race, narrowed but not closed: check -> delete really is
+        # one DB round trip immediately followed by the delete call, so that
+        # part of the window is tight. But delete -> write is NOT immediate --
+        # store_chunks_with_tenant (weaviate.py) embeds the chunk batch (a
+        # blocking HTTP call to the TEI sidecar, offloaded via
+        # asyncio.to_thread) AFTER the delete and BEFORE the actual write, so
+        # there is a real gap -- tens of seconds on a full batch -- between
+        # the old vectors being deleted and the new ones landing, during
+        # which the document has NO vectors at all. A run that got past this
+        # check still owes its whole embed+write before it can commit, so a
+        # DIFFERENT, even-newer run could in principle claim and supersede it
+        # again inside that gap; exposure in practice is small (whoever wins
+        # the check has already survived the same race everyone else does),
+        # but this is a real, not hypothetical, TOCTOU window -- not "one
+        # round trip" the way the Postgres-side fence is.
         db_service = get_db_service()
         if not await db_service.is_active_run(input.document_id, input.workflow_run_id):
             duration_ms = int((time.monotonic() - start) * 1000)

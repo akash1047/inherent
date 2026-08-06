@@ -270,7 +270,15 @@ async def run_worker(
             audit_client_created_here=audit_client_created_here,
             exc_info=True,
         )
+        # Await the cancellation (consistent with the other two cancel sites
+        # in this file, #110 follow-up review item 7) -- cancel() alone only
+        # schedules cancellation, it doesn't wait for the task to actually
+        # stop. Harmless either way here (the task just stops sweeping), but
+        # inconsistency invites someone to later "fix" one site and miss the
+        # others.
         staging_sweep_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await staging_sweep_task
         try:
             shared_services.shutdown()
         except Exception:

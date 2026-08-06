@@ -287,10 +287,13 @@ class TestSetDocumentStatusActivity:
         )
 
         assert result is True
+        # workflow_run_id defaults to None (unfenced) when the caller doesn't
+        # supply one -- the real workflow always supplies it (#110 follow-up).
         mock_db.update_document_status.assert_awaited_once_with(
             document_id="doc_1",
             status=DocumentStatus.PROCESSING,
             error_message=None,
+            workflow_run_id=None,
         )
 
     @patch("src.temporal.shared_services.get_db_service")
@@ -317,6 +320,37 @@ class TestSetDocumentStatusActivity:
             document_id="doc_1",
             status=DocumentStatus.FAILED,
             error_message="boom",
+            workflow_run_id=None,
+        )
+
+    @patch("src.temporal.shared_services.get_db_service")
+    @pytest.mark.asyncio
+    async def test_set_status_forwards_workflow_run_id_for_fencing(self, mock_get_db):
+        """(#110 follow-up) When the caller supplies workflow_run_id (the
+        real workflow always does), it must reach update_document_status so
+        the write is fenced -- a terminated run's stale status write must
+        not be able to land after a newer run finished."""
+        from src.services.database import DocumentStatus
+        from src.temporal.activities.status import set_document_status
+
+        mock_db = MagicMock()
+        mock_db.update_document_status = AsyncMock(return_value=True)
+        mock_get_db.return_value = mock_db
+
+        await set_document_status(
+            SetDocumentStatusInput(
+                document_id="doc_1",
+                workspace_id="ws_1",
+                status="processing",
+                workflow_run_id="run-xyz",
+            )
+        )
+
+        mock_db.update_document_status.assert_awaited_once_with(
+            document_id="doc_1",
+            status=DocumentStatus.PROCESSING,
+            error_message=None,
+            workflow_run_id="run-xyz",
         )
 
     @patch("src.temporal.shared_services.get_db_service")

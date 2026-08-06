@@ -110,11 +110,21 @@ All notable changes to Inherent are documented here. The format follows
   reject-on-collision behavior instead, since it may be replaying stale
   content. A background sweep (`worker.py::_periodic_staging_cleanup`, every
   15 min) now also cleans `ingestion_staging` rows a terminated run orphans,
-  since termination skips the workflow's own cleanup step.
-  **Upgrade:** run migration `016_active_run_fencing.sql`
-  (`scripts/migrations/`, applied automatically by `postgres-init` /
-  `run_migrations.sh`) before deploying — the store activities depend on the
-  new `active_run_id` column existing. No configuration changes required.
+  since termination skips the workflow's own cleanup step. The claim itself
+  (`create_pending_document`) is ordered by each run's Temporal start time
+  (`active_run_claimed_at`, migration 017), not by which claim write commits
+  last — otherwise an earlier-starting, terminated run's still-in-flight
+  claim could land after, and overwrite, a later-starting run's claim,
+  fencing the legitimate newest run out of its own store step (found in
+  follow-up review). `update_document_status` is fenced the same way, so a
+  terminated run's stale status write can't leave `status='processing'`
+  stuck forever on a document whose content is otherwise correct.
+  **Upgrade:** run migrations `016_active_run_fencing.sql` and
+  `017_active_run_claim_ordering.sql` (`scripts/migrations/`, applied
+  automatically by `postgres-init` / `run_migrations.sh`) before deploying —
+  the store and status-write activities depend on the `active_run_id` /
+  `active_run_claimed_at` columns existing. No configuration changes
+  required.
 
 - **Retrieval-eval baseline ratchet silently never ran (#139 follow-up).**
   `eval-baseline-ratchet` pushed its ratchet commit straight to `main`, but

@@ -129,6 +129,41 @@ its work.
   claim about existing infrastructure actually true?" — both questions a
   passing test suite doesn't ask on its own.
 
+**Defect (round 3 — fencing the write is not enough if the CLAIM isn't
+ordered).** Round 2's fencing token stopped a stale write from landing, but
+the CLAIM step that sets `active_run_id` was itself a bare unconditional
+UPDATE with no ordering predicate — whichever transaction committed LAST
+owned the document, regardless of which run actually STARTED later. Concrete
+inversion this allowed, in exactly the retry window #110 exists to serve: run
+A starts, its claim activity is dispatched; ~50ms later a fresh run B
+terminates A and starts. Termination doesn't stop A's already-dispatched
+claim activity (same premise the store-side fence already accepts). If A's
+claim commits AFTER B's, the DEAD run A ends up owning `active_run_id`, and
+B — the legitimate, newest run — gets fenced out of its OWN store step. The
+newest content that's supposed to "win immediately" instead hard-fails and
+gets dead-lettered. Fixed by ordering the claim on each run's Temporal
+**start time** (`workflow.info().start_time`, deterministic and
+workflow-supplied) rather than commit order: `active_run_claimed_at`
+(migration 017), guarded with "unclaimed OR existing claim started at or
+before mine."
+
+- **A fence that protects the WRITE still needs an ordered CLAIM, or the
+  claim itself becomes the race.** Fencing tokens are usually presented as a
+  single mechanism ("check a token before writing"), but there are actually
+  two operations that both need correctness: acquiring/updating the token
+  (the claim) and checking it (the write guard). Round 2 got the second half
+  right and missed that the first half was just as exposed to the same
+  "termination doesn't stop in-flight activities" premise the whole fix is
+  built on. When you fence step N of a workflow, ask whether step N-1 (or
+  any earlier step) needs the same treatment — a fence that's airtight
+  everywhere except where the token itself is written is not airtight.
+- **Prefer a domain timestamp Temporal already gives you over inventing an
+  ordering scheme.** `workflow.info().start_time` was sitting right there,
+  deterministic and safe inside `@workflow.run` (unlike `datetime.now()`,
+  which would break workflow replay). No new coordination mechanism, no
+  clock synchronization concerns beyond what Temporal's server already
+  guarantees for workflow metadata.
+
 ## #146 — A single-probe readiness wait races the rest of the corpus it's gating (2026-07-24)
 
 **Defect.** `test_compose_retrieval_regression.py`'s corpus-readiness wait

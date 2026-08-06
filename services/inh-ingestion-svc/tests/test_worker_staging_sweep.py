@@ -22,7 +22,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from src.temporal.worker import TemporalWorkerManager, _periodic_staging_cleanup
+from src.temporal.worker import TemporalWorkerManager, _periodic_staging_cleanup, run_worker
 
 
 @pytest.fixture(autouse=True)
@@ -161,3 +161,54 @@ class TestTemporalWorkerManagerStagingSweepLifecycle:
 
             assert sweep_task.done()
             assert manager._staging_sweep_task is None
+
+
+# ---------------------------------------------------------------------------
+# run_worker: the audit-worker-setup failure path must also await the
+# cancellation, not just request it (#110 follow-up review item 7)
+# ---------------------------------------------------------------------------
+
+
+class TestRunWorkerAuditSetupFailureAwaitsSweepCancellation:
+    """If audit worker construction fails, run_worker cleans up and
+    re-raises. All THREE places this file cancels the sweep task must await
+    the cancellation the same way -- this one previously didn't."""
+
+    @pytest.mark.asyncio
+    async def test_sweep_task_is_done_after_audit_setup_failure(self):
+        settings = MagicMock()
+        settings.temporal_task_queue = "document-ingestion"
+        settings.temporal_audit_task_queue = "audit"
+        settings.temporal_max_concurrent_activities = 10
+        settings.temporal_max_concurrent_workflow_tasks = 10
+
+        captured: dict[str, asyncio.Task] = {}
+        real_create_task = asyncio.create_task
+
+        def _capturing_create_task(coro, *a, **kw):
+            task = real_create_task(coro, *a, **kw)
+            captured["sweep_task"] = task
+            return task
+
+        with (
+            patch("src.temporal.shared_services.initialize", new=MagicMock()),
+            patch("src.temporal.shared_services.shutdown", new=MagicMock()),
+            patch("src.temporal.worker._cleanup_stale_staging", new=AsyncMock()),
+            patch("src.temporal.worker.create_temporal_client", new=AsyncMock()),
+            # Audit client construction fails -> the except branch this test
+            # targets.
+            patch(
+                "src.temporal.worker.create_audit_temporal_client",
+                new=AsyncMock(side_effect=RuntimeError("audit connect failed")),
+            ),
+            patch("src.temporal.worker.Worker", new=MagicMock()),
+            patch("asyncio.create_task", side_effect=_capturing_create_task),
+        ):
+            with pytest.raises(RuntimeError, match="audit connect failed"):
+                await run_worker(settings)
+
+        sweep_task = captured["sweep_task"]
+        # Awaited (not just cancel()-requested): by the time run_worker has
+        # re-raised, the task must already be fully done, not merely
+        # scheduled for cancellation.
+        assert sweep_task.done()

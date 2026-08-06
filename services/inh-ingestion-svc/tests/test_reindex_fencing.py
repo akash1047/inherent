@@ -18,7 +18,7 @@ newer run has claimed the document, not just documented as a risk.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -66,6 +66,8 @@ class TestStoreProcessedDocumentFencing:
         commits its own, newer content. When A's late write finally arrives,
         it must be rejected -- B's content must survive untouched."""
         document_id = "doc_fencing_race_1"
+        t_a = datetime(2026, 1, 1, tzinfo=UTC)
+        t_b = t_a + timedelta(milliseconds=50)  # B genuinely started after A
 
         # Run A claims the document first (this is what create_pending_document
         # does at the top of every real workflow run).
@@ -80,6 +82,7 @@ class TestStoreProcessedDocumentFencing:
             storage_backend="local",
             storage_path="workspaces/ws_fencing/f.txt",
             workflow_run_id="run-A",
+            workflow_start_time=t_a,
         )
 
         # Run B (a fresh re-index) supersedes A: TERMINATE_EXISTING kills A's
@@ -95,6 +98,7 @@ class TestStoreProcessedDocumentFencing:
             storage_backend="local",
             storage_path="workspaces/ws_fencing/f.txt",
             workflow_run_id="run-B",
+            workflow_start_time=t_b,
         )
 
         # B is fast: its store step commits before A's ever does.
@@ -165,6 +169,7 @@ class TestStoreProcessedDocumentFencing:
             storage_backend="local",
             storage_path="workspaces/ws_fencing/f.txt",
             workflow_run_id="run-retry",
+            workflow_start_time=datetime.now(UTC),
         )
 
         first = await db_service.store_processed_document(
@@ -207,6 +212,7 @@ class TestIsActiveRun:
             storage_backend="local",
             storage_path="workspaces/ws_fencing/f.txt",
             workflow_run_id="run-self",
+            workflow_start_time=datetime.now(UTC),
         )
         assert await db_service.is_active_run(document_id, "run-self") is True
 
@@ -224,5 +230,101 @@ class TestIsActiveRun:
             storage_backend="local",
             storage_path="workspaces/ws_fencing/f.txt",
             workflow_run_id="run-owner",
+            workflow_start_time=datetime.now(UTC),
         )
         assert await db_service.is_active_run(document_id, "run-impostor") is False
+
+
+class TestUpdateDocumentStatusFencing:
+    """(#110 follow-up, ALSO FIX item 4) update_document_status must be
+    fenced the same way store_processed_document is: a terminated
+    (superseded) run's in-flight status write must not be able to land after
+    a newer run finished, leaving status='processing' with no self-heal on a
+    document whose actual content (already protected by the store-side
+    fence) is correct."""
+
+    @pytest.mark.asyncio
+    async def test_stale_run_status_write_is_rejected_after_newer_run_claims(
+        self, db_service: DatabaseService
+    ):
+        from src.services.database import DocumentStatus
+
+        document_id = "doc_status_fencing_1"
+
+        await db_service.create_pending_document(
+            document_id=document_id,
+            workspace_id="ws_fencing",
+            user_id="user_fencing",
+            filename="f.txt",
+            original_filename="f.txt",
+            content_type="text/plain",
+            size_bytes=10,
+            storage_backend="local",
+            storage_path="workspaces/ws_fencing/f.txt",
+            workflow_run_id="run-A",
+            workflow_start_time=datetime(2026, 1, 1, tzinfo=UTC),
+        )
+        # B supersedes A and claims the document.
+        await db_service.create_pending_document(
+            document_id=document_id,
+            workspace_id="ws_fencing",
+            user_id="user_fencing",
+            filename="f.txt",
+            original_filename="f.txt",
+            content_type="text/plain",
+            size_bytes=10,
+            storage_backend="local",
+            storage_path="workspaces/ws_fencing/f.txt",
+            workflow_run_id="run-B",
+            workflow_start_time=datetime(2026, 1, 1, 0, 0, 0, 50000, tzinfo=UTC),
+        )
+        # B finishes successfully.
+        updated = await db_service.update_document_status(
+            document_id=document_id,
+            status=DocumentStatus.PROCESSED,
+            workflow_run_id="run-B",
+        )
+        assert updated is True
+
+        # A's abandoned activity finally tries to mark the document
+        # 'processing' (or 'failed') again. Must be rejected -- must NOT
+        # revert a correctly-processed document's status.
+        stale_updated = await db_service.update_document_status(
+            document_id=document_id,
+            status=DocumentStatus.PROCESSING,
+            workflow_run_id="run-A",
+        )
+        assert stale_updated is False, "stale run A's status write must be fenced out"
+
+        doc = await db_service.get_document_status(document_id)
+        assert doc is not None
+        assert doc["status"] == DocumentStatus.PROCESSED.value
+        assert doc["processed_at"] is not None
+
+    @pytest.mark.asyncio
+    async def test_unfenced_when_workflow_run_id_omitted(self, db_service: DatabaseService):
+        """Backward-compatible: a caller without a run context (none exist
+        today) gets the pre-#110 unconditional write."""
+        from src.services.database import DocumentStatus
+
+        document_id = "doc_status_unfenced"
+        await db_service.create_pending_document(
+            document_id=document_id,
+            workspace_id="ws_fencing",
+            user_id="user_fencing",
+            filename="f.txt",
+            original_filename="f.txt",
+            content_type="text/plain",
+            size_bytes=10,
+            storage_backend="local",
+            storage_path="workspaces/ws_fencing/f.txt",
+            workflow_run_id="run-only",
+            workflow_start_time=datetime.now(UTC),
+        )
+
+        updated = await db_service.update_document_status(
+            document_id=document_id,
+            status=DocumentStatus.FAILED,
+            error_message="no run context",
+        )
+        assert updated is True

@@ -11,6 +11,7 @@ and avoids the 4MB Temporal limit.
 """
 
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Literal
 
 
@@ -273,12 +274,20 @@ class SetDocumentStatusInput:
     Used to write best-effort 'processing'/'failed' status transitions
     during the workflow. ``status`` is a plain string ("processing",
     "failed", etc.) so it serializes cleanly across Temporal's gRPC.
+
+    workflow_run_id (#110 follow-up): fences this write the same way the
+    store activities are fenced (DatabaseService.update_document_status) --
+    a terminated (superseded) run's in-flight status write must not be able
+    to land after a newer run finished and leave status='processing' with no
+    self-heal. Optional so a caller without a run context (none exist today,
+    but keeps the DB method's signature backward compatible) still works.
     """
 
     document_id: str
     workspace_id: str
     status: str
     error_message: str | None = None
+    workflow_run_id: str | None = None
 
 
 @dataclass
@@ -310,6 +319,12 @@ class CreatePendingDocumentInput:
     store commit from a DIFFERENT, superseded run for the same document_id
     can detect it's been superseded and skip its write instead of clobbering
     this run's content.
+
+    workflow_start_time (#110 follow-up, migration 017): this run's Temporal
+    start time (workflow.info().start_time -- deterministic, safe inside
+    @workflow.run), used to make the claim monotonic in START order rather
+    than commit order. See DatabaseService.create_pending_document's
+    docstring for the failure this closes.
     """
 
     document_id: str
@@ -322,6 +337,7 @@ class CreatePendingDocumentInput:
     storage_backend: str
     storage_path: str
     workflow_run_id: str
+    workflow_start_time: datetime
     storage_bucket: str | None = None
     storage_url: str | None = None
 

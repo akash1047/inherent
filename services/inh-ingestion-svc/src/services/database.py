@@ -210,6 +210,19 @@ class DatabaseService:
             # a newer run's already-committed content when it finally
             # completes. See docs/developer/learnings.md.
             Column("active_run_id", String(255), nullable=True),
+            # Claim ordering (#110, migration 017): the CLAIMING run's
+            # Temporal start time (workflow.info().start_time -- deterministic
+            # and workflow-supplied, safe inside @workflow.run). The claim
+            # UPDATE in create_pending_document is otherwise a bare
+            # unconditional write with no ordering predicate, so whichever
+            # transaction commits LAST would own active_run_id regardless of
+            # which run actually STARTED later -- an earlier-starting,
+            # terminated run's still-in-flight claim could commit AFTER a
+            # newer run's and steal the claim back, fencing the legitimate
+            # newest run out of its OWN store step. Guarding the claim with
+            # "unclaimed OR existing claim's start time <= mine" makes the
+            # claim monotonic in START order, not commit order.
+            Column("active_run_claimed_at", DateTime(timezone=True), nullable=True),
             Index("idx_processed_documents_workspace_id", "workspace_id"),
             Index("idx_processed_documents_user_id", "user_id"),
             Index("idx_processed_documents_tenant_id", "tenant_id"),
@@ -991,6 +1004,7 @@ class DatabaseService:
         storage_backend: str,
         storage_path: str,
         workflow_run_id: str,
+        workflow_start_time: datetime,
         storage_bucket: str | None = None,
         storage_url: str | None = None,
     ) -> bool:
@@ -1008,6 +1022,25 @@ class DatabaseService:
         at the run doing the write, which is what stops a
         TERMINATE_EXISTING-superseded run's late write from clobbering a
         newer run's already-committed content.
+
+        workflow_start_time (#110 follow-up, migration 017): this run's
+        Temporal start time (workflow.info().start_time), used to make the
+        claim monotonic in START order rather than commit order -- see the
+        WHERE guard below and migration 017's comment for the failure this
+        closes (an earlier-starting, terminated run's late claim overwriting
+        a later-starting run's, fencing the legitimate newest run out of its
+        OWN store step). Only bites on a RE-INDEX: a first-ever ingest has no
+        prior claim (active_run_claimed_at IS NULL), which the guard already
+        permits. Note this also converts what used to be a harmless
+        transient claim-write failure into a guaranteed hard failure of a
+        run that would otherwise have succeeded: if THIS call's UPDATE never
+        lands (both retry attempts fail) while an OLDER run's claim is still
+        on the row, this run's own later store commit will find active_run_id
+        pointing at that older run and be fenced out. Accepted for the same
+        reason as before (see the workflow's best-effort comment) -- a DB
+        outage severe enough to fail two lightweight single-row writes in a
+        row is very likely to also fail this run's later store step on its
+        own merits.
 
         Returns True if a row was created, False if one already existed
         (claim semantics are identical either way).
@@ -1034,6 +1067,7 @@ class DatabaseService:
                     status=DocumentStatus.PROCESSING.value,
                     chunk_count=0,
                     active_run_id=workflow_run_id,
+                    active_run_claimed_at=workflow_start_time,
                     created_at=now,
                     updated_at=now,
                 )
@@ -1048,10 +1082,26 @@ class DatabaseService:
             # "created" return value keeps its original, simple meaning
             # (rowcount from the INSERT statement only) and every existing
             # caller/test of that meaning is unaffected.
+            #
+            # Monotonic guard (#110 follow-up): apply only when unclaimed, or
+            # when the CURRENTLY recorded claim started at or before THIS
+            # run. Without this, a bare unconditional UPDATE lets whichever
+            # transaction commits LAST win regardless of which run actually
+            # started later -- see migration 017's comment for the concrete
+            # failure this allowed (a terminated run's still-in-flight claim
+            # write landing after, and overwriting, the newer run's claim).
             session.execute(
                 self.processed_documents.update()
-                .where(self.processed_documents.c.document_id == document_id)
-                .values(active_run_id=workflow_run_id, updated_at=now)
+                .where(
+                    self.processed_documents.c.document_id == document_id,
+                    self.processed_documents.c.active_run_claimed_at.is_(None)
+                    | (self.processed_documents.c.active_run_claimed_at <= workflow_start_time),
+                )
+                .values(
+                    active_run_id=workflow_run_id,
+                    active_run_claimed_at=workflow_start_time,
+                    updated_at=now,
+                )
             )
 
             return created
@@ -1064,13 +1114,16 @@ class DatabaseService:
         happen in the same statement, so there is no race). Weaviate has no
         equivalent transactional primitive, so store_in_weaviate
         (activities/store.py) calls this immediately before its destructive
-        delete+write as a best-effort guard -- it narrows the window a
-        superseded run's write can land in from "the whole activity duration
-        (up to ~60s, dominated by the embedding batch call)" to "one extra DB
-        round trip immediately before the write", not to zero. A document
-        that predates migration 016, or was never claimed for some other
-        reason, has active_run_id IS NULL, which is treated as unclaimed
-        (permitted) -- consistent with the Postgres-side fencing check.
+        delete+write as a best-effort guard -- it narrows, but does not
+        close, the window a superseded run's write can land in: check ->
+        delete is one DB round trip, tight; but delete -> write is NOT
+        immediate (store_chunks_with_tenant embeds the chunk batch, a
+        tens-of-seconds blocking call, AFTER the delete and before the actual
+        write -- see store_in_weaviate's own comment for the detail). A
+        document that predates migration 016, or was never claimed for some
+        other reason, has active_run_id IS NULL, which is treated as
+        unclaimed (permitted) -- consistent with the Postgres-side fencing
+        check.
 
         Returns:
             True if unclaimed or claimed by workflow_run_id (write permitted);
@@ -1098,6 +1151,7 @@ class DatabaseService:
         document_id: str,
         status: DocumentStatus,
         error_message: str | None = None,
+        workflow_run_id: str | None = None,
     ) -> bool:
         """Update document processing status.
 
@@ -1105,6 +1159,18 @@ class DatabaseService:
             document_id: Document ID
             status: New status
             error_message: Error message if failed
+            workflow_run_id: Fences this write (#110 follow-up) the same way
+                store_processed_document is fenced -- when provided, the
+                UPDATE only applies if the document is unclaimed or still
+                claimed by this run. Without this, a terminated (superseded)
+                run's in-flight 'processing'/'failed' status write could land
+                AFTER a newer run finished, leaving status='processing' with
+                processed_at=NULL forever on a document whose actual content
+                is correct -- a status API that lies with no self-heal, even
+                though the content-level fencing (active_run_id on the store
+                activities) already protects the content itself. None skips
+                the fence entirely (unconditional write, pre-#110 behavior)
+                for any caller without a run context.
 
         Returns:
             True if updated
@@ -1114,9 +1180,15 @@ class DatabaseService:
 
         with self.get_session() as session:
             now = datetime.now(UTC)
+            conditions = [self.processed_documents.c.document_id == document_id]
+            if workflow_run_id is not None:
+                conditions.append(
+                    self.processed_documents.c.active_run_id.is_(None)
+                    | (self.processed_documents.c.active_run_id == workflow_run_id)
+                )
             result = session.execute(
                 self.processed_documents.update()
-                .where(self.processed_documents.c.document_id == document_id)
+                .where(*conditions)
                 .values(
                     status=status.value,
                     error_message=error_message,
