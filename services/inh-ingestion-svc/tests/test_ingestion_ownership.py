@@ -35,6 +35,18 @@ row against PostgreSQL first, 404 unless its stored workspace_id matches the
 caller's claim (same response for missing vs. foreign-workspace, so
 existence doesn't leak), and -- the "lookup-failure-denies" tests below --
 never treat a DB lookup failure as "allowed".
+
+POST-#177-REVIEW HARDENING (empty-string bypass): an adversarial review
+proved the FIRST version of this fix was itself bypassable --
+`GET /dead-letter?workspace_id=` (query param PRESENT but EMPTY) returned
+200 with no workspace filter applied, because `Query(...)` only enforces
+presence, not non-emptiness, and `DatabaseService.get_dead_letter_jobs`
+guarded its WHERE clause with a bare `if workspace_id:` (falsy for `""`).
+`TestEmptyWorkspaceIdBypassClosed` below reproduces that exact bypass
+end-to-end and pins it closed at all three layers: `require_workspace_id`
+(the shared boundary check), the route's own `min_length=1` Query
+constraint, and `DatabaseService.get_dead_letter_jobs` itself (now REQUIRES
+workspace_id and raises rather than silently widening).
 """
 
 from __future__ import annotations
@@ -45,7 +57,11 @@ import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
-from src.api.ownership import resolve_owned_dead_letter_job, resolve_owned_document
+from src.api.ownership import (
+    require_workspace_id,
+    resolve_owned_dead_letter_job,
+    resolve_owned_document,
+)
 
 # ---------------------------------------------------------------------------
 # Override conftest autouse fixtures -- these tests don't need PostgreSQL.
@@ -67,6 +83,41 @@ def db_service():
 # ---------------------------------------------------------------------------
 # Unit tests: src/api/ownership.py helpers, in isolation
 # ---------------------------------------------------------------------------
+
+
+class TestRequireWorkspaceId:
+    """require_workspace_id -- the boundary check closing the empty-string
+    bypass an adversarial review found in the first version of this fix.
+
+    A blank or whitespace-only workspace_id must NEVER reach a DB call that
+    might (as get_dead_letter_jobs's old `if workspace_id:` guard did) treat
+    "no value" as "no filter" -- these tests pin that at the source.
+    """
+
+    def test_valid_value_passes_through_unchanged(self):
+        assert require_workspace_id("ws1") == "ws1"
+
+    def test_value_is_stripped(self):
+        assert require_workspace_id("  ws1  ") == "ws1"
+
+    def test_empty_string_rejected(self):
+        """The exact bypass payload: `?workspace_id=` decodes to `""`."""
+        with pytest.raises(HTTPException) as exc_info:
+            require_workspace_id("")
+        assert exc_info.value.status_code == 422
+
+    def test_whitespace_only_rejected(self):
+        """`?workspace_id=%20` decodes to `" "` -- length 1, so a bare
+        `min_length=1` Query constraint alone would NOT catch this; the
+        strip-then-check here must."""
+        with pytest.raises(HTTPException) as exc_info:
+            require_workspace_id("   ")
+        assert exc_info.value.status_code == 422
+
+    def test_tab_and_newline_only_rejected(self):
+        with pytest.raises(HTTPException) as exc_info:
+            require_workspace_id("\t\n")
+        assert exc_info.value.status_code == 422
 
 
 class TestResolveOwnedDocument:
@@ -110,6 +161,19 @@ class TestResolveOwnedDocument:
         with pytest.raises(RuntimeError, match="DB unavailable"):
             await resolve_owned_document(mock_db, "doc1", "ws1")
 
+    async def test_empty_workspace_id_rejected_before_any_db_call(self):
+        """The blank-workspace_id boundary check must fire BEFORE the DB is
+        ever touched -- proven here by asserting get_document_status is
+        never called."""
+        mock_db = MagicMock()
+        mock_db.get_document_status = AsyncMock(
+            return_value={"document_id": "doc1", "workspace_id": "ws1", "user_id": "u1"}
+        )
+        with pytest.raises(HTTPException) as exc_info:
+            await resolve_owned_document(mock_db, "doc1", "")
+        assert exc_info.value.status_code == 422
+        mock_db.get_document_status.assert_not_called()
+
 
 class TestResolveOwnedDeadLetterJob:
     """resolve_owned_dead_letter_job -- same matrix, for dead_letter_jobs."""
@@ -143,6 +207,16 @@ class TestResolveOwnedDeadLetterJob:
         mock_db.get_dead_letter_job = AsyncMock(side_effect=RuntimeError("DB unavailable"))
         with pytest.raises(RuntimeError, match="DB unavailable"):
             await resolve_owned_dead_letter_job(mock_db, 1, "ws1")
+
+    async def test_empty_workspace_id_rejected_before_any_db_call(self):
+        mock_db = MagicMock()
+        mock_db.get_dead_letter_job = AsyncMock(
+            return_value={"id": 1, "workspace_id": "ws1", "status": "pending"}
+        )
+        with pytest.raises(HTTPException) as exc_info:
+            await resolve_owned_dead_letter_job(mock_db, 1, "   ")
+        assert exc_info.value.status_code == 422
+        mock_db.get_dead_letter_job.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -468,16 +542,28 @@ class TestDeadLetterEscalationChainClosed:
     to change.
     """
 
-    def test_list_never_returns_another_workspaces_rows(self, client: TestClient):
-        """GET /dead-letter?workspace_id=ws_attacker must not surface
-        ws_victim's rows -- proven here by asserting the DB call itself is
-        always scoped to the caller's claimed workspace_id, so a fake/mocked
-        DB that ignores the filter is the only way this could leak, and the
-        real DatabaseService.get_dead_letter_jobs (tests/test_dead_letter.py)
-        is exercised WHERE the query actually filters."""
+    def test_list_route_passes_callers_own_workspace_id_to_the_db_call(
+        self, client: TestClient
+    ):
+        """Route-plumbing check ONLY: GET /dead-letter?workspace_id=ws_attacker
+        calls DatabaseService.get_dead_letter_jobs with EXACTLY the caller's
+        own claimed workspace_id, never anything else (e.g. never omits it,
+        never substitutes a different value).
+
+        This does NOT prove the DB layer's own filtering actually excludes a
+        victim's rows -- get_dead_letter_jobs is mocked here, so this test
+        would pass even if database.py's WHERE clause were deleted entirely.
+        That distinct claim -- "the real query genuinely filters" -- is
+        proven separately by
+        TestGetDeadLetterJobsRealFiltering.test_real_query_execution_excludes_foreign_workspace_rows,
+        which calls the ACTUAL production method against a real (in-memory)
+        database. A prior version of this test's docstring claimed
+        test_dead_letter.py covered that gap; it did not (that file also
+        only ever mocks get_dead_letter_jobs) -- see docs/developer/learnings.md
+        #110's lesson: a citation to "existing infrastructure already covers
+        this" is a claim, not a check.
+        """
         mock_db = MagicMock()
-        # Simulate a correctly-filtering DB: only ws_attacker's own
-        # (empty) set of jobs comes back, never ws_victim's.
         mock_db.get_dead_letter_jobs = AsyncMock(return_value=[])
         with patch("src.temporal.shared_services.get_db_service", return_value=mock_db):
             resp = client.get(
@@ -485,7 +571,6 @@ class TestDeadLetterEscalationChainClosed:
                 headers={"X-API-Key": VALID_API_KEY},
             )
         assert resp.status_code == 200
-        assert resp.json()["jobs"] == []
         mock_db.get_dead_letter_jobs.assert_awaited_once_with(
             workspace_id="ws_attacker", status="pending", limit=50
         )
@@ -518,15 +603,17 @@ class TestDeadLetterEscalationChainClosed:
             )
         assert resp.status_code == 404
 
-    def test_end_to_end_chain_is_broken(self, client: TestClient):
-        """Full chain, single test: list scoped to the attacker's own
-        workspace never surfaces the victim's job, so the attacker never
-        obtains a genuine (document_id, workspace_id) pair to escalate with
-        via PATCH /chunks in the first place."""
+    def test_end_to_end_route_wiring_never_asks_for_another_workspace(
+        self, client: TestClient
+    ):
+        """Route-plumbing check ONLY (see the previous test's docstring for
+        why this is a narrower claim than "the chain is broken"): across the
+        full request path (auth -> boundary validation -> DB call), the
+        route never asks the DB for anything but the attacker's own claimed
+        workspace_id. The DB call is mocked, so -- again -- this does not by
+        itself prove foreign rows are excluded; that is
+        TestGetDeadLetterJobsRealFiltering's job."""
         mock_db = MagicMock()
-        # The attacker's own workspace has no dead-letter jobs at all --
-        # the victim's job exists in PostgreSQL but under a different
-        # workspace_id, so a correctly-scoped query never returns it.
         mock_db.get_dead_letter_jobs = AsyncMock(return_value=[])
         with patch("src.temporal.shared_services.get_db_service", return_value=mock_db):
             list_resp = client.get(
@@ -534,6 +621,248 @@ class TestDeadLetterEscalationChainClosed:
                 headers={"X-API-Key": VALID_API_KEY},
             )
         assert list_resp.status_code == 200
-        assert list_resp.json()["jobs"] == []
-        # No (document_id, workspace_id) pair was ever harvested, so there
-        # is nothing to escalate with -- the chain stops here.
+        mock_db.get_dead_letter_jobs.assert_awaited_once_with(
+            workspace_id="ws_attacker", status="pending", limit=50
+        )
+
+
+class TestGetDeadLetterJobsRealFiltering:
+    """Proves DatabaseService.get_dead_letter_jobs's ACTUAL filtering logic
+    excludes another workspace's rows -- not a mock's own configured return
+    value, which is what every other test in this module (and
+    test_dead_letter.py) exercises instead, since none of them can reach a
+    real PostgreSQL in this sandbox.
+
+    Post-#177-review finding: mocking `get_dead_letter_jobs` itself is
+    EXACTLY what let the empty-string bypass ship unnoticed -- every test
+    stubbed the method, so nothing anywhere ever executed database.py's own
+    `if workspace_id:` guard or its WHERE clause. These tests call the real,
+    unmocked method against a real (in-memory SQLite) table so the WHERE
+    clause genuinely runs. SQLite stands in for PostgreSQL here ONLY for
+    this table's DDL (a generic `JSON` column type replaces the postgres-only
+    `JSONB` this repo's real schema uses, since SQLite has no JSONB dialect
+    type) -- the WHERE-clause construction under test
+    (`self.dead_letter_jobs.c.workspace_id == workspace_id`) is
+    dialect-agnostic SQLAlchemy Core and behaves identically on both engines.
+    """
+
+    def _make_sqlite_backed_db_service(self):
+        """Build a DatabaseService.__new__ instance wired to a real
+        in-memory SQLite engine, with `dead_letter_jobs` swapped for a
+        schema-compatible (same column NAMES the production code
+        references) stand-in table. Returns (db, engine, table)."""
+        import sqlalchemy as sa
+
+        from src.services.database import DatabaseService
+
+        metadata = sa.MetaData()
+        dead_letter_jobs = sa.Table(
+            "dead_letter_jobs",
+            metadata,
+            sa.Column("id", sa.Integer, primary_key=True),
+            sa.Column("document_id", sa.String, nullable=False),
+            sa.Column("workspace_id", sa.String, nullable=False),
+            sa.Column("user_id", sa.String, nullable=False),
+            sa.Column("workflow_run_id", sa.String, nullable=True),
+            sa.Column("original_message", sa.JSON, nullable=False),
+            sa.Column("error_message", sa.Text, nullable=False),
+            sa.Column("error_type", sa.String, nullable=False),
+            sa.Column("retry_count", sa.Integer, nullable=False, default=0),
+            sa.Column("status", sa.String, nullable=False, default="pending"),
+            sa.Column("created_at", sa.DateTime, nullable=False),
+            sa.Column("updated_at", sa.DateTime, nullable=False),
+            sa.Column("resolved_at", sa.DateTime, nullable=True),
+        )
+        engine = sa.create_engine("sqlite:///:memory:")
+        metadata.create_all(engine)
+
+        db = DatabaseService.__new__(DatabaseService)
+        db.engine = engine
+        db.dead_letter_jobs = dead_letter_jobs
+
+        from contextlib import contextmanager
+
+        @contextmanager
+        def _get_session():
+            with sa.orm.Session(engine) as session:
+                yield session
+                session.commit()
+
+        db.get_session = _get_session
+        return db, engine, dead_letter_jobs
+
+    def _seed(self, engine, table, **overrides):
+        from datetime import UTC, datetime
+
+        row = {
+            "document_id": "doc",
+            "workspace_id": "ws",
+            "user_id": "user",
+            "workflow_run_id": None,
+            "original_message": {},
+            "error_message": "e",
+            "error_type": "TimeoutError",
+            "retry_count": 0,
+            "status": "pending",
+            "created_at": datetime.now(UTC),
+            "updated_at": datetime.now(UTC),
+            "resolved_at": None,
+        }
+        row.update(overrides)
+        with engine.begin() as conn:
+            conn.execute(table.insert(), [row])
+
+    async def test_real_query_execution_excludes_foreign_workspace_rows(self):
+        """Two dead-letter jobs exist in the SAME table, one per workspace.
+        Calling the real get_dead_letter_jobs for ws_attacker must return
+        ONLY ws_attacker's row -- proof the WHERE clause genuinely executes
+        and filters, not just that some mock was asked nicely."""
+        db, engine, table = self._make_sqlite_backed_db_service()
+        self._seed(
+            engine, table, document_id="doc_victim", workspace_id="ws_victim", user_id="u_victim"
+        )
+        self._seed(
+            engine,
+            table,
+            document_id="doc_attacker_own",
+            workspace_id="ws_attacker",
+            user_id="u_attacker",
+        )
+
+        rows = await db.get_dead_letter_jobs(workspace_id="ws_attacker", status=None, limit=50)
+
+        assert len(rows) == 1
+        assert rows[0]["workspace_id"] == "ws_attacker"
+        assert rows[0]["document_id"] == "doc_attacker_own"
+        # The victim's row must never appear, however the result is sliced.
+        assert all(r["document_id"] != "doc_victim" for r in rows)
+        assert all(r["workspace_id"] != "ws_victim" for r in rows)
+
+    async def test_blank_workspace_id_never_reaches_the_query_and_returns_no_rows(self):
+        """The blank-input side of the same guarantee: with the SAME two
+        cross-tenant rows seeded, `workspace_id=""` and `workspace_id="  "`
+        must raise (never silently execute a query that would return both
+        tenants' rows). This is the exact input shape of the original
+        bypass finding, run against a real, populated database -- not just
+        asserted in isolation against `require_workspace_id`."""
+        db, engine, table = self._make_sqlite_backed_db_service()
+        self._seed(engine, table, document_id="doc_victim", workspace_id="ws_victim")
+        self._seed(engine, table, document_id="doc_attacker_own", workspace_id="ws_attacker")
+
+        for blank in ("", "   "):
+            with pytest.raises(ValueError, match="non-blank workspace_id"):
+                await db.get_dead_letter_jobs(workspace_id=blank, status=None, limit=50)
+
+        # Sanity: the rows really are both there (the ValueError is from the
+        # guard, not from an empty table masking the real risk).
+        with_valid_scope = await db.get_dead_letter_jobs(
+            workspace_id="ws_victim", status=None, limit=50
+        )
+        assert len(with_valid_scope) == 1
+        assert with_valid_scope[0]["document_id"] == "doc_victim"
+
+
+class TestEmptyWorkspaceIdBypassClosed:
+    """Reproduces the exact bypass an adversarial review found in the FIRST
+    version of the #177 fix, end to end.
+
+    `GET /dead-letter?workspace_id=` -- the query param PRESENT but set to
+    the EMPTY STRING -- passed the original `Query(...)` validation (which
+    only enforces presence) and then hit `get_dead_letter_jobs`'s old
+    `if workspace_id:` guard, falsy for `""`, which silently skipped the
+    WHERE clause entirely and returned every workspace's dead-letter rows.
+    This class asserts the fixed behavior at both the route and the mocked
+    DB call, and (in the last test) via a REAL DatabaseService method call
+    against an in-memory-mocked engine, so the assertion isn't just "the
+    mock was asked correctly" but "the query-building code itself refuses a
+    blank scope".
+    """
+
+    def test_empty_workspace_id_query_param_rejected(self, client: TestClient):
+        """The literal payload from the finding: `?workspace_id=`."""
+        mock_db = MagicMock()
+        # If this mock is EVER called, the bypass has reopened -- the
+        # boundary check must reject the request before reaching here.
+        mock_db.get_dead_letter_jobs = AsyncMock(
+            return_value=[{"id": 1, "workspace_id": "ws_victim"}]
+        )
+        with patch("src.temporal.shared_services.get_db_service", return_value=mock_db):
+            resp = client.get(
+                "/dead-letter?workspace_id=",
+                headers={"X-API-Key": VALID_API_KEY},
+            )
+        assert resp.status_code == 422
+        mock_db.get_dead_letter_jobs.assert_not_called()
+
+    def test_whitespace_workspace_id_query_param_rejected(self, client: TestClient):
+        """`?workspace_id=%20` (a single space) has length 1, so a bare
+        `min_length=1` Query constraint alone would NOT catch this --
+        require_workspace_id's strip-then-check must."""
+        mock_db = MagicMock()
+        mock_db.get_dead_letter_jobs = AsyncMock(
+            return_value=[{"id": 1, "workspace_id": "ws_victim"}]
+        )
+        with patch("src.temporal.shared_services.get_db_service", return_value=mock_db):
+            resp = client.get(
+                "/dead-letter?workspace_id=%20",
+                headers={"X-API-Key": VALID_API_KEY},
+            )
+        assert resp.status_code == 422
+        mock_db.get_dead_letter_jobs.assert_not_called()
+
+    def test_single_job_routes_reject_empty_workspace_id_too(self, client: TestClient):
+        """The same payload against the single-job dead-letter routes
+        (#1's instruction: apply the boundary check everywhere workspace_id
+        was made required, not just the list endpoint)."""
+        mock_db = MagicMock()
+        mock_db.get_dead_letter_job = AsyncMock(
+            return_value={"id": 1, "workspace_id": "ws_victim", "status": "pending"}
+        )
+        with patch("src.temporal.shared_services.get_db_service", return_value=mock_db):
+            get_resp = client.get(
+                "/dead-letter/1?workspace_id=", headers={"X-API-Key": VALID_API_KEY}
+            )
+            retry_resp = client.post(
+                "/dead-letter/1/retry?workspace_id=", headers={"X-API-Key": VALID_API_KEY}
+            )
+            abandon_resp = client.post(
+                "/dead-letter/1/abandon?workspace_id=", headers={"X-API-Key": VALID_API_KEY}
+            )
+        assert get_resp.status_code == 422
+        assert retry_resp.status_code == 422
+        assert abandon_resp.status_code == 422
+        mock_db.get_dead_letter_job.assert_not_called()
+
+    def test_document_routes_reject_empty_workspace_id_too(self, client: TestClient):
+        """Same payload against the document-scoped routes."""
+        mock_db = MagicMock()
+        mock_db.get_document_status = AsyncMock(return_value=_OWNED_DOC)
+        with patch("src.temporal.shared_services.get_db_service", return_value=mock_db):
+            status_resp = client.get(
+                "/ingest/doc1/status?workspace_id=", headers={"X-API-Key": VALID_API_KEY}
+            )
+            lineage_resp = client.get(
+                "/lineage/doc1?workspace_id=", headers={"X-API-Key": VALID_API_KEY}
+            )
+            delete_resp = client.delete(
+                "/documents/doc1?workspace_id=&user_id=u1", headers={"X-API-Key": VALID_API_KEY}
+            )
+        assert status_resp.status_code == 422
+        assert lineage_resp.status_code == 422
+        assert delete_resp.status_code == 422
+        mock_db.get_document_status.assert_not_called()
+
+    async def test_db_layer_raises_on_blank_workspace_id_rather_than_widening(self):
+        """DatabaseService.get_dead_letter_jobs itself -- not just the route
+        -- must refuse a blank workspace_id (#2 in the review: the DB layer
+        is what stops the NEXT caller reintroducing this bug). This calls
+        the real method (engine mocked as present so the blank-check is
+        what's under test, not the "not connected" guard)."""
+        from src.services.database import DatabaseService
+
+        db = DatabaseService.__new__(DatabaseService)
+        db.engine = MagicMock()  # truthy, so we reach the workspace_id check
+
+        for blank in ("", "   ", None):
+            with pytest.raises(ValueError, match="non-blank workspace_id"):
+                await db.get_dead_letter_jobs(workspace_id=blank)  # type: ignore[arg-type]

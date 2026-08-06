@@ -539,37 +539,73 @@ All notable changes to Inherent are documented here. The format follows
 
 - **Seven more inh-ingestion-svc endpoints trusted a caller-supplied
   `workspace_id`/`document_id`/`job_id` with no ownership check, closing the
-  `GET /dead-letter` → `PATCH /chunks` escalation chain #134 flagged as
-  unresolved.** `DELETE /documents/{document_id}` (#175) and six more routes
-  (#177) — `GET /ingest/{document_id}/status`, `GET /lineage/{document_id}`,
+  `GET /dead-letter` → `PATCH /chunks` cross-tenant harvesting vector #134
+  flagged as unresolved — and closing a bypass an adversarial review found
+  in this fix's own first draft.** `DELETE /documents/{document_id}` (#175)
+  and six more routes (#177) — `GET /ingest/{document_id}/status`,
+  `GET /lineage/{document_id}`, `GET /dead-letter`,
+  `GET /dead-letter/{job_id}`, `POST /dead-letter/{job_id}/retry`,
+  `POST /dead-letter/{job_id}/abandon` — were gated only by `verify_api_key`.
+  `DELETE /documents` additionally used the caller-supplied
+  `workspace_id`/`user_id` UNVERIFIED to pick the Weaviate tenant to delete
+  from and never scoped the PostgreSQL delete at all. `GET /dead-letter` was
+  the sharpest edge: `workspace_id` was an *optional* filter, so omitting it
+  returned dead-letter rows — each carrying a genuine `(document_id,
+  workspace_id, user_id)` triple — across every tenant. A caller holding
+  only the shared `INGESTION_API_KEY` could harvest a real cross-tenant pair
+  there and present it to `PATCH /chunks/{document_id}/{chunk_index}`:
+  #134's guard checks `(document_id, workspace_id)` *consistency*, which a
+  harvested pair genuinely satisfies, so it would pass and let the caller
+  overwrite (and re-embed) a victim's chunk.
+
+  All seven routes now mirror #134's match-or-404 guard
+  (`src/api/ownership.py`: `resolve_owned_document`,
+  `resolve_owned_dead_letter_job`): resolve the row against PostgreSQL
+  first, 404 unless its stored `workspace_id` matches the caller's claim
+  (same response for missing vs. foreign-workspace, so existence doesn't
+  leak), and use only the *resolved* workspace_id/user_id downstream —
+  never the caller-supplied ones. `GET /dead-letter` also makes
+  `workspace_id` a *required*, always-enforced filter instead of an
+  optional one.
+
+  **This fix's own first draft was itself bypassable and was caught before
+  merge, not after.** `Query(..., min_length=1)` alone rejects a fully
+  empty `?workspace_id=` but not a whitespace-only one, and — the actual
+  hole — presence validation on the route said nothing about what
+  `DatabaseService.get_dead_letter_jobs` then did with the value: it
+  guarded its WHERE clause with a bare `if workspace_id:`, falsy for `""`,
+  so `?workspace_id=` skipped the filter entirely and returned every
+  tenant's rows. `workspace_id` is now validated at three independent
+  layers before it can reach a query: `min_length=1` on the `Query`, a
+  shared `require_workspace_id` boundary check (strips and rejects
+  whitespace-only values, used by every route above), and
+  `get_dead_letter_jobs`/`delete_document` themselves now REQUIRE
+  `workspace_id` and raise rather than silently widening scope on a falsy
+  value — so a future caller of either DB method can't reintroduce the same
+  fail-open shape by skipping the route-level check. Every denial (blank
+  `workspace_id`, unknown document/job, workspace mismatch) is now logged
+  as `workspace_access_denied` (mirrors inh-public-api-svc's
+  `services/auth.py`), where none of this was visible before.
+
+  A PostgreSQL failure during any of these lookups propagates as a 5xx;
+  none of them fail open.
+
+  **This remains workspace<->row CONSISTENCY, not caller<->workspace
+  ENTITLEMENT.** `verify_api_key` is one shared secret with no
+  key→workspace binding (unlike the public API's `resolve_workspace_read`),
+  so these checks only prove the caller named a workspace/document pair
+  that is genuinely consistent in PostgreSQL — not that the caller is
+  actually entitled to that workspace. Giving `INGESTION_API_KEY` real
+  key→workspace binding is a separate, larger design decision #177's issue
+  body tracks as a follow-up; it is NOT resolved by this change. (#175,
+  #177)
+- **⚠️ BREAKING (API) — `workspace_id` is now a required, non-blank query
+  param on six more inh-ingestion-svc routes, and on
+  `DELETE /documents/{document_id}` it is now verified, not just
+  accepted.** Required by the fix above; a request omitting `workspace_id`,
+  or passing it blank/whitespace-only (`?workspace_id=`, `?workspace_id=%20`),
+  on `GET /ingest/{document_id}/status`, `GET /lineage/{document_id}`,
   `GET /dead-letter`, `GET /dead-letter/{job_id}`,
-  `POST /dead-letter/{job_id}/retry`, `POST /dead-letter/{job_id}/abandon` —
-  were gated only by `verify_api_key`. `DELETE /documents` additionally used
-  the caller-supplied `workspace_id`/`user_id` UNVERIFIED to pick the
-  Weaviate tenant to delete from and never scoped the PostgreSQL delete at
-  all. `GET /dead-letter` was the sharpest edge: `workspace_id` was an
-  *optional* filter, so omitting it returned dead-letter rows — each
-  carrying a genuine `(document_id, workspace_id, user_id)` triple — across
-  every tenant. A caller holding only the shared `INGESTION_API_KEY` could
-  harvest a real cross-tenant pair there and present it to
-  `PATCH /chunks/{document_id}/{chunk_index}`: #134's guard checks
-  `(document_id, workspace_id)` *consistency*, which a harvested pair
-  genuinely satisfies, so it would pass and let the caller overwrite (and
-  re-embed) a victim's chunk. All seven routes now mirror #134's
-  match-or-404 guard (`src/api/ownership.py`, shared by both
-  `resolve_owned_document` and `resolve_owned_dead_letter_job`): resolve the
-  row against PostgreSQL first, 404 unless its stored `workspace_id` matches
-  the caller's claim (same response for missing vs. foreign-workspace, so
-  existence doesn't leak), and use only the *resolved* workspace_id/user_id
-  downstream — never the caller-supplied ones. `GET /dead-letter` also makes
-  `workspace_id` a *required*, always-enforced filter instead of an optional
-  one. A PostgreSQL failure during any of these lookups propagates as a 5xx;
-  none of them fail open. (#175, #177)
-- **⚠️ BREAKING (API) — `workspace_id` is now a required query param on six
-  more inh-ingestion-svc routes, and on `DELETE /documents/{document_id}` it
-  is now verified, not just accepted.** Required by the fix above; a request
-  omitting `workspace_id` on `GET /ingest/{document_id}/status`,
-  `GET /lineage/{document_id}`, `GET /dead-letter`, `GET /dead-letter/{job_id}`,
   `POST /dead-letter/{job_id}/retry`, or `POST /dead-letter/{job_id}/abandon`
   now gets **422** instead of the previous (unscoped) behavior. Every
   existing caller of these inh-ingestion-svc-internal endpoints must add
@@ -589,9 +625,13 @@ All notable changes to Inherent are documented here. The format follows
   already holds a valid `(document_id, workspace_id)` pair for a workspace
   it doesn't own is still not stopped by this fix on its own — seven more
   inh-ingestion-svc endpoints shared that gap, including a
-  `GET /dead-letter` → `PATCH /chunks` escalation chain; see the (#175,
-  #177) entry above, which closes it by making `GET /dead-letter` unable to
-  hand out a genuine cross-tenant pair in the first place. (#134)
+  `GET /dead-letter` → `PATCH /chunks` harvesting vector; see the (#175,
+  #177) entry above, which closes that specific harvesting vector by making
+  `GET /dead-letter` unable to hand out a genuine cross-tenant pair (verified
+  filtering, not just an accepted parameter — see that entry for the
+  bypass an adversarial review caught in the first attempt). It does NOT
+  close the underlying consistency-vs-entitlement gap those entries both
+  describe. (#134)
 - **⚠️ BREAKING (API) — `workspace_id` is now a required query param on
   `PATCH /chunks/{document_id}/{chunk_index}`.** Required by the fix above;
   a request omitting it now gets **422** instead of editing the chunk. Every

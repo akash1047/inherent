@@ -22,7 +22,11 @@ from temporalio.exceptions import TerminatedError, WorkflowAlreadyStartedError
 from temporalio.service import RPCError
 
 from src.api.auth import verify_api_key
-from src.api.ownership import resolve_owned_dead_letter_job, resolve_owned_document
+from src.api.ownership import (
+    require_workspace_id,
+    resolve_owned_dead_letter_job,
+    resolve_owned_document,
+)
 from src.config.settings import Settings
 from src.services.metrics import get_metrics
 from src.temporal.models import (
@@ -374,7 +378,9 @@ def create_app(settings: Settings) -> FastAPI:
     async def get_ingestion_status(
         document_id: str,
         request: Request,
-        workspace_id: str = Query(..., description="Workspace that must own document_id"),
+        workspace_id: str = Query(
+            ..., min_length=1, description="Workspace that must own document_id"
+        ),
     ):
         """Query the real-time progress of a running ingestion workflow.
 
@@ -444,7 +450,9 @@ def create_app(settings: Settings) -> FastAPI:
         chunk_index: int,
         body: ChunkEditRequest,
         request: Request,
-        workspace_id: str = Query(..., description="Workspace that must own document_id"),
+        workspace_id: str = Query(
+            ..., min_length=1, description="Workspace that must own document_id"
+        ),
     ):
         """Edit a chunk via Temporal workflow (updates PG + re-embeds in Weaviate).
 
@@ -569,7 +577,9 @@ def create_app(settings: Settings) -> FastAPI:
     async def delete_document(
         document_id: str,
         request: Request,
-        workspace_id: str = Query(..., description="Workspace that must own document_id"),
+        workspace_id: str = Query(
+            ..., min_length=1, description="Workspace that must own document_id"
+        ),
         user_id: str = Query(
             ...,
             description=(
@@ -667,7 +677,9 @@ def create_app(settings: Settings) -> FastAPI:
     )
     async def get_lineage(
         document_id: str,
-        workspace_id: str = Query(..., description="Workspace that must own document_id"),
+        workspace_id: str = Query(
+            ..., min_length=1, description="Workspace that must own document_id"
+        ),
     ):
         """Get data lineage (ingestion events) for a document.
 
@@ -717,9 +729,9 @@ def create_app(settings: Settings) -> FastAPI:
     @dl_router.get("")
     async def list_dead_letter_jobs(
         workspace_id: str = Query(
-            ..., description="Workspace to list dead-letter jobs for (required, #177)"
+            ..., min_length=1, description="Workspace to list dead-letter jobs for (required, #177)"
         ),
-        status: str | None = Query("pending"),
+        status: str | None = Query("pending", min_length=1),
         limit: int = Query(50, ge=1, le=200),
     ):
         """List dead-letter jobs, scoped to a workspace.
@@ -732,12 +744,28 @@ def create_app(settings: Settings) -> FastAPI:
         pair here, then present it to ``PATCH /chunks/{document_id}/{chunk_index}``
         -- #134's ownership guard checks (document_id, workspace_id)
         CONSISTENCY, which this harvested pair genuinely satisfies, so it
-        would pass. ``workspace_id`` is now REQUIRED and always enforced as
-        a DB-level filter (``DatabaseService.get_dead_letter_jobs``), never
-        an optional one -- this endpoint can no longer be the source of a
+        would pass.
+
+        ``workspace_id`` is now REQUIRED at the FastAPI layer (``min_length=1``
+        rejects a fully-empty ``?workspace_id=``), boundary-validated AGAIN
+        via ``require_workspace_id`` (rejects a whitespace-only value like
+        ``?workspace_id=%20``, which ``min_length=1`` alone does not catch),
+        and REQUIRED (not optional, no falsy-skips-the-filter path) in
+        ``DatabaseService.get_dead_letter_jobs`` itself. Post-#177-review
+        finding: an adversarial pass proved the FIRST version of this fix
+        was bypassable -- ``Query(...)`` alone only enforces PRESENCE of the
+        query param, not non-emptiness, so ``?workspace_id=`` (present,
+        empty) passed FastAPI validation, then hit
+        ``get_dead_letter_jobs``'s old ``if workspace_id:`` guard (falsy for
+        ``""``), which silently skipped the WHERE clause and returned every
+        workspace's rows -- the exact cross-tenant harvest this endpoint
+        exists to prevent. All three layers now have to independently agree
+        the value is non-blank before this endpoint can be the source of a
         genuine cross-tenant pair.
         """
         from src.temporal import shared_services
+
+        workspace_id = require_workspace_id(workspace_id)
 
         db_svc = shared_services.get_db_service()
         jobs = await db_svc.get_dead_letter_jobs(
@@ -764,7 +792,7 @@ def create_app(settings: Settings) -> FastAPI:
     )
     async def get_dead_letter_job(
         job_id: int,
-        workspace_id: str = Query(..., description="Workspace that must own job_id"),
+        workspace_id: str = Query(..., min_length=1, description="Workspace that must own job_id"),
     ):
         """Get a single dead-letter job by ID.
 
@@ -796,7 +824,7 @@ def create_app(settings: Settings) -> FastAPI:
     async def retry_dead_letter_job(
         job_id: int,
         request: Request,
-        workspace_id: str = Query(..., description="Workspace that must own job_id"),
+        workspace_id: str = Query(..., min_length=1, description="Workspace that must own job_id"),
     ):
         """Retry a dead-letter job by re-publishing its original message.
 
@@ -846,7 +874,7 @@ def create_app(settings: Settings) -> FastAPI:
     )
     async def abandon_dead_letter_job(
         job_id: int,
-        workspace_id: str = Query(..., description="Workspace that must own job_id"),
+        workspace_id: str = Query(..., min_length=1, description="Workspace that must own job_id"),
     ):
         """Mark a dead-letter job as permanently abandoned.
 
