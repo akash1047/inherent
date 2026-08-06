@@ -198,6 +198,52 @@ class TestIntakeDocumentValidation:
             )
 
 
+class TestIntakeDocumentExplicitlyRejectedLegacyFormats:
+    """#124/#126: legacy .doc and Outlook .msg are intentionally NOT in
+    FILE_TYPE_REGISTRY (accept-then-garble is explicitly disallowed), but
+    they get a SPECIFIC, actionable 400 message pointing at the supported
+    replacement -- not the generic "Unsupported file type" text every other
+    unregistered type gets. Neither upload may leave any partial state:
+    nothing stored, nothing persisted, for a request rejected before step 6.
+    """
+
+    async def test_legacy_doc_rejected_with_convert_to_docx_message(
+        self, mock_db, mock_storage, mock_mq
+    ):
+        p1, p2 = _patches(mock_storage, mock_mq)
+        with p1, p2, pytest.raises(BadRequestError) as exc_info:
+            await document_intake.intake_document(
+                database=mock_db,
+                workspace_id="test-workspace-id",
+                user_id="test-user-id",
+                content_bytes=b"\xd0\xcf\x11\xe0 fake OLE compound file bytes",
+                filename="report.doc",
+                content_type="application/msword",
+            )
+
+        assert ".docx" in exc_info.value.detail
+        mock_storage.upload_file.assert_not_awaited()
+        mock_db.create_or_reset_pending_document.assert_not_awaited()
+
+    async def test_outlook_msg_rejected_with_export_to_eml_message(
+        self, mock_db, mock_storage, mock_mq
+    ):
+        p1, p2 = _patches(mock_storage, mock_mq)
+        with p1, p2, pytest.raises(BadRequestError) as exc_info:
+            await document_intake.intake_document(
+                database=mock_db,
+                workspace_id="test-workspace-id",
+                user_id="test-user-id",
+                content_bytes=b"\xd0\xcf\x11\xe0 fake OLE compound file bytes",
+                filename="message.msg",
+                content_type="application/vnd.ms-outlook",
+            )
+
+        assert ".eml" in exc_info.value.detail
+        mock_storage.upload_file.assert_not_awaited()
+        mock_db.create_or_reset_pending_document.assert_not_awaited()
+
+
 class TestIntakeDocumentMagicByteSniffing:
     """#117: MIME type is entirely client-supplied and, before this, was
     never checked against the actual bytes. These pin the closed hole --

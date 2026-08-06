@@ -16,6 +16,7 @@ from inh_contracts.file_types import (
     ContentTypeMismatchError,
     ExtensionMismatchError,
     check_extension_consistency,
+    explicitly_unsupported_message_for_mime,
     get_spec_for_mime,
     sniff_content_type,
 )
@@ -83,6 +84,20 @@ async def intake_document(
         ServiceUnavailableError: S3 upload or pending-row persistence failed.
     """
     # --- 1. Validate content type -------------------------------------------
+    # Checked BEFORE the generic registry lookup below (#124/#126): a format
+    # that is deliberately unsupported but has a real replacement (legacy
+    # .doc -> .docx, Outlook .msg -> .eml) gets a message naming that
+    # replacement, not the generic allow-list dump every other unrecognized
+    # type gets -- "explicit 400, never accept-then-garble" per both issues.
+    # Sourced from inh_contracts' EXPLICITLY_UNSUPPORTED table (#124/#126
+    # review blocker 3) -- a hand-maintained copy of this table lived here
+    # alone until a review caught it meant the MCP `upload_document` surface
+    # never learned about it and could accept the exact formats this is
+    # supposed to reject.
+    rejection_message = explicitly_unsupported_message_for_mime(content_type)
+    if rejection_message is not None:
+        raise BadRequestError(detail=rejection_message)
+
     spec = get_spec_for_mime(content_type)
     if spec is None:
         raise BadRequestError(

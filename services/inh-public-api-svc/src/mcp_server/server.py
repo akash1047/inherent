@@ -58,7 +58,12 @@ import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
-from inh_contracts.file_types import get_spec_for_extension, mcp_mime_types
+from inh_contracts.file_types import (
+    explicitly_unsupported_message_for_extension,
+    explicitly_unsupported_message_for_mime,
+    get_spec_for_extension,
+    mcp_mime_types,
+)
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
@@ -948,12 +953,33 @@ async def _handle_upload_document(key_info: APIKeyInfo, arguments: dict) -> list
     """
     filename = arguments.get("filename", "")
     content = arguments.get("content", "")
-    content_type = arguments.get("content_type") or _default_upload_content_type(filename)
+    declared_content_type = arguments.get("content_type")
 
     if not filename:
         return [TextContent(type="text", text="Error: filename is required")]
     if not content:
         return [TextContent(type="text", text="Error: content is required and cannot be empty")]
+
+    # Explicitly-unsupported formats (#124/#126 review blocker 3) -- checked
+    # BEFORE the content_type default is resolved below, against BOTH the
+    # declared content_type (if the caller passed one) and the filename
+    # extension. The extension check is what closes the actual hole: this
+    # tool's content_type is OPTIONAL and defaults from the filename
+    # extension when omitted (see `_default_upload_content_type`), and
+    # '.doc'/'.msg' have no FILE_TYPE_REGISTRY entry to derive a content
+    # type from -- so a caller who omits content_type for "report.doc" used
+    # to silently default to "text/markdown" (MCP-eligible) and sail
+    # straight through as if it were prose, the exact accept-then-garble
+    # outcome both issues forbid. Sourced from the SAME
+    # inh_contracts.EXPLICITLY_UNSUPPORTED table REST's intake_document
+    # reads, so the two surfaces cannot drift on which formats this covers.
+    rejection_message = (
+        declared_content_type and explicitly_unsupported_message_for_mime(declared_content_type)
+    ) or explicitly_unsupported_message_for_extension(filename)
+    if rejection_message is not None:
+        return [TextContent(type="text", text=f"Error: {rejection_message}")]
+
+    content_type = declared_content_type or _default_upload_content_type(filename)
 
     if content_type not in SUPPORTED_TEXT_MIME_TYPES:
         return [

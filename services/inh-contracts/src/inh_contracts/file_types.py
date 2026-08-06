@@ -149,18 +149,49 @@ class FileTypeSpec:
     # service's global MAX_UPLOAD_SIZE_BYTES default".
     max_size_bytes: int | None = None
 
+    # Overrides the default `_SNIFF_WINDOW` (1024 bytes) tolerance for THIS
+    # spec's OWN `magic` signature only. None (the default) means "use the
+    # standard tolerant window" -- correct for a real binary container
+    # format like PDF, which legitimately has leading junk (BOM, blank
+    # lines) before its signature in real-world files (see
+    # `sniff_content_type`'s docstring). Set this to a SMALL value only for
+    # a format whose real files NEVER have anything before the signature --
+    # otherwise a substring match anywhere in a large window can
+    # false-positive on ordinary PROSE that happens to mention the magic
+    # bytes (#126 review item 5: RTF's `{\rtf` is exactly this -- unlike
+    # `%PDF-`, it is plausible English prose, e.g. a sentence explaining
+    # RTF's own file format, so a 1024-byte substring search rejects
+    # legitimate text/markdown/html/eml uploads that merely discuss RTF).
+    magic_anchor_window: int | None = None
+
+    # Whether the extension-mismatch check (`check_extension_consistency`)
+    # should be SKIPPED for this format, even though it has a `magic`
+    # signature (used for sniffing above). Set for a format whose bytes are
+    # genuinely ASCII/text -- RTF is a control-word TEXT format, not a
+    # binary container, so it is plausibly declared under a generic text/*
+    # Content-Type by a real client, exactly the same "text/plain is a
+    # truthful, IANA-valid Content-Type for X" argument
+    # `check_extension_consistency`'s own docstring already makes for
+    # .txt/.md/.csv/.html (#126 review item 6). False (the default) for
+    # every genuinely BINARY container format (docx/epub/odt/png/pdf/...),
+    # where a mismatched extension IS still a real, actionable
+    # contradiction that must stay caught.
+    extension_check_exempt: bool = False
+
 
 # ---------------------------------------------------------------------------
 # The registry
 # ---------------------------------------------------------------------------
-# One entry per currently-supported format. Order here is the order rendered
-# in error messages and generated docs -- matches the pre-#117
-# constants.py ALLOWED_MIME_TYPES ordering exactly (plain text, Markdown,
-# CSV, HTML, PDF, JSON, DOCX, PNG), so the 400 error text is byte-for-byte
-# unchanged by this migration. (docs/index.md's prose list happened to state
-# JSON before PDF -- a pre-existing, harmless inconsistency between two
-# human-readable listings that predates #117; this registry follows the
-# CODE's order, the one that actually appears in a response body.)
+# One entry per currently-supported format. The FIRST EIGHT entries match
+# the pre-#117 constants.py ALLOWED_MIME_TYPES ordering exactly (plain text,
+# Markdown, CSV, HTML, PDF, JSON, DOCX, PNG), so the 400 error text for those
+# eight is byte-for-byte unchanged by this migration -- entries after PNG are
+# formats #117 itself did not cover (#118+), appended in whatever order their
+# own issues landed; nothing beyond "the first eight" was ever a promise.
+# (docs/index.md's prose list happened to state JSON before PDF -- a
+# pre-existing, harmless inconsistency between two human-readable listings
+# that predates #117; this registry follows the CODE's order, the one that
+# actually appears in a response body.)
 #
 # Adding a NEW format (the whole point of #117) is:
 #   1. One FileTypeSpec entry below.
@@ -297,7 +328,168 @@ FILE_TYPE_REGISTRY: tuple[FileTypeSpec, ...] = (
         optional_extra="ocr",
         degradation="placeholder",
     ),
+    # -- Long-tail formats (#124/#125/#126) -- the low-dependency group: EML
+    # needs only the stdlib `email` package, EPUB needs stdlib `zipfile` plus
+    # the bs4 already a core dep, RTF needs one tiny pure-Python dep
+    # (striprtf), and ODT is a zip of XML read through the same tag-strip
+    # path as HTML/EPUB. All REST-only: EML transports raw, possibly
+    # non-UTF-8-encoded bytes and the other three are binary containers, none
+    # of which can cross the MCP upload_document tool's inline-UTF-8-text-only
+    # boundary (#87 Task 3).
+    FileTypeSpec(
+        key="eml",
+        mime_types=("message/rfc822",),
+        extensions=(".eml",),
+        # RFC 822 messages have no binary file signature -- like every other
+        # text/* entry above, this relies entirely on sniff_content_type's
+        # cross-check against OTHER specs' signatures (e.g. real PNG bytes
+        # declared message/rfc822 are still caught).
+        magic=None,
+        surfaces=frozenset({"rest"}),
+        extractor="eml",
+        chunking_hint="prose",
+    ),
+    FileTypeSpec(
+        key="epub",
+        mime_types=("application/epub+zip",),
+        extensions=(".epub",),
+        # EPUB is a ZIP container (OCF) -- shares the identical PK\x03\x04
+        # signature with docx/xlsx/pptx/odt/zip. See the `docx` entry's
+        # comment and `_magic_families_overlap`: this is a "same family,
+        # cannot disambiguate at this level" case, not a conflict -- both
+        # docx and epub still validate correctly (pinned by
+        # test_docx_still_validates_with_epub_and_odt_registered in
+        # inh-contracts' test suite).
+        magic=b"PK\x03\x04",
+        surfaces=frozenset({"rest"}),
+        extractor="epub",
+        # The closed ChunkingHint vocabulary (#129) has no dedicated
+        # "chapter-segmented" value yet; "prose" is the closest existing fit
+        # for long-form chapter text. The extractor's own "## Chapter N"
+        # markers (spine order) are what give a future format-aware chunker
+        # the actual chapter boundaries to split on.
+        chunking_hint="prose",
+    ),
+    FileTypeSpec(
+        key="rtf",
+        # application/rtf is the canonical/registered IANA type; text/rtf is
+        # the alias many real-world clients (older Word exports, macOS
+        # TextEdit) send instead -- both must be accepted (#126).
+        mime_types=("application/rtf", "text/rtf"),
+        extensions=(".rtf",),
+        # Real RTF files begin with the literal control word "{\rtf1..." --
+        # a distinct signature from every other family registered here (not
+        # the shared ZIP PK\x03\x04 prefix), so this one gets a real,
+        # disambiguating magic check rather than a same-family pass-through.
+        magic=b"{\\rtf",
+        # ANCHORED to the first 8 bytes (5-byte magic + 3 bytes of slack for
+        # a stray UTF-8 BOM) rather than the default 1024-byte window: a
+        # real RTF file's signature is always at byte 0, and unlike PDF's
+        # `%PDF-`, the string "{\rtf" is plausible ordinary prose (e.g. a
+        # sentence about RTF itself) that a full-window substring search
+        # would wrongly reject when it appears anywhere in an unrelated
+        # text/markdown/html/eml upload (#126 review item 5).
+        magic_anchor_window=8,
+        # RTF is a control-word TEXT format, not a binary container --
+        # exempted from the binary-extension mismatch check the same way
+        # .txt/.md/.csv/.html are, since text/plain is a truthful Content-
+        # Type a real client may declare for it (#126 review item 6).
+        extension_check_exempt=True,
+        surfaces=frozenset({"rest"}),
+        extractor="rtf",
+        chunking_hint="prose",
+    ),
+    FileTypeSpec(
+        key="odt",
+        mime_types=("application/vnd.oasis.opendocument.text",),
+        extensions=(".odt",),
+        # ODT is also a ZIP container (ODF) -- same PK\x03\x04 family as
+        # docx/epub above; see the epub entry's comment for why this is safe.
+        magic=b"PK\x03\x04",
+        surfaces=frozenset({"rest"}),
+        extractor="odt",
+        chunking_hint="prose",
+    ),
 )
+
+
+# ---------------------------------------------------------------------------
+# Explicitly unsupported formats -- deliberately NOT in FILE_TYPE_REGISTRY,
+# but with a real supported replacement, so a caller gets a SPECIFIC,
+# actionable rejection instead of the generic "Unsupported file type" allow-
+# list dump (#124/#126). "Explicit 400, never accept-then-garble" per both
+# issues -- the message names the replacement instead of leaving the caller
+# to guess.
+#
+# This lives beside FILE_TYPE_REGISTRY (not duplicated per-service) after a
+# #124/#126 review caught the single-service version of this table causing a
+# cross-surface hole: REST's own local copy meant MCP's `upload_document`
+# never learned about it, and MCP's content_type default (derived from the
+# filename extension when the caller omits content_type) fell through to a
+# generic MCP-eligible type for a filename like "report.doc" -- silently
+# accepting and indexing the exact format both issues say must be rejected.
+# Both `mime_types` AND `extensions` are needed here (unlike most of this
+# module, which treats extension as a secondary signal): REST always has a
+# declared Content-Type, but MCP's upload_document resolves its content_type
+# FROM the filename extension when the caller omits it, so the extension
+# itself must be a first-class rejection key, not just a fallback check.
+@dataclass(frozen=True)
+class ExplicitlyUnsupportedSpec:
+    """One deliberately-rejected format: a short key, the MIME type(s) and
+    extension(s) that identify it, and the actionable message every surface
+    shows instead of the generic allow-list dump."""
+
+    key: str
+    mime_types: tuple[str, ...]
+    extensions: tuple[str, ...]
+    message: str
+
+
+EXPLICITLY_UNSUPPORTED: tuple[ExplicitlyUnsupportedSpec, ...] = (
+    ExplicitlyUnsupportedSpec(
+        key="doc",
+        mime_types=("application/msword",),
+        extensions=(".doc",),
+        message="Legacy .doc files are not supported. Convert the file to .docx and re-upload.",
+    ),
+    ExplicitlyUnsupportedSpec(
+        key="msg",
+        mime_types=("application/vnd.ms-outlook",),
+        extensions=(".msg",),
+        message="Outlook .msg files are not supported. Export the message to .eml and re-upload.",
+    ),
+)
+
+
+def explicitly_unsupported_message_for_mime(content_type: str) -> str | None:
+    """The actionable rejection message for `content_type`, or None if it
+    isn't one of the specifically-called-out unsupported formats above.
+    Normalized the same way `get_spec_for_mime` normalizes the registry
+    (strip Content-Type parameters, lowercase, strip whitespace)."""
+    normalized = content_type.split(";", 1)[0].strip().lower()
+    for spec in EXPLICITLY_UNSUPPORTED:
+        if normalized in spec.mime_types:
+            return spec.message
+    return None
+
+
+def explicitly_unsupported_message_for_extension(filename: str) -> str | None:
+    """The actionable rejection message for `filename`'s extension, or None.
+
+    Needed on top of the MIME-based lookup above for any surface that can
+    resolve a content type FROM the filename when none is declared (MCP's
+    upload_document, see the module comment above) -- checking the MIME
+    alone misses that path entirely, which is exactly how a `report.doc`
+    upload with `content_type` omitted used to slip through as
+    ``text/markdown`` (#124/#126 review blocker 3).
+    """
+    if "." not in filename:
+        return None
+    extension = "." + filename.rsplit(".", 1)[-1].strip().lower()
+    for spec in EXPLICITLY_UNSUPPORTED:
+        if extension in spec.extensions:
+            return spec.message
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -416,11 +608,15 @@ class ContentTypeMismatchError(ValueError):
 _SNIFF_WINDOW = 1024
 
 
-def _contains_signature(content: bytes, magic: bytes) -> bool:
-    """Whether `magic` appears within the first `_SNIFF_WINDOW` bytes of
-    `content` -- see the module comment above for why this isn't a strict
-    ``content.startswith(magic)``."""
-    return magic in content[:_SNIFF_WINDOW]
+def _contains_signature(content: bytes, magic: bytes, window: int = _SNIFF_WINDOW) -> bool:
+    """Whether `magic` appears within the first `window` bytes of `content`
+    -- see the module comment above for why this isn't a strict
+    ``content.startswith(magic)``. `window` defaults to `_SNIFF_WINDOW` but
+    is overridable per-spec via `FileTypeSpec.magic_anchor_window` (#126
+    review item 5) for a format whose real files never have anything before
+    the signature, where a full 1024-byte substring search risks matching
+    ordinary prose instead of an actual file of that format."""
+    return magic in content[:window]
 
 
 def _magic_families_overlap(a: bytes, b: bytes) -> bool:
@@ -478,7 +674,12 @@ def sniff_content_type(content: bytes, declared_mime: str) -> FileTypeSpec:
     if spec is None:
         raise UnknownContentTypeError(declared_mime)
 
-    if spec.magic is not None and not _contains_signature(content, spec.magic):
+    # The window a given spec's OWN signature is searched within is a
+    # property of THAT spec (`magic_anchor_window`), not of the sniff call
+    # site -- whether junk may legitimately precede the signature depends on
+    # the format itself (PDF: yes: RTF: no, see the field's docstring).
+    own_window = spec.magic_anchor_window if spec.magic_anchor_window is not None else _SNIFF_WINDOW
+    if spec.magic is not None and not _contains_signature(content, spec.magic, own_window):
         raise ContentTypeMismatchError(
             declared_mime,
             f"expected the '{spec.key}' file signature but the bytes did not match it",
@@ -489,7 +690,10 @@ def sniff_content_type(content: bytes, declared_mime: str) -> FileTypeSpec:
             continue
         if spec.magic is not None and _magic_families_overlap(spec.magic, other.magic):
             continue
-        if _contains_signature(content, other.magic):
+        other_window = (
+            other.magic_anchor_window if other.magic_anchor_window is not None else _SNIFF_WINDOW
+        )
+        if _contains_signature(content, other.magic, other_window):
             raise ContentTypeMismatchError(
                 declared_mime,
                 f"the bytes match the '{other.key}' file signature instead",
@@ -550,7 +754,16 @@ def check_extension_consistency(filename: str, declared_spec: FileTypeSpec) -> N
         return
 
     extension_spec = get_spec_for_extension(extension)
-    if extension_spec is None or extension_spec.magic is None:
+    if (
+        extension_spec is None
+        or extension_spec.magic is None
+        # RTF has a `magic` (needed for the binary-mislabel sniff above) but
+        # is genuinely ASCII text, not a binary container -- exempted here
+        # the same way .txt/.md/.csv/.html are, via `extension_check_exempt`
+        # rather than `magic is None`, since it still needs real sniffing
+        # (#126 review item 6).
+        or extension_spec.extension_check_exempt
+    ):
         return
     if extension_spec.key == declared_spec.key:
         return

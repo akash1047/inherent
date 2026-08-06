@@ -799,6 +799,7 @@ dependencies = [
     { name = "python-pptx" },
     { name = "redis" },
     { name = "sqlalchemy" },
+    { name = "striprtf" },
     { name = "structlog" },
     { name = "temporalio" },
     { name = "uvicorn", extra = ["standard"] },
@@ -863,6 +864,7 @@ requires-dist = [
     { name = "redis", specifier = ">=5.0.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = "==0.14.10" },
     { name = "sqlalchemy", specifier = ">=2.0.0" },
+    { name = "striprtf", specifier = ">=0.0.26,<0.1" },
     { name = "structlog", specifier = ">=24.0.0" },
     { name = "temporalio", specifier = ">=1.9.0" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.30.0" },
@@ -1924,6 +1926,15 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/e9/88/35e4d27d9177d7df76d060e0a18f69c6c5794c96960c94042e20a12c8ba2/stevedore-5.8.0.tar.gz", hash = "sha256:b49867b32ca3016e94100e68dbf26e72aa7b8708d0a3f73c08aeb220370ac715", size = 514710, upload-time = "2026-05-18T09:15:27.731Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/f5/ac/19f9941c74add59d17694930ec8105d5eddeee4ce56dd8632b765ca16d6c/stevedore-5.8.0-py3-none-any.whl", hash = "sha256:88eede9e66ca80e34085b9174e2327da2c61ac91f24f70e41c3ad76e4bb4872b", size = 54553, upload-time = "2026-05-18T09:15:25.82Z" },
+]
+
+[[package]]
+name = "striprtf"
+version = "0.0.32"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/86/f9/b3ecbd2e0abb9c29edd2913482f0c5df47a098221444ccd50cc5cd3f9b91/striprtf-0.0.32.tar.gz", hash = "sha256:7f375a375d99a2700842173168c90c9b545cb244241ffc5d868ed9f6baf9155f", size = 7571, upload-time = "2026-04-27T15:42:37.15Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/c3/cf/4157959aa36a567faab32a5fb078904b76654bdd86a3d7f8fba21ed89d84/striprtf-0.0.32-py3-none-any.whl", hash = "sha256:9f695fea9662cb4ffccf2b56286b3e77028c0a61e87258719584e681e0144869", size = 8044, upload-time = "2026-04-27T15:42:35.948Z" },
 ]
 
 [[package]]

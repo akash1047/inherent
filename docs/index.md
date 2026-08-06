@@ -10,6 +10,10 @@ You connect sources — plain text, Markdown, CSV, HTML, PDF, JSON, DOCX,
 XLSX, PPTX, PNG (OCR), see the full [supported file types](reference/file-types.md) list
 — and Inherent extracts, chunks, embeds, stores, and serves retrieval with
 citations, permissions, and freshness signals.
+PNG (OCR), EML, EPUB, RTF, ODT, see the full
+[supported file types](reference/file-types.md) list — and Inherent
+extracts, chunks, embeds, stores, and serves retrieval with citations,
+permissions, and freshness signals.
 
 [Get started locally](getting-started/local.md){ .md-button .md-button--primary }
 [What's new](release-notes.md){ .md-button }

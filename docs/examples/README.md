@@ -126,10 +126,17 @@ Allowed MIME types: `text/plain`, `text/markdown`, `text/csv`, `text/html`,
 `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet` (XLSX),
 `application/vnd.openxmlformats-officedocument.presentationml.presentation` (PPTX),
 `image/png` (OCR) — see the full [supported file types](../reference/file-types.md)
+`application/vnd.openxmlformats-officedocument.wordprocessingml.document`,
+`image/png` (OCR), `message/rfc822` (EML), `application/epub+zip` (EPUB),
+`application/rtf` / `text/rtf` (RTF), `application/vnd.oasis.opendocument.text`
+(ODT) — see the full [supported file types](../reference/file-types.md)
 reference for extensions, chunking strategy, and optional-dependency notes.
 Max size: 50 MB. Binary formats are magic-byte sniffed against the declared
 `Content-Type` at upload; a mismatch (e.g. PNG bytes declared `text/plain`)
-is rejected with `400 Bad Request`.
+is rejected with `400 Bad Request`. Legacy `application/msword` (.doc) and
+Outlook `application/vnd.ms-outlook` (.msg) are explicitly rejected with a
+`400` naming the supported replacement (.docx / .eml) rather than accepted
+and garbled.
 
 ### Upload plain text
 
@@ -281,6 +288,7 @@ curl -s -X POST "$API_BASE/v1/documents" \
   "title": "Bad Request",
   "status": 400,
   "detail": "Unsupported file type 'application/octet-stream'. Allowed types: text/plain, text/markdown, text/csv, text/html, application/pdf, application/json, application/vnd.openxmlformats-officedocument.wordprocessingml.document, application/vnd.openxmlformats-officedocument.spreadsheetml.sheet, application/vnd.openxmlformats-officedocument.presentationml.presentation, image/png"
+  "detail": "Unsupported file type 'application/octet-stream'. Allowed types: text/plain, text/markdown, text/csv, text/html, application/pdf, application/json, application/vnd.openxmlformats-officedocument.wordprocessingml.document, image/png, message/rfc822, application/epub+zip, application/rtf, text/rtf, application/vnd.oasis.opendocument.text"
 }
 ```
 

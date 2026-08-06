@@ -34,6 +34,10 @@ the build if this table and the registry ever disagree.
 | xlsx | `.xlsx` | `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet` | rest | tabular | — |
 | pptx | `.pptx` | `application/vnd.openxmlformats-officedocument.presentationml.presentation` | rest | structured | — |
 | png | `.png` | `image/png` | rest | media | `ocr` |
+| eml | `.eml` | `message/rfc822` | rest | prose | — |
+| epub | `.epub` | `application/epub+zip` | rest | prose | — |
+| rtf | `.rtf` | `application/rtf`, `text/rtf` | rest | prose | — |
+| odt | `.odt` | `application/vnd.oasis.opendocument.text` | rest | prose | — |
 
 <!-- END GENERATED FILE TYPES TABLE -->
 

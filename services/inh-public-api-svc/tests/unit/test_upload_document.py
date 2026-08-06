@@ -443,6 +443,82 @@ class TestUploadDocumentValidation:
         application.dependency_overrides.clear()
 
 
+class TestUploadExplicitlyRejectedLegacyFormats:
+    """#124/#126, exercised end-to-end through the real HTTP route: legacy
+    .doc and Outlook .msg are explicitly rejected with an actionable 400,
+    never accept-then-garble. No partial state on rejection."""
+
+    async def test_legacy_doc_rejected_400(self, write_key, mock_db, mock_storage, mock_mq):
+        application = create_app()
+        application.dependency_overrides[get_api_key_info] = lambda: write_key
+        application.dependency_overrides[get_write_permission] = lambda: write_key
+        application.dependency_overrides[resolve_workspace_write] = lambda: ResolvedAuth(
+            key_info=write_key, workspace_id=write_key.workspace_id
+        )
+        application.dependency_overrides[get_database] = lambda: mock_db
+
+        with (
+            patch.object(document_intake, "get_storage_service", return_value=mock_storage),
+            patch.object(
+                document_intake,
+                "get_mq_service",
+                new_callable=AsyncMock,
+                return_value=mock_mq,
+            ),
+        ):
+            transport = ASGITransport(app=application)
+            async with AsyncClient(transport=transport, base_url="http://test") as ac:
+                response = await ac.post(
+                    "/v1/documents",
+                    files=_file_payload(
+                        content=b"\xd0\xcf\x11\xe0 fake OLE bytes",
+                        filename="report.doc",
+                        content_type="application/msword",
+                    ),
+                    headers={"X-API-Key": "ink_test_key"},
+                )
+
+        assert response.status_code == 400
+        assert ".docx" in response.json()["detail"]
+        mock_storage.upload_file.assert_not_awaited()
+        application.dependency_overrides.clear()
+
+    async def test_outlook_msg_rejected_400(self, write_key, mock_db, mock_storage, mock_mq):
+        application = create_app()
+        application.dependency_overrides[get_api_key_info] = lambda: write_key
+        application.dependency_overrides[get_write_permission] = lambda: write_key
+        application.dependency_overrides[resolve_workspace_write] = lambda: ResolvedAuth(
+            key_info=write_key, workspace_id=write_key.workspace_id
+        )
+        application.dependency_overrides[get_database] = lambda: mock_db
+
+        with (
+            patch.object(document_intake, "get_storage_service", return_value=mock_storage),
+            patch.object(
+                document_intake,
+                "get_mq_service",
+                new_callable=AsyncMock,
+                return_value=mock_mq,
+            ),
+        ):
+            transport = ASGITransport(app=application)
+            async with AsyncClient(transport=transport, base_url="http://test") as ac:
+                response = await ac.post(
+                    "/v1/documents",
+                    files=_file_payload(
+                        content=b"\xd0\xcf\x11\xe0 fake OLE bytes",
+                        filename="message.msg",
+                        content_type="application/vnd.ms-outlook",
+                    ),
+                    headers={"X-API-Key": "ink_test_key"},
+                )
+
+        assert response.status_code == 400
+        assert ".eml" in response.json()["detail"]
+        mock_storage.upload_file.assert_not_awaited()
+        application.dependency_overrides.clear()
+
+
 class TestUploadMagicByteSniffing:
     """#117: content-type is client-supplied and, before this, was never
     checked against the actual bytes. Exercised through the real HTTP route
