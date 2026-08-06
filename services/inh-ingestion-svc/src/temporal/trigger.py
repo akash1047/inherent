@@ -93,6 +93,44 @@ class TemporalWorkflowTrigger:
             return "fetch_failed"
         return "unknown"
 
+    @staticmethod
+    def _build_source_memo(upload_message: DocumentUploadMessage) -> dict[str, str]:
+        """Build the Temporal memo describing where an ingestion came from
+        (inherent-systems/prime#187).
+
+        Memo needs no namespace search-attribute registration and renders
+        directly in the Temporal UI workflow summary panel, so operators can
+        tell a connector sync apart from a manual or public-API upload.
+
+        Backward compatible: messages produced before the ``source`` field
+        existed have it as None, which maps to "unknown" rather than crashing
+        the consumer. ``connection_id``/``sync_id`` are omitted entirely when
+        absent (only set for connector-sourced uploads).
+
+        Oversized-value handling (#141 adversarial pass): source/connection_id/
+        sync_id carry ``max_length=500`` on ``DocumentUploadMessage`` itself
+        (services/inh-contracts/src/inh_contracts/events.py), so a
+        pathologically large value never reaches this method at all --
+        ``DocumentUploadMessage(**message)`` raises ``PydanticValidationError``
+        first, in both trigger paths, before ``_build_source_memo`` is ever
+        called. ``trigger_workflow_async`` treats that exception as poison: it
+        dead-letters via ``_record_dead_letter`` and returns normally so the MQ
+        consumer ACKs the message (the redelivery loop in
+        services/inh-ingestion-svc/src/services/mq/redis_mq.py never sees this
+        failure mode). ``trigger_workflow`` (the synchronous, wait-for-result
+        path) returns a failed ``ProcessingResult`` for the same exception
+        instead of dead-lettering -- it has no production caller today (see
+        ``trigger_workflow_async`` for the path the MQ consumer actually
+        uses). Either way, this keeps the memo a value that is always correct
+        or entirely absent -- never a truncated, misleadingly-plausible one.
+        """
+        memo: dict[str, str] = {"source": upload_message.source or "unknown"}
+        if upload_message.connection_id:
+            memo["connection_id"] = upload_message.connection_id
+        if upload_message.sync_id:
+            memo["sync_id"] = upload_message.sync_id
+        return memo
+
     async def _record_dead_letter(
         self,
         document_id: str,
@@ -208,6 +246,7 @@ class TemporalWorkflowTrigger:
                 workflow_input,
                 id=workflow_id,
                 task_queue=self.settings.temporal_task_queue,
+                memo=self._build_source_memo(upload_message),
             )
 
             logger.info(
@@ -329,6 +368,7 @@ class TemporalWorkflowTrigger:
             workflow_input,
             id=workflow_id,
             task_queue=self.settings.temporal_task_queue,
+            memo=self._build_source_memo(upload_message),
         )
 
         # Record admission latency: MQ-receive → Temporal-accepted.

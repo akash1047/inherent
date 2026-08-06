@@ -205,6 +205,16 @@ async def intake_document(
         "storage_url": storage_url,
         "timestamp": now_iso,
         "contract_version": "1.0.0",
+        # Ingestion source labeling (inherent-systems/prime#187, ingestion-svc
+        # consumer side: inherent-prime/inherent#141). This function is the
+        # single intake path shared by both the REST route
+        # (POST /v1/documents, src/api/v1/documents.py) and the MCP
+        # upload_document tool (src/mcp_server/server.py) — both are the
+        # public API surface, so "public-api" is correct for every call here.
+        # Without this, ingestion-svc's Temporal memo shows "unknown" for
+        # every upload this service makes, which reads to an operator as
+        # "producer running stale code" rather than "not yet labeled".
+        "source": "public-api",
     }
 
     try:

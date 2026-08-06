@@ -123,6 +123,13 @@ class TestIntakeDocumentSuccess:
         assert msg["original_filename"] == "test.pdf"
         assert msg["content_type"] == "application/pdf"
         assert msg["storage_backend"] == "s3"
+        # inherent-prime/inherent#141 pattern-sweep finding: this function is
+        # the ONLY in-repo publisher of core.document.uploaded.v1 (shared by
+        # both the REST route and the MCP upload_document tool), so without
+        # this the ingestion-svc Temporal memo showed "unknown" for every
+        # upload this service makes -- indistinguishable from a message
+        # produced before the source field existed.
+        assert msg["source"] == "public-api"
 
     async def test_content_hash_persisted_and_checked_before_filename(
         self, mock_db, mock_storage, mock_mq
