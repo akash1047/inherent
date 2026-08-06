@@ -223,6 +223,20 @@ All notable changes to Inherent are documented here. The format follows
   behavior change — asserted by test. Recovered from an unmerged branch
   authored by Prime and rebased onto the current registry-derived
   `ALLOWED_MIME_TYPES`.
+- **Two more cross-service config defaults single-sourced: bucket name and
+  mongodb_uri (#176).** Same drift shape #132 fixed for the S3 region:
+  `inh-ingestion-svc`'s `storage_bucket` defaulted to `""` while
+  `inh-public-api-svc`'s `aws_s3_bucket` defaulted to `"inherent-documents"`
+  — a deployment setting neither `STORAGE_BUCKET` nor `AWS_S3_BUCKET` had
+  ingestion writing to an empty bucket name while public-api read from
+  `"inherent-documents"`. Both now default from the shared
+  `inh_contracts.defaults.DEFAULT_S3_BUCKET` (`"inherent-documents"`) —
+  ingestion's default changes from `""` to that value. Both services'
+  `mongodb_uri` defaults (`.../27017` vs `.../27017/main`) are now also
+  single-sourced (`DEFAULT_MONGODB_URI`, no path segment); functionally a
+  no-op either way since both services select the database explicitly via
+  `mongodb_db_name`, not the URI path. Anti-drift contract tests added on
+  each side (extends `test_settings_config_dedup_contract.py`).
 - **⚠️ BREAKING (behavior) — format-aware chunking driven by the registry
   `chunking_hint` (#129).** `chunk_text` previously resolved
   sentences/paragraphs/tokens purely from config — the same rule for a
@@ -336,6 +350,32 @@ All notable changes to Inherent are documented here. The format follows
 
 ### Fixed
 
+- **⚠️ BREAKING (config) — `HEALTH_CHECK_TIMEOUT_SECONDS` was declared but
+  had zero call sites; setting it silently did nothing (#203).**
+  `inh-public-api-svc`'s `/health/ready` endpoint read hardcoded
+  `DATABASE_HEALTH_CHECK_TIMEOUT` / `WEAVIATE_HEALTH_CHECK_TIMEOUT`
+  constants instead of `settings.health_check_timeout_seconds` — an operator
+  raising the timeout to stop a liveness/readiness probe from flapping
+  against a slow Postgres or Weaviate changed nothing; the probe kept timing
+  out at the hardcoded 5.0s. Replaced with two independent knobs,
+  `database_health_check_timeout_seconds` (env
+  `DATABASE_HEALTH_CHECK_TIMEOUT_SECONDS`) and
+  `weaviate_health_check_timeout_seconds` (env
+  `WEAVIATE_HEALTH_CHECK_TIMEOUT_SECONDS`), rather than reconnecting the
+  single dead knob — the readiness check already treats the two
+  dependencies as having different latency tolerances (100ms vs 500ms
+  "high latency" thresholds; Weaviate vector search is expected to be
+  slower), so one shared timeout would force one dependency's probe to
+  inherit the other's budget. Both default to `5.0` (unchanged behavior at
+  the shipped default). Also fixes a deeper instance of the same defect
+  found while wiring this up: `SearchService.is_connected()` hardcoded its
+  own 5.0s `httpx` timeout independently of the wait_for wrapping it in
+  `health.py`, so raising the new Weaviate setting above 5.0 still would not
+  have worked — it now accepts and is passed the configured timeout.
+  **Upgrade:** replace `HEALTH_CHECK_TIMEOUT_SECONDS` in `.env` /
+  deployment config with `DATABASE_HEALTH_CHECK_TIMEOUT_SECONDS` and
+  `WEAVIATE_HEALTH_CHECK_TIMEOUT_SECONDS` if you had set it to a non-default
+  value — the old var is no longer read.
 - **⚠️ BREAKING (deploy) — S3 region default drift between inh-ingestion-svc
   and inh-public-api-svc (#132).** public-api's `AWS_S3_REGION` defaulted to
   `eu-central-1` while ingestion's `AWS_REGION` defaulted to `nbg1` (a Hetzner

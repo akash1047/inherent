@@ -186,11 +186,22 @@ class SearchService:
             finally:
                 self._client = None
 
-    async def is_connected(self) -> bool:
-        """Check if Weaviate is reachable."""
+    async def is_connected(self, timeout: float = 5.0) -> bool:
+        """Check if Weaviate is reachable.
+
+        Args:
+            timeout: Per-request timeout (seconds) for the readiness call.
+                Defaults to 5.0 for callers that don't care, but the health
+                endpoint (the only real caller) passes
+                ``settings.weaviate_health_check_timeout_seconds`` explicitly
+                (#203) -- without an explicit param here, an operator raising
+                that setting would still be capped by this method's own
+                internal timeout, which is exactly the "setting is accepted
+                but ignored" defect #203 exists to fix.
+        """
         try:
             client = await self._get_client()
-            response = await client.get("/v1/.well-known/ready", timeout=5.0)
+            response = await client.get("/v1/.well-known/ready", timeout=timeout)
             return response.status_code == 200
         except Exception:
             return False

@@ -3,7 +3,7 @@
 from functools import lru_cache
 from typing import Literal
 
-from inh_contracts.defaults import DEFAULT_S3_REGION
+from inh_contracts.defaults import DEFAULT_MONGODB_URI, DEFAULT_S3_BUCKET, DEFAULT_S3_REGION
 from inh_contracts.events import StorageBackend
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -28,7 +28,14 @@ class Settings(BaseSettings):
 
     # GCP Configuration (only needed when using GCS storage or Pub/Sub MQ)
     gcp_project_id: str = Field("", alias="GCP_PROJECT_ID")
-    storage_bucket: str = Field("", alias="STORAGE_BUCKET")
+    # Default: see inh_contracts.defaults.DEFAULT_S3_BUCKET (#176) -- the single
+    # source of truth shared with public-api-svc's aws_s3_bucket field. Most
+    # uploads carry their own bucket in the event payload
+    # (message.storage_bucket), so this default is mainly a fallback
+    # (services/storage.py's default_bucket) -- but it must still agree with
+    # public-api's default so a deployment that sets neither env var doesn't
+    # write to one bucket while public-api reads from another.
+    storage_bucket: str = Field(DEFAULT_S3_BUCKET, alias="STORAGE_BUCKET")
 
     # Storage Configuration
     # Reuse the shared contract type so this can't drift from the wire/DB enum
@@ -164,7 +171,12 @@ class Settings(BaseSettings):
     # MongoDB Configuration (for audit log writes)
     # =========================================================================
 
-    mongodb_uri: str = Field("mongodb://localhost:27017", alias="MONGODB_URI")
+    # Default: see inh_contracts.defaults.DEFAULT_MONGODB_URI (#176) -- the
+    # single source of truth shared with public-api-svc's mongodb_uri field.
+    # The URI carries no database path segment on purpose: mongodb_db_name
+    # below is what actually selects the database (client[mongodb_db_name]),
+    # so the path is not a second source of truth to keep in sync.
+    mongodb_uri: str = Field(DEFAULT_MONGODB_URI, alias="MONGODB_URI")
     mongodb_db_name: str = Field("main", alias="MONGODB_DB_NAME")
 
     # =========================================================================
