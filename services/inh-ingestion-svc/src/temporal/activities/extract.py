@@ -2,11 +2,32 @@
 
 Fetches file content directly from storage (instead of receiving bytes
 via gRPC) and writes extracted text to the staging table.
+
+Extraction dispatch (#117)
+---------------------------
+Which function handles a content type used to be an if/elif chain here,
+duplicating the allow-list REST/MCP validation maintained independently in
+``inh-public-api-svc``. Dispatch is now driven by the shared
+``inh_contracts.FILE_TYPE_REGISTRY`` (the same registry REST/MCP validate
+against): ``_resolve_extractor`` looks up the registry entry for a content
+type and then the function wired for it in ``EXTRACTORS`` below. Two
+failure modes are explicit and tested (see ``test_temporal_activities.py::
+TestFileTypeRegistryDispatch``), never a silent lossy decode:
+
+- No registry entry for the content type at all -> the document fails with
+  a message naming the type and the supported set.
+- A registry entry exists but its ``extractor`` key has no function in
+  ``EXTRACTORS`` -- a wiring bug (a sibling format issue added a
+  ``FileTypeSpec`` without its extractor) -- fails with a message that says
+  so, instead of a bare ``KeyError`` crashing the Temporal worker.
 """
 
 import io
+from collections.abc import Callable
 
+import charset_normalizer
 import structlog
+from inh_contracts.file_types import all_mime_types, get_spec_for_mime
 from temporalio import activity
 
 from src.temporal.lineage import track_event
@@ -19,14 +40,10 @@ logger = structlog.get_logger(__name__)
 async def extract_text(input: ExtractTextInput) -> ExtractTextOutput:
     """Extract text from document content based on content type.
 
-    Supports multiple formats:
-    - Plain text, Markdown, CSV: Direct UTF-8 decode
-    - JSON: Parse and pretty-print
-    - PDF: Extract via pypdf/PyPDF2
-    - DOCX: Extract via python-docx
-    - HTML: Strip tags via BeautifulSoup
-    - PNG images: OCR via pytesseract/Pillow (graceful fallback to a
-      placeholder when OCR is unavailable, so the pipeline never crashes)
+    Which formats are supported, and which function handles each, is defined
+    once in ``inh_contracts.FILE_TYPE_REGISTRY`` (#117) -- see the module
+    docstring above and ``docs/reference/file-types.md`` for the current
+    list, rather than duplicated here where it would drift.
 
     The activity fetches file content from storage itself (avoiding the
     4MB gRPC limit) and writes extracted text to the staging table.
@@ -92,45 +109,14 @@ async def _extract_text_inner(input: ExtractTextInput) -> ExtractTextOutput:
         content_size=len(content),
     )
 
-    text = ""
-
-    # Plain text files
-    if content_type in ("text/plain", "text/markdown", "text/csv"):
-        text = content.decode("utf-8", errors="ignore")
-
-    # JSON files
-    elif content_type == "application/json" or filename.endswith(".json"):
-        import json
-
-        data = json.loads(content.decode("utf-8"))
-        text = json.dumps(data, indent=2)
-
-    # PDF files
-    elif content_type == "application/pdf" or filename.endswith(".pdf"):
-        text = _extract_pdf_text(content)
-
-    # Word documents
-    elif "wordprocessingml" in content_type or filename.endswith((".docx", ".doc")):
-        text = _extract_docx_text(content)
-
-    # Spreadsheet documents
-    elif "spreadsheetml" in content_type or filename.endswith((".xlsx", ".xls")):
-        raise RuntimeError(
-            "Unsupported spreadsheet document type. "
-            "Add an XLSX extractor before accepting spreadsheet uploads."
-        )
-
-    # HTML files
-    elif content_type == "text/html" or filename.endswith(".html"):
-        text = _extract_html_text(content)
-
-    # PNG images (OCR with graceful fallback)
-    elif content_type == "image/png" or filename.endswith(".png"):
-        text = _extract_image_text(content, input.original_filename)
-
-    # Default: try to decode as text
-    else:
-        text = content.decode("utf-8", errors="ignore")
+    # Dispatch via the shared FILE_TYPE_REGISTRY (#117) -- see the module
+    # docstring. `_resolve_extractor` raises a specific, actionable
+    # RuntimeError for either "no registry entry" or "registry entry with no
+    # wired extractor"; there is deliberately no catch-all decode-as-text
+    # fallback anymore -- an unrecognized type must fail the document, never
+    # silently produce garbled chunks.
+    extractor = _resolve_extractor(content_type)
+    text = extractor(content, input.original_filename)
 
     # Run data quality checks on extracted text
     from src.services.quality import DataQualityService
@@ -176,6 +162,101 @@ async def _extract_text_inner(input: ExtractTextInput) -> ExtractTextOutput:
     staging.write_text(input.workflow_run_id, text)
 
     return ExtractTextOutput(text_length=len(text))
+
+
+def _decode_text(content: bytes) -> str:
+    """Decode raw bytes to text without ever silently dropping bytes (#117).
+
+    1. Try strict UTF-8 first: the overwhelming common case for uploaded
+       text/markdown/csv/html content, and the only decoding that's provably
+       correct when it succeeds -- it also handles content with embedded NUL
+       bytes exactly right (needed for the #84 NUL-stripping step above),
+       where encoding-detection heuristics on short/ambiguous input can
+       misfire (see ``test_temporal_activities.py::TestDecodeText``).
+    2. If the bytes are NOT valid UTF-8, use charset-normalizer to detect the
+       actual encoding (Windows-1252, UTF-16, ...) and decode with it. This
+       replaces the previous ``content.decode("utf-8", errors="ignore")``,
+       which silently DELETED every byte that wasn't valid UTF-8 -- data loss
+       with no signal, not even a log line.
+    3. If detection can't confidently identify an encoding either, fall back
+       to UTF-8 with replacement characters (a visible mojibake marker)
+       rather than silently vanishing the byte.
+    """
+    try:
+        return content.decode("utf-8")
+    except UnicodeDecodeError:
+        pass
+
+    best = charset_normalizer.from_bytes(content).best()
+    if best is not None:
+        return str(best)
+    return content.decode("utf-8", errors="replace")
+
+
+def _extract_json_text(content: bytes) -> str:
+    """Parse JSON and pretty-print it as extractable text.
+
+    ``json.loads`` accepts bytes directly (auto-detecting UTF-8/16/32 via any
+    BOM present, per the JSON spec), so this needs no separate decode step.
+    """
+    import json
+
+    data = json.loads(content)
+    return json.dumps(data, indent=2)
+
+
+# Extraction dispatch table (#117): one entry per FileTypeSpec.extractor key
+# in inh_contracts.FILE_TYPE_REGISTRY. Adding a sibling format (#118 XLSX,
+# #119 PPTX, ...) means adding ONE FileTypeSpec entry (services/inh-contracts)
+# and ONE function + entry here -- `test_every_registry_extractor_key_is_wired`
+# fails CI if the two ever disagree. Every extractor has the uniform
+# ``(content: bytes, filename: str) -> str`` signature `_resolve_extractor`
+# dispatches through, even where a given extractor ignores `filename` --
+# lambdas adapt the helpers below that predate this table and only take
+# `content`, so their own signatures/tests (and imports elsewhere) stay
+# untouched. Lambdas also defer name lookup to call time, so this table can
+# sit above the helper functions it references without a definition-order
+# NameError at import.
+EXTRACTORS: dict[str, Callable[[bytes, str], str]] = {
+    "text_passthrough": lambda content, filename: _decode_text(content),
+    "json_pretty": lambda content, filename: _extract_json_text(content),
+    "html": lambda content, filename: _extract_html_text(content),
+    "pdf": lambda content, filename: _extract_pdf_text(content),
+    "docx": lambda content, filename: _extract_docx_text(content),
+    "image_ocr": lambda content, filename: _extract_image_text(content, filename),
+}
+
+
+def _resolve_extractor(content_type: str) -> Callable[[bytes, str], str]:
+    """Resolve the extractor function for `content_type`, or fail loudly.
+
+    Two distinct, explicit failure modes (both raise RuntimeError so
+    Temporal retries/fails the activity -- never a silent lossy decode):
+
+    1. No FILE_TYPE_REGISTRY entry for this content type at all -- an
+       unsupported or unrecognized upload reaching extraction.
+    2. A registry entry exists but its ``extractor`` key has no function
+       wired into EXTRACTORS -- a wiring bug (a sibling format issue added a
+       FileTypeSpec without its extractor), not a bad upload, but it must
+       still fail the document with an actionable message instead of a bare
+       KeyError crashing the Temporal worker.
+    """
+    spec = get_spec_for_mime(content_type)
+    if spec is None:
+        raise RuntimeError(
+            f"No extractor registered for content type '{content_type}'. "
+            f"Supported types: {', '.join(all_mime_types())}"
+        )
+
+    extractor = EXTRACTORS.get(spec.extractor)
+    if extractor is None:
+        raise RuntimeError(
+            f"Registry entry '{spec.key}' ({content_type}) names extractor "
+            f"'{spec.extractor}', which has no function wired in EXTRACTORS. "
+            f"This is a wiring bug: add EXTRACTORS['{spec.extractor}'] in "
+            f"src/temporal/activities/extract.py."
+        )
+    return extractor
 
 
 def _extract_pdf_text(content: bytes) -> str:
@@ -279,7 +360,11 @@ def _extract_image_text(content: bytes, original_filename: str) -> str:
 def _extract_html_text(content: bytes) -> str:
     """Extract text from HTML content.
 
-    Falls back to raw UTF-8 decode if BeautifulSoup is not available.
+    Falls back to a raw text decode if BeautifulSoup is not available (bs4 is
+    a core, non-optional dependency of this service, so this branch is
+    defense-in-depth rather than an expected runtime path). Uses
+    `_decode_text` (#117) rather than `errors="ignore"` so even this fallback
+    never silently drops bytes.
     """
     try:
         from bs4 import BeautifulSoup
@@ -290,4 +375,4 @@ def _extract_html_text(content: bytes) -> str:
         return soup.get_text(separator="\n", strip=True)
     except ImportError:
         logger.warning("beautifulsoup4 not available, falling back to raw decode")
-        return content.decode("utf-8", errors="ignore")
+        return _decode_text(content)

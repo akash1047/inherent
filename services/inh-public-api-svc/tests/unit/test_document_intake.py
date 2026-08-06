@@ -23,6 +23,14 @@ from src.services import document_intake
 
 pytestmark = [pytest.mark.unit]
 
+# Content-type "application/pdf" is now magic-byte sniffed at intake (#117),
+# so placeholder bytes that don't start with the PDF signature (%PDF-) are
+# rejected as a mismatch. Tests below that only care about the generic
+# pipeline (storage/dedup/MQ), not real PDF parsing, use this PDF-shaped
+# placeholder instead of arbitrary bytes so they exercise that pipeline
+# without tripping the new sniff check.
+_PDF_BYTES = b"%PDF-1.4\nhello world"
+
 
 @pytest.fixture
 def mock_db():
@@ -73,7 +81,7 @@ class TestIntakeDocumentSuccess:
                 database=mock_db,
                 workspace_id="test-workspace-id",
                 user_id="test-user-id",
-                content_bytes=b"hello world",
+                content_bytes=_PDF_BYTES,
                 filename="test.pdf",
                 content_type="application/pdf",
             )
@@ -81,7 +89,7 @@ class TestIntakeDocumentSuccess:
         assert result.name == "test.pdf"
         assert result.workspace_id == "test-workspace-id"
         assert result.mime_type == "application/pdf"
-        assert result.size_bytes == len(b"hello world")
+        assert result.size_bytes == len(_PDF_BYTES)
         assert result.status == "pending"
         assert result.document_id
         assert result.storage_url
@@ -93,7 +101,7 @@ class TestIntakeDocumentSuccess:
                 database=mock_db,
                 workspace_id="test-workspace-id",
                 user_id="test-user-id",
-                content_bytes=b"hello world",
+                content_bytes=_PDF_BYTES,
                 filename="test.pdf",
                 content_type="application/pdf",
             )
@@ -108,7 +116,7 @@ class TestIntakeDocumentSuccess:
                 database=mock_db,
                 workspace_id="test-workspace-id",
                 user_id="test-user-id",
-                content_bytes=b"hello world",
+                content_bytes=_PDF_BYTES,
                 filename="test.pdf",
                 content_type="application/pdf",
             )
@@ -133,13 +141,13 @@ class TestIntakeDocumentSuccess:
                 database=mock_db,
                 workspace_id="test-workspace-id",
                 user_id="test-user-id",
-                content_bytes=b"hello world",
+                content_bytes=_PDF_BYTES,
                 filename="test.pdf",
                 content_type="application/pdf",
             )
 
         kwargs = mock_db.create_or_reset_pending_document.call_args.kwargs
-        assert kwargs["content_hash"] == hashlib.sha256(b"hello world").hexdigest()
+        assert kwargs["content_hash"] == hashlib.sha256(_PDF_BYTES).hexdigest()
         mock_db.get_document_id_by_content_hash.assert_awaited_once()
         mock_db.get_document_id_by_filename.assert_awaited_once()
 
@@ -183,6 +191,169 @@ class TestIntakeDocumentValidation:
             )
 
 
+class TestIntakeDocumentMagicByteSniffing:
+    """#117: MIME type is entirely client-supplied and, before this, was
+    never checked against the actual bytes. These pin the closed hole --
+    every case named in the #117 issue and review note.
+    """
+
+    async def test_png_bytes_declared_as_text_plain_rejected(self, mock_db, mock_storage, mock_mq):
+        """The acceptance-criteria scenario verbatim: a mislabeled binary
+        (PNG bytes) declared as text/plain must be rejected at upload.
+
+        Filename deliberately does NOT end in '.png' (unlike the sibling
+        extension-consistency tests) so this exercises the BYTE-level sniff
+        specifically -- content_intake.py runs the extension check first,
+        and a filename ending in '.png' would be caught by that check
+        instead, leaving this test not actually proving the byte sniff
+        works. A generic '.upload' extension is not in the registry, so
+        the extension check is a no-op here and the byte mismatch is what
+        gets caught.
+        """
+        p1, p2 = _patches(mock_storage, mock_mq)
+        with p1, p2, pytest.raises(BadRequestError) as exc_info:
+            await document_intake.intake_document(
+                database=mock_db,
+                workspace_id="test-workspace-id",
+                user_id="test-user-id",
+                content_bytes=b"\x89PNG\r\n\x1a\n fake png bytes",
+                filename="scan.upload",
+                content_type="text/plain",
+            )
+        assert "text/plain" in str(exc_info.value)
+        # Nothing downstream must have run -- the file was never dedup'd,
+        # stored, or persisted, so no half-applied state exists.
+        mock_storage.upload_file.assert_not_awaited()
+        mock_db.create_or_reset_pending_document.assert_not_awaited()
+        mock_mq.publish.assert_not_awaited()
+
+    async def test_png_bytes_and_png_filename_declared_as_text_plain_rejected(
+        self, mock_db, mock_storage, mock_mq
+    ):
+        """The SAME mislabeling but with a revealing '.png' filename: now
+        BOTH the extension check and the byte sniff would object -- whichever
+        runs first still rejects with 400 and zero side effects, so the two
+        checks compose instead of interfering."""
+        p1, p2 = _patches(mock_storage, mock_mq)
+        with p1, p2, pytest.raises(BadRequestError):
+            await document_intake.intake_document(
+                database=mock_db,
+                workspace_id="test-workspace-id",
+                user_id="test-user-id",
+                content_bytes=b"\x89PNG\r\n\x1a\n fake png bytes",
+                filename="scan.png",
+                content_type="text/plain",
+            )
+        mock_storage.upload_file.assert_not_awaited()
+        mock_db.create_or_reset_pending_document.assert_not_awaited()
+        mock_mq.publish.assert_not_awaited()
+
+    async def test_pdf_declared_but_bytes_are_not_pdf_rejected(
+        self, mock_db, mock_storage, mock_mq
+    ):
+        """'A file whose magic bytes contradict its name': declared PDF, but
+        the bytes don't start with the PDF signature."""
+        p1, p2 = _patches(mock_storage, mock_mq)
+        with p1, p2, pytest.raises(BadRequestError):
+            await document_intake.intake_document(
+                database=mock_db,
+                workspace_id="test-workspace-id",
+                user_id="test-user-id",
+                content_bytes=b"this is not a pdf, just plain text",
+                filename="report.pdf",
+                content_type="application/pdf",
+            )
+        mock_storage.upload_file.assert_not_awaited()
+        mock_db.create_or_reset_pending_document.assert_not_awaited()
+
+    async def test_correctly_labeled_pdf_passes_the_sniff(self, mock_db, mock_storage, mock_mq):
+        """Sanity check in the other direction: real PDF bytes with the
+        correct declared type sail through untouched."""
+        p1, p2 = _patches(mock_storage, mock_mq)
+        with p1, p2:
+            result = await document_intake.intake_document(
+                database=mock_db,
+                workspace_id="test-workspace-id",
+                user_id="test-user-id",
+                content_bytes=_PDF_BYTES,
+                filename="report.pdf",
+                content_type="application/pdf",
+            )
+        assert result.status == "pending"
+
+    async def test_empty_file_reports_empty_not_mismatch(self, mock_db, mock_storage, mock_mq):
+        """Size validation runs BEFORE the magic-byte sniff, so an empty
+        upload keeps the specific, actionable 'file is empty' message
+        instead of a less-useful generic signature-mismatch one."""
+        p1, p2 = _patches(mock_storage, mock_mq)
+        with p1, p2, pytest.raises(BadRequestError) as exc_info:
+            await document_intake.intake_document(
+                database=mock_db,
+                workspace_id="test-workspace-id",
+                user_id="test-user-id",
+                content_bytes=b"",
+                filename="report.pdf",
+                content_type="application/pdf",
+            )
+        assert "empty" in str(exc_info.value).lower()
+
+
+class TestIntakeDocumentExtensionConsistency:
+    """#117: the filename's extension is cross-checked against the declared
+    content type, independent of the bytes-vs-declared sniff above. Between
+    the two checks, any pairwise disagreement among {declared type, filename,
+    bytes} is caught by at least one of them.
+    """
+
+    async def test_extension_mismatch_rejected(self, mock_db, mock_storage, mock_mq):
+        """Filename says '.pdf' (a KNOWN, registered extension), declared
+        type says text/plain -- a real, actionable disagreement."""
+        p1, p2 = _patches(mock_storage, mock_mq)
+        with p1, p2, pytest.raises(BadRequestError) as exc_info:
+            await document_intake.intake_document(
+                database=mock_db,
+                workspace_id="test-workspace-id",
+                user_id="test-user-id",
+                content_bytes=b"just plain text, matches the declared type",
+                filename="report.pdf",
+                content_type="text/plain",
+            )
+        assert "report.pdf" in str(exc_info.value)
+        mock_storage.upload_file.assert_not_awaited()
+        mock_db.create_or_reset_pending_document.assert_not_awaited()
+
+    async def test_unknown_extension_is_accepted(self, mock_db, mock_storage, mock_mq):
+        """An extension the registry doesn't recognize (e.g. '.log', not yet
+        a supported format) must NOT be rejected on that basis -- content
+        type remains authoritative for anything the registry doesn't know."""
+        p1, p2 = _patches(mock_storage, mock_mq)
+        with p1, p2:
+            result = await document_intake.intake_document(
+                database=mock_db,
+                workspace_id="test-workspace-id",
+                user_id="test-user-id",
+                content_bytes=b"2026-08-06 some log line",
+                filename="server.log",
+                content_type="text/plain",
+            )
+        assert result.status == "pending"
+
+    async def test_no_extension_is_accepted(self, mock_db, mock_storage, mock_mq):
+        """The REST route's 'unnamed' fallback (no extension at all) must
+        keep working -- nothing to compare, so nothing to reject."""
+        p1, p2 = _patches(mock_storage, mock_mq)
+        with p1, p2:
+            result = await document_intake.intake_document(
+                database=mock_db,
+                workspace_id="test-workspace-id",
+                user_id="test-user-id",
+                content_bytes=b"just plain text",
+                filename="unnamed",
+                content_type="text/plain",
+            )
+        assert result.status == "pending"
+
+
 class TestIntakeDocumentDedup:
     async def test_reupload_reuses_existing_document_id_by_filename(
         self, mock_db, mock_storage, mock_mq
@@ -196,7 +367,7 @@ class TestIntakeDocumentDedup:
                 database=mock_db,
                 workspace_id="test-workspace-id",
                 user_id="test-user-id",
-                content_bytes=b"hello world",
+                content_bytes=_PDF_BYTES,
                 filename="test.pdf",
                 content_type="application/pdf",
             )
@@ -307,7 +478,7 @@ class TestIntakeDocumentDedup:
                 database=mock_db,
                 workspace_id="test-workspace-id",
                 user_id="test-user-id",
-                content_bytes=b"hello world",
+                content_bytes=_PDF_BYTES,
                 filename="test.pdf",
                 content_type="application/pdf",
             )
@@ -327,7 +498,7 @@ class TestIntakeDocumentServiceFailures:
                 database=mock_db,
                 workspace_id="test-workspace-id",
                 user_id="test-user-id",
-                content_bytes=b"hello world",
+                content_bytes=_PDF_BYTES,
                 filename="test.pdf",
                 content_type="application/pdf",
             )
@@ -342,7 +513,7 @@ class TestIntakeDocumentServiceFailures:
                 database=mock_db,
                 workspace_id="test-workspace-id",
                 user_id="test-user-id",
-                content_bytes=b"hello world",
+                content_bytes=_PDF_BYTES,
                 filename="test.pdf",
                 content_type="application/pdf",
             )

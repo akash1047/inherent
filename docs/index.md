@@ -7,8 +7,9 @@ systems can actually query: a self-hostable ingestion, indexing, storage,
 and retrieval layer for a private RAG system, exposed over REST and MCP.
 
 You connect sources — plain text, Markdown, CSV, HTML, JSON, PDF, DOCX,
-PNG (OCR) — and Inherent extracts, chunks, embeds, stores, and serves
-retrieval with citations, permissions, and freshness signals.
+PNG (OCR), see the full [supported file types](reference/file-types.md) list
+— and Inherent extracts, chunks, embeds, stores, and serves retrieval with
+citations, permissions, and freshness signals.
 
 [Get started locally](getting-started/local.md){ .md-button .md-button--primary }
 [What's new](release-notes.md){ .md-button }

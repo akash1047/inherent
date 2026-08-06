@@ -668,6 +668,19 @@ class TestListChunksTool:
         db.eval_scorecard_counts.assert_not_called()
 
 
+def test_mcp_supported_text_mime_types_matches_registry():
+    """#117: SUPPORTED_TEXT_MIME_TYPES must be exactly the registry's
+    mcp-surfaced MIME types, not a re-derived guess. Before #117 this was a
+    ``.startswith("text/")`` filter over ALLOWED_MIME_TYPES -- correct only
+    by coincidence, since nothing enforced that every text/* type was
+    actually MCP-safe or that no non-text/* type ever should be. Pinning
+    equality here means the registry's explicit `surfaces` field is the only
+    place this can be decided."""
+    from inh_contracts.file_types import mcp_mime_types
+
+    assert mcp_server.SUPPORTED_TEXT_MIME_TYPES == mcp_mime_types()
+
+
 # =========================================================================== #
 # upload_document (#87 API parity Task 3): text-only counterpart of
 # POST /v1/documents. Binary uploads stay REST-only by design — content_type

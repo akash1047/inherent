@@ -7,6 +7,24 @@ All notable changes to Inherent are documented here. The format follows
 
 ### Added
 
+- **File-type support registry — single contract for validation, sniffing,
+  extraction, and docs (#117).** Adding a supported file type used to require
+  coordinated edits across 5+ places (`ALLOWED_MIME_TYPES` in
+  `inh-public-api-svc`, the MCP tool's own text-type subset, ingestion's
+  extraction if/elif chain, three docs pages, and two test files), with
+  nothing enforcing agreement between them. `FILE_TYPE_REGISTRY`
+  (`services/inh-contracts/src/inh_contracts/file_types.py`, imported by both
+  services) is now the one place a type is declared — extensions, MIME
+  types, magic-byte signature, upload surfaces (REST/MCP), extraction
+  dispatch key, and a `chunking_hint` field the upcoming format-aware
+  chunker (#129) will consume. `docs/reference/file-types.md`'s
+  supported-types table is generated from the registry
+  (`scripts/generate_supported_formats.py`) and CI-verified against it
+  (`services/inh-public-api-svc/tests/unit/test_docs_sync.py`) so the table
+  can no longer silently drift from the code, closing the same drift class
+  as #9 and the registry lesson as #100. All 8 existing formats migrated
+  with no behavior change to correctly-labeled uploads.
+
 - **Retrieval-eval hard gate, baseline ratcheting, and trend history (#139).**
   Implements the "v2" items ADR 0003 deferred (run-over-run regression deltas,
   a CLI/CI gate). The compose retrieval-eval baseline diff
@@ -75,6 +93,35 @@ All notable changes to Inherent are documented here. The format follows
   [ADR 0004](https://github.com/inherent-prime/inherent/blob/main/docs/adr/0004-per-document-diversification.md).
 
 ### Fixed
+
+- **⚠️ BREAKING (API) — uploads are now magic-byte AND filename-extension
+  sniffed against their declared content type; unregistered types reaching
+  extraction hard-fail instead of silently garbling (#117).** Three
+  validation holes the file-type registry closed, one per pair of the three
+  independent signals an upload carries (declared content type, filename,
+  actual bytes): (1) `Content-Type` was entirely client-supplied and never
+  checked against the actual bytes — a mislabeled binary (e.g. PNG bytes
+  declared `text/plain`) passed upload validation and was garbled by a
+  downstream text decode; `POST /v1/documents` (and the MCP `upload_document`
+  tool, which shares the same `intake_document` pipeline) now rejects a
+  byte/type mismatch with `400 Bad Request` before anything is stored — no
+  document row, no S3 object. (2) The filename was never cross-checked
+  against the declared type either — a file named `report.pdf` uploaded as
+  `text/plain` (bytes and declared type agreeing with each other, just not
+  with the name) now also gets `400` for the same reason; a filename whose
+  extension the registry doesn't recognize is unaffected (content type stays
+  authoritative for formats #117 doesn't cover yet). (3) A content type
+  accepted at upload but missing from ingestion's extraction dispatch fell
+  through to `content.decode("utf-8", errors="ignore")`, silently producing
+  empty or corrupted chunks; extraction now fails the document with a clear
+  `error_message` instead. Text extraction also switched from
+  `errors="ignore"` (which silently DELETED any non-UTF-8 byte) to
+  `charset-normalizer` encoding detection, so non-UTF-8 text uploads decode
+  correctly instead of losing bytes with no signal. **Upgrade note**: a
+  client that was uploading a mislabeled or corrupted file and relying on it
+  silently "working" (with garbled or truncated extracted text) will now see
+  a `400` at upload or a `failed` document status instead — this is the
+  intended fix, not a regression.
 
 - **Retrieval-eval baseline ratchet silently never ran (#139 follow-up).**
   `eval-baseline-ratchet` pushed its ratchet commit straight to `main`, but

@@ -47,11 +47,12 @@ import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
+from inh_contracts.file_types import mcp_mime_types
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
 
-from src.config.constants import ALLOWED_MIME_TYPES, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE
+from src.config.constants import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE
 from src.models.api_key import APIKeyInfo
 from src.models.evals import FeedbackRequest
 from src.services.compensation import mark_document_failed_with_retry
@@ -73,10 +74,14 @@ logger = get_logger(__name__)
 # A tool handler receives the already-authenticated key and the raw arguments.
 ToolHandler = Callable[["APIKeyInfo", dict], Awaitable[list[TextContent]]]
 
-# The text MIME types upload_document accepts, derived from the shared upload
-# allow-list so the MCP gate can never drift from what intake_document permits.
-# Binary types in ALLOWED_MIME_TYPES (PDF/DOCX/PNG) stay REST-only by design.
-SUPPORTED_TEXT_MIME_TYPES = tuple(sorted(t for t in ALLOWED_MIME_TYPES if t.startswith("text/")))
+# The text MIME types upload_document accepts, derived from the single
+# FILE_TYPE_REGISTRY (#117) instead of a `.startswith("text/")` guess over
+# ALLOWED_MIME_TYPES. The registry's explicit `surfaces` field is what marks
+# a type MCP-eligible, so this can never drift from intake_document's own
+# understanding of the allow-list, and a future type can be text/*-shaped
+# without being (or not being) MCP-safe without the two disagreeing.
+# Binary types (PDF/DOCX/PNG) stay REST-only by design.
+SUPPORTED_TEXT_MIME_TYPES = mcp_mime_types()
 
 
 @dataclass(frozen=True)

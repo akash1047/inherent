@@ -121,9 +121,13 @@ curl -s "$INGEST_BASE/health" | jq .
 Upload registers a file in storage and queues it for ingestion. The returned `document_id` is what every other endpoint uses to reference this document.
 
 Allowed MIME types: `text/plain`, `text/markdown`, `text/csv`, `text/html`,
-`application/pdf`, `application/json`,
-`application/vnd.openxmlformats-officedocument.wordprocessingml.document`.
-Max size: 50 MB.
+`application/json`, `application/pdf`,
+`application/vnd.openxmlformats-officedocument.wordprocessingml.document`,
+`image/png` (OCR) — see the full [supported file types](../reference/file-types.md)
+reference for extensions, chunking strategy, and optional-dependency notes.
+Max size: 50 MB. Binary formats are magic-byte sniffed against the declared
+`Content-Type` at upload; a mismatch (e.g. PNG bytes declared `text/plain`)
+is rejected with `400 Bad Request`.
 
 ### Upload plain text
 
@@ -195,6 +199,20 @@ curl -s -X POST "$API_BASE/v1/documents" \
   | jq .
 ```
 
+### Upload PNG (OCR)
+
+```bash
+curl -s -X POST "$API_BASE/v1/documents" \
+  -H "X-API-Key: $API_KEY" \
+  -H "X-Workspace-Id: $WORKSPACE_ID" \
+  -F "file=@docs/examples/sample-documents/sample.png;type=image/png" \
+  | jq .
+```
+
+Text is extracted via Tesseract OCR. If the `ocr` extra or the `tesseract`
+system binary isn't installed, extraction degrades to a placeholder instead
+of failing the upload — see [supported file types](../reference/file-types.md).
+
 **Expected response (201):**
 
 ```json
@@ -233,7 +251,31 @@ curl -s -X POST "$API_BASE/v1/documents" \
   "type": "https://api.inherent.systems/errors/bad-request",
   "title": "Bad Request",
   "status": 400,
-  "detail": "Unsupported file type 'application/octet-stream'. Allowed types: text/plain, text/markdown, text/csv, text/html, application/pdf, application/json, application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+  "detail": "Unsupported file type 'application/octet-stream'. Allowed types: text/plain, text/markdown, text/csv, text/html, application/json, application/pdf, application/vnd.openxmlformats-officedocument.wordprocessingml.document, image/png"
+}
+```
+
+**Mislabeled file — bytes don't match the declared type (400, #117):**
+
+The `Content-Type` you declare is checked against the file's actual magic
+bytes, not trusted blindly. A binary file declared as a text type, or a file
+declared as one binary format whose bytes don't match that format's
+signature, is rejected before anything is stored:
+
+```bash
+curl -s -X POST "$API_BASE/v1/documents" \
+  -H "X-API-Key: $API_KEY" \
+  -H "X-Workspace-Id: $WORKSPACE_ID" \
+  -F "file=@docs/examples/sample-documents/sample.png;type=text/plain" \
+  | jq .
+```
+
+```json
+{
+  "type": "https://api.inherent.systems/errors/bad-request",
+  "title": "Bad Request",
+  "status": 400,
+  "detail": "File content does not match the declared content type 'text/plain': the bytes match the 'png' file signature instead."
 }
 ```
 
@@ -984,6 +1026,7 @@ depend on it.
 | `sample.html` | `text/html` | `docs/examples/sample-documents/sample.html` |
 | `sample.pdf` | `application/pdf` | Generate with any PDF tool; not committed (binary) |
 | `sample.docx` | `application/vnd.openxmlformats-officedocument.wordprocessingml.document` | Generate with LibreOffice/Word; not committed (binary) |
+| `sample.png` | `image/png` | `docs/examples/sample-documents/sample.png` |
 
 ### Generate sample PDF (requires `enscript` + `ps2pdf`)
 

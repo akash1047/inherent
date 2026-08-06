@@ -2,6 +2,8 @@
 
 from typing import Final, Literal
 
+from inh_contracts.file_types import all_mime_types
+
 # API version
 API_VERSION: Final[str] = "v1"
 
@@ -79,16 +81,13 @@ HEALTH_STATUS_UNHEALTHY: Final[HealthStatus] = "unhealthy"
 
 # Upload limits
 MAX_UPLOAD_SIZE_BYTES: Final[int] = 50 * 1024 * 1024  # 50 MB
-ALLOWED_MIME_TYPES: Final[list[str]] = [
-    "text/plain",
-    "text/markdown",
-    "text/csv",
-    "text/html",
-    "application/pdf",
-    "application/json",
-    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",  # .docx
-    "image/png",  # OCR via Tesseract (graceful fallback when OCR unavailable)
-]
+
+# Derived from the single file-type registry (#117) --
+# services/inh-contracts/src/inh_contracts/file_types.py. Do NOT hand-edit
+# this list: it used to be its own hand-maintained copy that could (and did)
+# drift from the MCP surface's own copy and from extraction's dispatch table.
+# Add/remove a supported type by editing FILE_TYPE_REGISTRY instead.
+ALLOWED_MIME_TYPES: Final[list[str]] = all_mime_types()
 
 # Search constraints
 MAX_SEARCH_QUERY_LENGTH: Final[int] = 1000
