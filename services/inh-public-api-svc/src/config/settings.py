@@ -245,23 +245,29 @@ class Settings(BaseSettings):
         ),
     )
 
-    # Per-document diversification (#146) — EXPERIMENTAL, OFF BY DEFAULT.
+    # Per-document diversification (#146) — ON BY DEFAULT since 2026-08-06.
     #
     # Unlike the #47 scaffolding above, this method IS implemented (it's a
     # deterministic round-robin over already-fetched candidates, not a new
-    # model or index); it stays gated behind the same eval-gate policy
-    # (no default-on without a documented eval improvement vs the hybrid
-    # baseline + maintainer approval) because it changes ranking order, which
-    # the compose retrieval-eval gate needs to measure before this can default
-    # on. See docs/advanced-indexes.md and ADR 0004.
+    # model or index). It was gated behind the same eval-gate policy as the
+    # #47 methods (no default-on without a documented eval improvement vs the
+    # hybrid baseline + maintainer approval) because it changes ranking
+    # order; both conditions are now met (recall@5 0.5->1.0 on the
+    # multi_doc_crowding golden-corpus category, maintainer approval granted
+    # 2026-08-06) so the default flipped. Set ENABLE_DIVERSIFICATION=false to
+    # restore the pre-2026-08-06 (pre-#146-default-flip) behavior. See
+    # docs/advanced-indexes.md and ADR 0004 (including its 2026-08-06
+    # amendment).
     enable_diversification: bool = Field(
-        default=False,
+        default=True,
         description=(
-            "EXPERIMENTAL (#146), off by default. Opt-in per-document result "
+            "On by default since 2026-08-06 (#146). Per-document result "
             "diversification: round-robins candidates across document_id before "
             "truncating to the page size, so one highly-relevant document can't "
-            "crowd out every other result. Requires a documented eval improvement "
-            "vs the hybrid baseline + maintainer approval before it may default on."
+            "crowd out every other result. Cleared the eval-gate policy "
+            "(documented eval improvement vs the hybrid baseline + maintainer "
+            "approval, see ADR 0004) before defaulting on. Set to false to "
+            "restore the pre-#146-default-flip ranking behavior."
         ),
     )
     diversification_over_fetch_multiplier: int = Field(

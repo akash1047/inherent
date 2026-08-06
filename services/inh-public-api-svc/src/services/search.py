@@ -641,7 +641,8 @@ class SearchService:
         # Truncate back to the requested page size after min_score filtering
         # (the query may have over-fetched to avoid under-filling) (#31), or
         # diversify-then-truncate when enable_diversification is on (#146,
-        # EXPERIMENTAL, off by default -- see settings.py).
+        # on by default since 2026-08-06 -- see settings.py; an operator can
+        # still set ENABLE_DIVERSIFICATION=false to opt out).
         if settings.enable_diversification:
             return self._diversify_by_document(results, request.limit)
         return results[: request.limit]
@@ -650,7 +651,8 @@ class SearchService:
     def _diversify_by_document(results: list[SearchResult], limit: int) -> list[SearchResult]:
         """Round-robin diversify candidates across ``document_id`` (#146).
 
-        EXPERIMENTAL, gated by ``enable_diversification`` (default False).
+        Gated by ``enable_diversification`` (default True since 2026-08-06;
+        an operator can set ENABLE_DIVERSIFICATION=false to disable it).
         Widening the fetch (see the diversification branch in
         ``_build_graphql``) surfaces more per-document candidates than the
         page size; without this step, a naive score-sorted truncate to
@@ -707,7 +709,7 @@ class SearchService:
         # page could come back short even when more above-threshold matches
         # exist. Results are truncated back to request.limit after filtering (#31).
         fetch_limit = min(100, request.limit * 3) if request.min_score > 0 else request.limit
-        # Diversification (#146, EXPERIMENTAL, off by default) needs a wider
+        # Diversification (#146, on by default since 2026-08-06) needs a wider
         # candidate pool to diversify across -- fetching exactly `limit` rows
         # leaves nothing to round-robin against once the top document's
         # chunks fill the page. Takes the max with the min_score branch above

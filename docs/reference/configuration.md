@@ -64,6 +64,8 @@ and binds all datastore ports to `127.0.0.1`.
 | `EMBEDDING_DIM` | `384` | Embedding vector dimension |
 | `EMBEDDING_TIMEOUT_S` | `30.0` | Per-request TEI timeout (seconds) |
 | `ENABLE_RERANKER` / `ENABLE_GRAPHRAG_INDEX` / `ENABLE_HIERARCHY_INDEX` | `false` | EXPERIMENTAL retrieval scaffolding — off by default, not implemented |
+| `ENABLE_DIVERSIFICATION` | `true` | Round-robin search results across `document_id` before truncating to page size, so one document can't crowd out every other result (#146). Set `false` to restore pre-2026-08-06 ranking. |
+| `DIVERSIFICATION_OVER_FETCH_MULTIPLIER` | `5` | When `ENABLE_DIVERSIFICATION` is on, fetch up to `min(100, limit * this)` candidates to diversify across; ignored when off |
 
 ### Evals
 
@@ -128,13 +130,50 @@ and binds all datastore ports to `127.0.0.1`.
 
 | Variable | Default | Effect |
 | --- | --- | --- |
-| `CHUNKING_STRATEGY` | `sentences` | `tokens` / `sentences` / `paragraphs` |
+| `CHUNKING_STRATEGY` | `sentences` | `tokens` / `sentences` / `paragraphs`. **#129:** only consulted for a content type with no registry entry — every currently-registered format resolves a `chunking_hint` instead (see below), so this var no longer governs chunking in practice for any of them. **No per-document override reaches the upload surface yet** (`DocumentIngestionInput.chunking_strategy` exists at the workflow layer, but neither `POST /v1/documents` nor the MCP `upload_document` tool expose it — tracked in [#198](https://github.com/inherent-prime/inherent/issues/198)); there is currently no way to force one strategy uniformly across formats after this change. |
 | `MAX_CHUNK_SIZE` / `CHUNK_OVERLAP` | `1000` / `200` | Chunk sizing |
 | `EMBEDDING_ENABLED` | `true` | Toggle embedding generation |
 | `EMBEDDING_SERVICE_URL` / `EMBEDDING_DIM` | `http://text-embeddings-inference:80` / `384` | TEI sidecar |
 | `EMBEDDING_MAX_TOKENS` | `512` | Hard token budget per chunk (bge-small context window) |
 | `EMBEDDING_BATCH_SIZE` / `EMBEDDING_TIMEOUT_S` | `32` / `30.0` | Chunks per TEI call / per-request timeout |
 | `MAX_WORKERS` / `MAX_RETRIES` / `RETRY_DELAY_SECONDS` | `4` / `3` / `5` | Worker concurrency and retry policy |
+
+#### Format-aware chunking (#129)
+
+⚠️ **`CHUNKING_STRATEGY` above is the fallback, not the default.** Every
+upload chunks by this precedence, resolved once per document inside the
+`chunk_text` activity — and because every registered format resolves a
+hint, `CHUNKING_STRATEGY` is effectively dead for normal uploads; it only
+fires for a content type outside `FILE_TYPE_REGISTRY`:
+
+1. **Per-document override** — `tokens` / `sentences` / `paragraphs` set
+   directly on `DocumentIngestionInput.chunking_strategy`. Wins outright;
+   format-aware dispatch below never runs. Exists at the workflow/activity
+   layer only — **not yet reachable from either upload surface** (REST or
+   MCP; tracked in [#198](https://github.com/inherent-prime/inherent/issues/198)).
+2. **Registry `chunking_hint`** — looked up from the document's content type
+   against [`FILE_TYPE_REGISTRY`](file-types.md) (`prose` / `tabular` /
+   `structured` / `media`). Maps to one of three shape-aware strategies:
+   - `tabular` (csv, xlsx) → row-based chunking. Never splits a row in half;
+     every chunk carries the table's header row (and XLSX's `## Sheet: <name>`
+     heading, when present).
+   - `structured` (json, pptx) → section-based chunking, split at the
+     extractor's own `## ` boundaries (PPTX slide headings). Falls back to
+     size-based chunking when no such markers exist (JSON has none).
+   - `prose` (txt, markdown, docx, eml, epub, rtf, odt, pdf, html) →
+     unchanged sentence chunking, UNLESS the text opens with a `Key: value`
+     header block (an `.eml`'s From/To/Cc/Date/Subject) — that block is then
+     carried into every chunk, not just the first.
+   - `media` (png) → plain size-based chunking (OCR/placeholder output has no
+     structure worth preserving).
+3. **`CHUNKING_STRATEGY` (this table)** — used only when neither of the above
+   applies (no content type resolvable to a registry entry).
+
+Every chunk records which strategy actually produced it in
+`metadata.chunking_strategy` (`rows` / `sections` / `prose_header` /
+`sentences` / `paragraphs` / `tokens`) for eval attribution. See
+`services/inh-ingestion-svc/src/temporal/activities/chunk.py`'s module
+docstring for the full design rationale and cost tradeoffs.
 
 ### Temporal & tenancy
 

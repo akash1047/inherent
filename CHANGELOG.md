@@ -193,18 +193,134 @@ All notable changes to Inherent are documented here. The format follows
   retrieval-eval report. Visibility only; the existing loose SLO assertions
   are still what fails a build.
 
-- **Per-document result diversification (#146, opt-in).** New
-  `enable_diversification` flag (default `False`) round-robins search
-  results across `document_id` before truncating to the page size, so one
-  long, many-chunk document can no longer silently crowd every other
-  relevant document out of the result page — measured on a new golden-corpus
-  category (`multi_doc_crowding`, `q14`): recall@5 0.5 → 1.0, nDCG@5
-  ~0.61 → ~0.88-0.92 across all three search modes, with every pooled
-  per-mode metric flat or improved and none regressed. Gated behind the same
-  eval-gate policy as the #47 advanced methods (documented improvement +
-  maintainer approval before defaulting on) because it changes ranking order
-  for every multi-chunk query, not just crowded ones — see
-  [ADR 0004](https://github.com/inherent-prime/inherent/blob/main/docs/adr/0004-per-document-diversification.md).
+- **Per-document result diversification (#146).** New `enable_diversification`
+  flag round-robins search results across `document_id` before truncating to
+  the page size, so one long, many-chunk document can no longer silently
+  crowd every other relevant document out of the result page — measured on a
+  new golden-corpus category (`multi_doc_crowding`, `q14`): recall@5
+  0.5 → 1.0, nDCG@5 ~0.61 → ~0.88-0.92 across all three search modes, with
+  every pooled per-mode metric flat or improved and none regressed. Shipped
+  opt-in (default `False`), gated behind the same eval-gate policy as the
+  #47 advanced methods (documented improvement + maintainer approval before
+  defaulting on) because it changes ranking order for every multi-chunk
+  query, not just crowded ones. **Flipped to default `True` later in this
+  same `[Unreleased]` section once both gate conditions were met — see the
+  `### Changed` entry below and
+  [ADR 0004](https://github.com/inherent-prime/inherent/blob/main/docs/adr/0004-per-document-diversification.md)
+  and its amendment.**
+
+### Changed
+
+- **⚠️ BREAKING (behavior) — format-aware chunking driven by the registry
+  `chunking_hint` (#129).** `chunk_text` previously resolved
+  sentences/paragraphs/tokens purely from config — the same rule for a
+  one-page memo and a 10,000-row XLSX. **Measured cost, using the SHIPPED
+  defaults** (`CHUNKING_STRATEGY=sentences`, `MAX_CHUNK_SIZE=1000`,
+  `CHUNK_OVERLAP=200`, `EMBEDDING_MAX_TOKENS=512` → effective 787-char
+  budget — every value `.env.example`/`settings.py` actually ship, not a
+  hypothetical `tokens` config): a 10,000-row XLSX (510,258 extracted chars)
+  produced exactly **ONE chunk**, because the sentence splitter (`[.!?]`)
+  never finds a boundary in pipe-delimited rows with no sentence-ending
+  punctuation — and `embedder.py`'s TEI call uses `truncate=True` at the
+  embedding model's ~256-token input limit, so **~99.8% of that single
+  chunk's content was silently discarded before a vector was ever
+  computed.** This is not a worst case; it is what the out-of-the-box
+  configuration does today. A synthetic `.eml` under the same defaults
+  produced 14 chunks, of which exactly 1 carried both `From:` and
+  `Subject:`. `chunk_text` now resolves its strategy by precedence:
+  per-document override > registry `chunking_hint`
+  (`inh_contracts.FILE_TYPE_REGISTRY`, #117) > global `CHUNKING_STRATEGY`.
+  Every one of the 14 currently-registered formats has a hint, so
+  **`CHUNKING_STRATEGY` no longer governs chunking for any of them** — it is
+  now consulted only for a content type with no registry entry (already a
+  rare, near-error path since #117 hard-fails unregistered types at
+  extraction). **Upgrade:** there is currently no per-document lever to force
+  one strategy uniformly after this change — `DocumentIngestionInput.
+  chunking_strategy` exists at the workflow/activity layer but neither the
+  REST `POST /v1/documents` route nor the MCP `upload_document` tool expose
+  it yet (tracked separately, #198); a deployment that relied on
+  `CHUNKING_STRATEGY` for non-default behavior across every format has no
+  workaround until #198 lands. Hint dispatch: `tabular` (csv, xlsx)
+  row-based chunking that never splits a row and carries the table header
+  (+ XLSX sheet heading, "(continued)" suffix stripped from injected copies)
+  into every chunk, packing reserves room for that injection up front so
+  content never exceeds the configured budget; `structured` (json, pptx)
+  section-based chunking split at the extractor's own `## ` markers,
+  degrading to size-based chunking when none exist; `prose` (txt, markdown,
+  docx, eml, epub, rtf, odt, pdf, html) unchanged sentence chunking unless
+  the text opens with a `Key: value` header block that's at least 2 lines
+  long (an email's From/To/Cc/Date/Subject), in which case that block is
+  carried into every chunk instead of only the one positionally containing
+  it — each field/line capped independently at 200 chars rather than
+  truncating the whole block from the tail, so a large recipient list
+  trims itself rather than dropping `Subject:` (the field emitted last,
+  and the one with the most retrieval value); the sentence chunker's
+  `overlap` is clamped to at most half of the header-reserved budget so a
+  large header can't collapse chunking stride toward zero. `media` (png)
+  unchanged size-based chunking. Any injected context (table header,
+  section heading) is capped at min(500, max_size / 3) chars and a slicer
+  for an oversized single row/line guarantees at least `max_size / 5` chars
+  of real forward progress per chunk regardless of context size — both
+  scale with the configured budget instead of using a fixed absolute cap,
+  which could otherwise turn one oversized row into one chunk per
+  character at a small `MAX_CHUNK_SIZE` or embedding token budget. Measured
+  after (same shipped defaults): the same XLSX produces 801 chunks, 801/801
+  (100%) self-describing, at **+6.9%** total content chars (context
+  injection, no overlap on the row-based path); the same `.eml` produces
+  17/17 (100%) self-describing chunks at **+27%** chars (the injected
+  header cost, now correctly bounded regardless of recipient-list size —
+  a large recipient count no longer explodes chunk count: two independent
+  reviews measured a naive unclamped overlap turning a 32-chunk email into
+  348 chunks with only 1/348 still carrying `Subject:`; this is fixed).
+  Every chunk now records the strategy that produced it in
+  `metadata.chunking_strategy` (`rows` / `sections` / `prose_header` /
+  `sentences` / `paragraphs` / `tokens`) for eval attribution, persisted in
+  Postgres `document_chunks` metadata JSONB and as a new Weaviate
+  `chunking_strategy` TEXT property, `index_searchable=False` since it's a
+  closed set of internal names, not prose to keyword-match (added to
+  `_get_chunk_properties`; existing collections pick it up via the existing
+  `_reconcile_collection_properties` add-missing-property path — additive,
+  no manual migration needed). Surfacing it through `inh-public-api-svc`'s
+  search response is tracked separately (#196) — that service's GraphQL
+  query has an explicit field list that doesn't select it yet. See
+  `docs/reference/configuration.md`'s "Format-aware chunking" subsection,
+  `docs/examples/README.md`'s note on the relaxed chunk-offset invariant,
+  and the module docstring in
+  `services/inh-ingestion-svc/src/temporal/activities/chunk.py`.
+  **Existing indexed documents are unaffected by this release** — they keep
+  their old chunk boundaries until re-ingested/refreshed; there is no
+  migration or backfill in this change, so search results mix old- and
+  new-style chunks until a workspace's documents are re-ingested. Follow-up
+  work tracked separately: #196 (surface `chunking_strategy` through
+  search), #198 (wire the per-document override through the upload
+  surface), #199 (tabular/structured judgments in the retrieval-eval
+  corpus — the tabular hint's row-based chunking, the largest behavioral
+  change here, is currently invisible to the eval gate).
+
+- **⚠️ BREAKING (behavior) — per-document result diversification now on by
+  default (#146).** `enable_diversification` (added opt-in, off by default,
+  in the entry above) now defaults to `True`: both eval-gate conditions this
+  ADR required — documented eval improvement (recall@5 0.5 → 1.0 on the
+  `multi_doc_crowding` golden-corpus category, every other pooled per-mode
+  metric flat or improved) and maintainer approval — are now met (ADR 0004's
+  2026-08-06 amendment). Search results for every caller now round-robin
+  across `document_id` before truncating to the page size instead of a plain
+  score-sorted truncate, so a query where one document's chunks previously
+  filled the whole result page will now surface other genuinely relevant
+  documents too; ranking order can shift for any multi-chunk-per-document
+  query, not just crowded ones, even when nothing about that query's own
+  relevance changed. Reproduced concretely by this same release's #129
+  chunking change: `sample.json` going from 1 to 4 chunks crowded the
+  keyword-mode top-5 on the golden corpus (`keyword.mrr` 0.8205 → 0.7821,
+  `keyword.ndcg@5` 0.7137 → 0.6835, both beyond the 0.02 gate tolerance,
+  `recall@5` unchanged in all three modes — the right document stayed
+  retrievable, only its rank slipped); diversification exists to prevent
+  exactly this. The mechanism (`SearchService._diversify_by_document`, the
+  wider Weaviate over-fetch in `_build_graphql`) is unchanged code — only the
+  default moved. **Upgrade:** an operator who wants the pre-#146 ranking sets
+  `ENABLE_DIVERSIFICATION=false`. See
+  [ADR 0004](https://github.com/inherent-prime/inherent/blob/main/docs/adr/0004-per-document-diversification.md)
+  and its amendment.
 
 ### Fixed
 

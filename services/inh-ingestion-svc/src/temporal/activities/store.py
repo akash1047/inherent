@@ -16,19 +16,34 @@ logger = structlog.get_logger(__name__)
 
 
 def _risk_metadata(chunk_dict: dict) -> dict | None:
-    """Build chunk metadata carrying the RAG-poisoning risk signal (#44).
+    """Build chunk metadata carrying the RAG-poisoning risk signal (#44) and
+    the format-aware chunking strategy attribution (#129).
 
-    Only emitted when a risk level is present in the staged chunk so benign
-    chunks keep a clean/None metadata payload. Additive: any future metadata
-    keys can be merged here.
+    Additive: each signal is only added to the dict when the staged chunk
+    actually carries it, so a chunk with neither keeps a clean/None metadata
+    payload (name kept as `_risk_metadata` -- it predates #129 and callers
+    already import it by this name; the #44 risk signal is still its
+    primary purpose, chunking_strategy just rides along in the same JSONB
+    write rather than needing a second column/migration).
     """
+    metadata: dict = {}
+
     risk = chunk_dict.get("content_risk")
-    if not risk or risk == "none":
-        return None
-    return {
-        "content_risk": risk,
-        "content_risk_reasons": list(chunk_dict.get("content_risk_reasons") or []),
-    }
+    if risk and risk != "none":
+        metadata["content_risk"] = risk
+        metadata["content_risk_reasons"] = list(chunk_dict.get("content_risk_reasons") or [])
+
+    # Which strategy (#129: "rows" | "sections" | "prose_header" |
+    # "sentences" | "paragraphs" | "tokens") actually produced this chunk --
+    # lets the #34 eval suite attribute retrieval quality per strategy, not
+    # just per file type. Empty string (a chunk that somehow bypassed the
+    # chunk activity's dispatch, e.g. an older staged chunk from before this
+    # field existed) is treated as "nothing to record", not a real value.
+    strategy = chunk_dict.get("chunking_strategy")
+    if strategy:
+        metadata["chunking_strategy"] = strategy
+
+    return metadata or None
 
 
 @activity.defn

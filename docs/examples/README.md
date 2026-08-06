@@ -786,6 +786,21 @@ results for it may stay stale until a retry succeeds; the failure is also record
 Note: an edit does not recompute `start_char`/`end_char` in either store, so after a
 length-changing edit they no longer bracket the chunk's actual content.
 
+**Note (#129):** for a chunk produced by the `tabular` or `structured`
+format-aware strategies, `start_char`/`end_char` (surfaced on `Citation` and
+`SearchResult`) bracket only the chunk's own REAL row/section span in the
+source document — they do NOT cover any injected context (a table header
+row, an XLSX sheet heading, a section heading) that was prepended to
+`content` to keep the fragment self-describing. This relaxes the offset
+invariant other chunking strategies (`sentences`/`paragraphs`/`tokens`)
+hold exactly (`text[start_char:end_char] == content`): for `rows`/`sections`
+chunks, `text[start_char:end_char]` is a SUBSTRING of `content`, not equal
+to it, whenever context was injected. A citation/highlight consumer that
+slices the source document at `[start_char, end_char)` still gets exactly
+the chunk's own real content — it just won't include the (separately
+present, at its own real position elsewhere in the document) injected
+header/heading text. See `chunk.py`'s module docstring for the full design.
+
 ---
 
 ## 10. Document Lineage
