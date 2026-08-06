@@ -10,6 +10,51 @@ this file — read the matching entry before touching the related area. Add an
 entry when a shipped defect teaches something a rule alone can't carry: one
 entry per root cause, newest first.
 
+## #110 — A fixed workflow id turns a routine race into a ~10-minute stall (2026-08-06)
+
+**Defect.** `DocumentIngestionWorkflow` is started with a deterministic id
+(`ingest-{document_id}`, `services/inh-ingestion-svc/src/temporal/trigger.py`)
+so a workflow can be addressed for status queries by document_id alone. That
+determinism is also a collision surface: re-indexing a document (edited-content
+re-upload, or the `/refresh` endpoint under load) while the prior run for the
+same document_id was still open hit Temporal's default `id_conflict_policy`
+(`UNSPECIFIED`), which raises `WorkflowAlreadyStartedError` on a same-id
+collision against a running execution. That exception propagated out of the
+MQ handler, so `RedisMQService` never ACKed the message — and every
+redelivery collided with the *same* still-open run and failed again, so the
+message effectively wasn't retried on a fixed cadence at all: it waited out
+however long the stale run took to close on its own (~10min in the CI run
+that surfaced it). Two REST-facing call sites with the same fixed-id shape
+(`POST /ingest`, `PATCH /chunks/{id}/{index}`) already caught this exception
+and returned a fast 409 — the gap was specifically the MQ-driven path, where
+nothing was watching for it and the failure mode is "wait," not "error."
+
+**Learnings.**
+
+- A deterministic Temporal workflow id is a deliberate collision surface, not
+  an incidental one — it exists so callers/queries can address a run without
+  tracking a run id. Every `start_workflow` call using one needs an explicit
+  decision about `id_conflict_policy`, made at the call site, not inherited
+  silently from the SDK default (`UNSPECIFIED` raises). Grep for `id=f"` next
+  to `start_workflow(` when auditing this pattern — the fixed-id shape is
+  visible in the string itself.
+- The right conflict policy depends on what a fresh request *means*: a
+  synchronous duplicate request (accidental double-click) should be rejected
+  fast (409) so the caller doesn't do double work — that's what `/ingest` and
+  the chunk-edit endpoint already did correctly. A re-index/refresh is
+  different: the fresh event *is* the newer truth, so it should supersede a
+  stale in-flight run (`WorkflowIDConflictPolicy.TERMINATE_EXISTING`), not
+  queue behind it or bounce off it as a conflict. Naming the same exception
+  doesn't mean the same handling is correct everywhere it's caught.
+- A raised exception on an MQ consumer path doesn't fail fast by default — it
+  fails on whatever cadence the queue's redelivery/reclaim logic happens to
+  produce, which can be far slower and less regular than the nominal retry
+  interval suggests (see #179, filed alongside this fix: the reclaim pass
+  itself only runs when *unrelated* new traffic also arrives on the stream).
+  When a stall shows up as "roughly N minutes" in an incident, distrust that
+  as a constant until you've traced the actual mechanism producing it — here
+  it was "however long the other workflow run happens to take," not a timeout.
+
 ## #146 — A single-probe readiness wait races the rest of the corpus it's gating (2026-07-24)
 
 **Defect.** `test_compose_retrieval_regression.py`'s corpus-readiness wait

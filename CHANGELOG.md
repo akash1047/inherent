@@ -76,6 +76,26 @@ All notable changes to Inherent are documented here. The format follows
 
 ### Fixed
 
+- **Re-indexing a document while its prior ingestion workflow was still open
+  stalled ~10min instead of completing (#110).** `DocumentIngestionWorkflow`
+  is started with a fixed id (`ingest-{document_id}`) so status queries can
+  address a run by document_id. A re-index/refresh enqueued while the prior
+  run for that document_id was still open (edited-content re-upload, or the
+  `/documents/{id}/refresh` endpoint under load) collided on that id:
+  Temporal's default `id_conflict_policy` raised `WorkflowAlreadyStartedError`,
+  which propagated out of the MQ handler
+  (`TemporalWorkflowTrigger.trigger_workflow_async`,
+  `services/inh-ingestion-svc/src/temporal/trigger.py`) so the message was
+  never ACKed. Every `RedisMQService` redelivery hit the same still-open run
+  and failed again, so the caller waited out however long the stale run took
+  to close on its own (~10min observed in CI run 29222060795 — not a fixed
+  timeout). Both `start_workflow` call sites now pass
+  `id_conflict_policy=WorkflowIDConflictPolicy.TERMINATE_EXISTING`, so a
+  fresh re-index/refresh always supersedes a stale in-flight run instead of
+  colliding with it — the newest content wins immediately, and an AI-agent
+  caller that retries a re-index gets a fast, complete result instead of a
+  ~10-minute stall.
+
 - **Retrieval-eval baseline ratchet silently never ran (#139 follow-up).**
   `eval-baseline-ratchet` pushed its ratchet commit straight to `main`, but
   branch protection rejects direct `github-actions[bot]` pushes — every

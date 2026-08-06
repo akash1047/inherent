@@ -50,6 +50,20 @@ a vector-store hiccup can therefore leave stale chunks behind. If a superseded
 revision keeps surfacing after a successful reindex, delete the document
 (`DELETE /v1/documents/{id}`) and upload it again.
 
+### Re-indexing while a previous ingestion is still running
+
+A document is processed by one Temporal workflow run at a time, addressed by
+a fixed id (`ingest-{document_id}`). If a reindex or refresh is triggered
+again while the prior run for that document is still open — an edited-content
+re-upload arriving mid-processing, or `POST /v1/documents/{id}/refresh` fired
+twice in quick succession — the new run **supersedes** the old one: the stale
+run is terminated and the fresh request runs from a clean start. The newest
+request always wins; there is no queuing behind the older run and no error
+back to the caller for this case. If you need the *outcome* of a specific
+re-index rather than just its acceptance, poll `GET /v1/documents/{id}` (or
+the workflow status endpoint) until `status` leaves `pending`/`processing`
+rather than assuming the first request you sent is the one that finished.
+
 ### Correcting a corpus that already forked
 
 If old and new revisions were uploaded as separate documents:

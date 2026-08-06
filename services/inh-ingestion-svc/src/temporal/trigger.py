@@ -12,11 +12,40 @@ from typing import TYPE_CHECKING
 import structlog
 from pydantic import ValidationError as PydanticValidationError
 from temporalio.client import Client
+from temporalio.common import WorkflowIDConflictPolicy, WorkflowIDReusePolicy
 
 from src.config.settings import Settings
 from src.models.document import DocumentUploadMessage, ProcessingResult
 from src.temporal.models import DocumentIngestionInput, WorkflowResult
 from src.temporal.workflows import DocumentIngestionWorkflow
+
+# Both start_workflow call sites below use a fixed, deterministic workflow id
+# (f"ingest-{document_id}") so status queries and dedup can address a run by
+# document_id. That determinism means a re-index/refresh enqueued while the
+# prior run for the same document_id is still open collides on the id.
+#
+# Temporal's default id_conflict_policy (UNSPECIFIED) treats a same-id
+# collision against a RUNNING execution as an error: start_workflow raises
+# WorkflowAlreadyStartedError. On the MQ-driven path (trigger_workflow_async)
+# that exception propagates out of the handler, so the message is never
+# ACKed and RedisMQService leaves it pending for redelivery (see
+# src/services/mq/redis_mq.py) -- but every redelivery collides with the
+# same still-open run and fails again, so the caller is stuck waiting for
+# however long that stale run takes to close on its own (#110; ~10min was
+# observed in CI, not a fixed timeout -- see docs/developer/learnings.md).
+#
+# Fix: supersede instead of collide. TERMINATE_EXISTING tells Temporal to
+# terminate the same-id running execution and start the new one atomically,
+# so start_workflow always returns fast instead of raising. This is the
+# correct semantics for an AI-agent caller that will retry a re-index: the
+# fresh event always represents the content that should win, so the newest
+# request should supersede a stale in-flight run rather than queue behind
+# it or bounce off it as a conflict. ALLOW_DUPLICATE (the SDK default, named
+# explicitly here for clarity) is unaffected -- it only governs whether a
+# new run may start after a *previous, closed* run with the same id, which
+# re-index/refresh always needs regardless of how that previous run ended.
+_INGEST_ID_REUSE_POLICY = WorkflowIDReusePolicy.ALLOW_DUPLICATE
+_INGEST_ID_CONFLICT_POLICY = WorkflowIDConflictPolicy.TERMINATE_EXISTING
 
 if TYPE_CHECKING:
     from src.services.database import DatabaseService
@@ -203,11 +232,15 @@ class TemporalWorkflowTrigger:
 
             workflow_id = f"ingest-{upload_message.document_id}"
 
+            # Supersede a still-open prior run for this document_id instead of
+            # colliding with it (#110) -- see module comment above.
             handle = await self._client.start_workflow(
                 DocumentIngestionWorkflow.run,
                 workflow_input,
                 id=workflow_id,
                 task_queue=self.settings.temporal_task_queue,
+                id_reuse_policy=_INGEST_ID_REUSE_POLICY,
+                id_conflict_policy=_INGEST_ID_CONFLICT_POLICY,
             )
 
             logger.info(
@@ -324,11 +357,21 @@ class TemporalWorkflowTrigger:
         # Start the workflow without awaiting its result. If Temporal is
         # transiently unavailable this raises and propagates so the MQ
         # consumer does NOT ack the message (it stays pending → redelivered).
+        #
+        # Supersede a still-open prior run for this document_id instead of
+        # colliding with it (#110) -- see module comment above. Without this,
+        # a re-index/refresh enqueued while the previous run is still open
+        # raises WorkflowAlreadyStartedError here, which (like any other
+        # exception in this method) also propagates for MQ redelivery -- but
+        # every redelivery hits the same collision until the stale run closes
+        # on its own, stalling the caller for however long that takes.
         await self._client.start_workflow(
             DocumentIngestionWorkflow.run,
             workflow_input,
             id=workflow_id,
             task_queue=self.settings.temporal_task_queue,
+            id_reuse_policy=_INGEST_ID_REUSE_POLICY,
+            id_conflict_policy=_INGEST_ID_CONFLICT_POLICY,
         )
 
         # Record admission latency: MQ-receive → Temporal-accepted.
