@@ -6,13 +6,22 @@
 
 <p align="center">
   <a href="https://inherent.sh/">Website</a> ·
-  <a href="https://docs.inherent.sh/">Docs</a> ·
+  <a href="https://docs.inherent.sh/](https://inherent-prime.github.io/inherent/">Docs</a> ·
   <a href="https://inherent.sh/#pricing">Pricing</a> ·
   <a href="https://inherent.sh/blog">Blog</a> ·
   <a href="https://app.inherent.sh/">Try the Sandbox</a>
 </p>
 
 # Inherent
+
+<p align="center">
+  <a href="https://github.com/inherent-prime/inherent/actions/workflows/ci.yml">
+    <img src="https://github.com/inherent-prime/inherent/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI status" />
+  </a>
+  <a href="https://github.com/inherent-prime/inherent/actions/workflows/integration.yml">
+    <img src="https://github.com/inherent-prime/inherent/actions/workflows/integration.yml/badge.svg?branch=main" alt="Integration (Compose e2e + retrieval-eval gate) status" />
+  </a>
+</p>
 
 Build your private company brain.
 
@@ -55,7 +64,33 @@ It gives you:
 - PostgreSQL as structured storage for documents and chunks
 - Weaviate as vector index for similarity search
 - REST API for search, document listing, chunk access, and context retrieval
+- Traffic-mined retrieval evals — turn real search traffic and agent feedback into a labeled eval set, then score recall/MRR/nDCG across keyword, semantic, and hybrid modes on your own corpus, no golden-set authoring required
 - Local-first developer setup with Docker Compose
+
+### Retrieval Quality Baseline
+
+Retrieval quality is a CI contract, not a claim. The numbers below are the
+committed baseline in
+[`retrieval_baseline.json`](services/inh-public-api-svc/tests/evals/corpus/retrieval_baseline.json),
+measured against the golden corpus on the full Compose stack. They are an
+enforced **floor**: any per-mode metric regressing more than `0.02` below them
+fails the build, and a green run on `main` ratchets them up (never down), so
+each value is the best score that mode has sustained.
+
+<!-- retrieval-baseline:start -->
+<!-- Generated from services/inh-public-api-svc/tests/evals/corpus/retrieval_baseline.json by tests/evals/render_baseline_table.py — do not edit by hand. The eval-baseline-ratchet job regenerates it whenever the baseline moves. -->
+
+| Mode | Recall@5 | MRR | nDCG@5 |
+| --- | --- | --- | --- |
+| Hybrid | 0.846 | 0.795 | 0.720 |
+| Keyword | 0.808 | 0.821 | 0.714 |
+| Semantic | 0.846 | 0.695 | 0.681 |
+<!-- retrieval-baseline:end -->
+
+Run-over-run scores are appended to
+[`retrieval_history.jsonl`](services/inh-public-api-svc/tests/evals/corpus/retrieval_history.jsonl).
+See [docs/testing.md](docs/testing.md#retrieval-eval-gate-baseline-ratchet-and-trend-history-139)
+for the gate, the absolute-floor backstop, and how to run the evals locally.
 
 ## What's In The Repo
 
@@ -230,6 +265,11 @@ Notes:
   full stack on an amd64 host for production-like performance.
 - The seeded `ink_dev_local_key_001` is a **dev convenience** — create your own
   workspace and API keys before exposing the stack to anything real.
+
+This release stack is a zero-setup **demo**. Before you point real users or data
+at it, work through [Taking Inherent to Production](docs/deploy/production.md) —
+real object storage, MongoDB auth, TLS, `ENVIRONMENT=production`, the event-queue
+eviction policy, and backups.
 
 ## Local Smoke Test
 

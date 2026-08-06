@@ -75,6 +75,37 @@ Repo-wide shortcut:
 make test-integration   # public-api compose suite (stack must be up)
 ```
 
+**Local compose CI:** `.github/workflows/integration.yml` (or `make test-integration`
+against a laptop stack).
+
+**Laptop Hetzner VM (manual):** [getting-started/local-vm-test.md](getting-started/local-vm-test.md)
+— Terraform apply from your machine with Object Storage remote state, smoke
+`/health`, optional bootstrap and `pytest -m compose`. Destroy when done.
+
+**Hetzner production-path e2e:** `.github/workflows/hetzner-e2e.yml` — Terraform
+apply on Hetzner (remote state key `inherent/ci/<run_id>/terraform.tfstate`),
+bootstrap, then public-api `pytest -m compose` against the VM. Not a PR gate.
+
+- **Triggers:** successful **Publish images** on a final `vX.Y.Z` tag
+  (`workflow_run`; RCs skipped), or manual **Run workflow** form.
+- **Form / inputs:** [infra/README.md § Manual run](https://github.com/inherent-prime/inherent/blob/main/infra/README.md#manual-run-github-form)
+  — `ref` (required; checkout + compose; needs `infra/`), optional
+  `inherent_version` (GHCR tag), `server_type` (default `cpx32`). “Use workflow
+  from” only selects the workflow YAML branch.
+- **Pin:** prefer aligned image tag + checkout when testing a release; use
+  `ref=main` + explicit `inherent_version` when the release tag lacks `infra/`.
+- **Secrets:** `HCLOUD_TOKEN`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`.
+- **Variables:** `HETZNER_S3_BUCKET`, `HETZNER_S3_ENDPOINT`, optional
+  `AWS_DEFAULT_REGION` (default `eu-central`).
+- **Recover orphans:** `.github/workflows/hetzner-e2e-recover.yml` (`run_id`
+  input) — same infra README section.
+- **Local `act`:** optional laptop simulation of the workflow; see infra README
+  § Local simulation and [audit/act-hetzner-e2e-weaviate-401.md](audit/act-hetzner-e2e-weaviate-401.md).
+  Smoke image parity before long runs ([releasing](maintainers/releasing.md#hetzner-act-e2e-image-parity)).
+
+See [infra/README.md](https://github.com/inherent-prime/inherent/blob/main/infra/README.md#ci-e2e) and
+[releasing](maintainers/releasing.md#cutting-an-image-release).
+
 ## Markers
 
 Markers are declared in each service's `[tool.pytest.ini_options].markers`.
@@ -114,6 +145,129 @@ cd services/inh-ingestion-svc && uv run pytest -m failure_injection
 # Benchmarks (either service)
 cd services/<svc> && uv run pytest -m benchmark
 ```
+
+## Retrieval-eval gate, baseline ratchet, and trend history (#139)
+
+`test_compose_retrieval_regression.py` (`retrieval_eval` + `compose`) hard-gates
+on regression, not just reporting: any per-mode metric (recall@5/MRR/nDCG@5)
+that drops more than `EVAL_GATE_TOLERANCE` (default `0.02`) below the committed
+`corpus/retrieval_baseline.json` fails the build, via
+`tests/evals/eval_gate.py`. An absolute-floor backstop
+(`RETRIEVAL_MIN_RECALL5`, default `0.15`) still applies underneath it.
+
+On a green gate on `main`, `.github/workflows/integration.yml`'s
+`eval-baseline-ratchet` job ratchets the baseline up to
+`max(current, baseline)` per mode/metric (never down), appends a line to
+`corpus/retrieval_history.jsonl` — a durable, checked-in trend log of every
+main-branch run's scores — regenerates the baseline table published in
+`README.md` (see [below](#publishing-the-baseline-to-readmemd)), and opens (or
+updates) a pull request carrying all three
+changes, rather than pushing to `main` directly: branch protection rejects
+direct `github-actions[bot]` pushes, so a push-based ratchet silently fails
+every run (this is what left the baseline seeded at zeros for the entire time
+#139 was live — see the history log's first entry for the real numbers it was
+seeded with instead). The job reuses one branch
+(`chore/ratchet-retrieval-baseline`) across runs; it checks for an **open** PR
+specifically (`gh pr list --state open`, not `gh pr view`, which also matches
+an already-merged PR on the same branch and would otherwise skip
+`gh pr create` forever after the first merge) and, if one is open, pulls that
+PR's own baseline/history forward before recomputing rather than resetting to
+`main`'s older copy, so a not-yet-merged rise is never silently dropped. The
+PR is opened with auto-merge requested so a clean ratchet still needs no human
+action, but falls back to a normal maintainer-merged PR if auto-merge isn't
+enabled on the repo — the same fallback applies if the optional
+`RATCHET_PR_TOKEN` repo secret (a PAT or GitHub App token with
+`contents:write`+`pull-requests:write`) isn't configured, since the default
+`GITHUB_TOKEN` is excluded from triggering other workflow runs on the push/PR
+it creates and the PR's required check (`ci.yml`) won't fire on its own
+without it. On gate failure (push-to-main or nightly), the
+`eval-regression-alert` job files or updates an issue labeled
+`retrieval-eval-regression`. This does **not** gate PRs — the full Compose
+stack stays too slow/expensive to run on every PR (see the note at the top of
+`integration.yml`); regressions are caught post-merge, same as the rest of
+this workflow.
+
+The golden corpus (`corpus/qrels.jsonl`) tags each judgment with an optional
+`category`: `general`, `exact_id`, `stale_version`, `paraphrase`, `abstention`
+(a query with no relevant document — the correct signal is zero recall/MRR/
+nDCG, not a fabricated match), or `multi_doc_crowding` (a query with 2+
+genuinely relevant documents where one has many more chunks than the other —
+`q14`, `rate-limiting-deep-dive.txt` (5 chunks) vs.
+`rate-limit-quick-reference.txt` (1 chunk) — exercising the scenario
+per-document diversification, #146, exists to fix: a naive score-sorted
+top-k can crowd the shorter document out entirely). Per-category scores are
+printed and written to the eval report (`_by_category`) for visibility; only
+the per-mode pooled averages are gated, and `abstention` queries are excluded
+from that pool since they can never contribute a positive score by
+construction. Permission/tenancy boundaries are deliberately not a category
+here — that's owned by the `security` marker suite, not this ranking-quality
+corpus.
+
+### Publishing the baseline to README.md
+
+`tests/evals/render_baseline_table.py` renders `corpus/retrieval_baseline.json`
+into the marker-delimited block in `README.md`:
+
+```bash
+# from services/inh-public-api-svc
+uv run python -m tests.evals.render_baseline_table \
+  --baseline tests/evals/corpus/retrieval_baseline.json \
+  --readme ../../README.md
+```
+
+Invoke it as `python -m` from the service directory, not as a bare script path
+from the repo root: it imports `load_metrics` from `eval_gate` rather than
+keeping a second copy of the doc-key-dropping parse, and only `-m` puts the
+`tests` package on `sys.path`.
+
+It rewrites only the text between `<!-- retrieval-baseline:start -->` and
+`<!-- retrieval-baseline:end -->`, and fails (exit 1) if that marker pair is
+missing rather than silently leaving the README stale. Output is a pure
+function of the baseline, so re-running against an unchanged baseline is a
+no-op — the `eval-baseline-ratchet` job relies on that to keep `README.md` out
+of its commit unless the numbers actually moved.
+
+It renders the **baseline**, not `retrieval_history.jsonl`, deliberately: a
+history line is appended on every main-branch run (each with a fresh
+timestamp, so never a no-op), so rendering history would rewrite `README.md`
+on every run. The baseline moves only on a real improvement. The baseline is
+also a per-metric `max()` across runs, so the block reports it as a floor and
+carries no single commit SHA — stamping one would misattribute values that
+came from different commits.
+
+Because the ratchet job now commits `README.md`, `README.md` is in the
+workflow's `paths-ignore`; without that, merging a ratchet PR would re-trigger
+`integration.yml` and recreate the unbounded ratchet loop that the
+`retrieval_baseline.json`/`retrieval_history.jsonl` exclusions already prevent.
+
+## Benchmark JSON report artifacts (REQ-EVL-3)
+
+The live Compose benchmarks (`benchmark` + `compose`, both services) each
+write a JSON summary alongside printing to stdout, so a run's numbers survive
+past the CI log — same principle as the retrieval-eval report above, not just
+for retrieval:
+
+- **public-api search benchmarks** (`test_search_latency_throughput.py`) write
+  `search-benchmark-report.json` with `search_latency` (p50/p95/p99/min/max
+  ms) and `search_throughput` (QPS) keys, each carrying the commit SHA the run
+  measured. `tests/benchmark/run_search_benchmark.py::write_benchmark_report`
+  merges rather than overwrites, since both tests share one file within a run;
+  the standalone CLI (`run_search_benchmark.py`) writes the same shape under a
+  `cli_search` key via its own `--report` flag.
+- **ingestion throughput benchmark** (`test_ingestion_throughput.py`) writes
+  `ingestion-benchmark-report.json` with an `ingestion_throughput` key
+  (`docs_per_sec`, `elapsed_s`, `batch_size`, commit SHA), via the sibling
+  `tests/benchmark/benchmark_report.py` helper (duplicated rather than shared
+  across services — separate Python packages, no common dependency between
+  them).
+
+Both are uploaded as CI artifacts (`search-benchmark-report`,
+`ingestion-benchmark-report`) by `integration.yml`'s `compose-integration` job,
+`if: always()` so a benchmark failure still leaves the partial numbers
+retrievable. Override the output path locally with the `BENCHMARK_REPORT` env
+var. These are visibility only — no CI gate reads them back; the loose
+SLO assertions already in the tests are what fails the build on a gross
+regression.
 
 ## Coverage
 

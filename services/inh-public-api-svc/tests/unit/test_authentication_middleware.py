@@ -43,16 +43,18 @@ def _create_test_app():
 
     @app.get("/test")
     async def test_endpoint(request: Request):
+        auth_error = getattr(request.state, "auth_error", "NOT_SET")
         api_key_info = getattr(request.state, "api_key_info", "NOT_SET")
         if api_key_info is None:
-            return {"api_key_info": None}
+            return {"api_key_info": None, "auth_error": auth_error}
         if api_key_info == "NOT_SET":
-            return {"api_key_info": "NOT_SET"}
+            return {"api_key_info": "NOT_SET", "auth_error": auth_error}
         return {
             "api_key_info": {
                 "key_id": api_key_info.key_id,
                 "user_id": api_key_info.user_id,
-            }
+            },
+            "auth_error": auth_error,
         }
 
     @app.get("/health")
@@ -116,6 +118,7 @@ class TestAuthenticationMiddleware:
         assert response.status_code == 200
         data = response.json()
         assert data["api_key_info"] is None
+        assert data["auth_error"] is False
 
         # Auth service should NOT be called
         mock_get_auth.assert_not_awaited()
@@ -134,6 +137,7 @@ class TestAuthenticationMiddleware:
         assert response.status_code == 200
         data = response.json()
         assert data["api_key_info"] is None
+        assert data["auth_error"] is False
 
     def test_exempt_paths_skip_validation(self):
         """Should skip auth resolution for exempt paths like /health."""
@@ -147,8 +151,9 @@ class TestAuthenticationMiddleware:
         # api_key_info should be None (initialized but not validated)
         assert data["api_key_info"] is None
 
+    @patch("src.middleware.authentication.metrics")
     @patch("src.middleware.authentication.get_auth_service")
-    def test_validation_error_does_not_crash(self, mock_get_auth):
+    def test_validation_error_does_not_crash(self, mock_get_auth, mock_metrics):
         """Should catch exceptions during validation and continue without crashing."""
         mock_get_auth.side_effect = RuntimeError("Database connection failed")
 
@@ -160,6 +165,24 @@ class TestAuthenticationMiddleware:
         assert response.status_code == 200
         data = response.json()
         assert data["api_key_info"] is None
+
+    @patch("src.middleware.authentication.metrics")
+    @patch("src.middleware.authentication.get_auth_service")
+    def test_validation_error_sets_auth_error_state_and_metric(self, mock_get_auth, mock_metrics):
+        """A backend error during validation must be distinguishable (#149) from a
+        simple missing/invalid key, so rate limiting doesn't silently squeeze a
+        valid-key holder down to the unauthenticated-IP tier without any signal."""
+        mock_get_auth.side_effect = RuntimeError("Database connection failed")
+
+        app = _create_test_app()
+        client = TestClient(app)
+
+        response = client.get("/test", headers={"X-API-Key": "ink_test_key"})
+        assert response.status_code == 200
+        data = response.json()
+        assert data["api_key_info"] is None
+        assert data["auth_error"] is True
+        mock_metrics.record_auth_failure.assert_called_once_with("auth_backend_error")
 
     @patch("src.middleware.authentication.get_auth_service")
     def test_expired_key_leaves_state_none(self, mock_get_auth):

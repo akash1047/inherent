@@ -24,10 +24,13 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import json
 import math
 import os
+import subprocess
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
 import httpx
 
@@ -35,6 +38,7 @@ DEFAULT_API_URL = os.environ.get("PUBLIC_API_URL", "http://localhost:18000").rst
 DEFAULT_API_KEY = os.environ.get("INTEGRATION_API_KEY", "ink_dev_local_key_001")
 DEFAULT_WORKSPACE_ID = os.environ.get("INTEGRATION_WORKSPACE_ID", "ws_local_001")
 DEFAULT_QUERY = "what retrieval modes does Inherent support"
+DEFAULT_BENCHMARK_REPORT = os.environ.get("BENCHMARK_REPORT", "search-benchmark-report.json")
 
 
 # ---------------------------------------------------------------------------
@@ -90,6 +94,54 @@ class BenchmarkSummary:
             f"max:        {self.max_ms:.2f} ms\n"
             f"throughput: {self.qps:.2f} QPS"
         )
+
+
+def git_sha() -> str:
+    """Return the commit SHA this benchmark ran against.
+
+    Prefers ``GITHUB_SHA`` (set by Actions, cheap and exact) and falls back to
+    ``git rev-parse HEAD`` for local runs; ``"unknown"`` if neither works (e.g.
+    a source tree with no ``.git``, such as an extracted release tarball).
+    """
+    sha = os.environ.get("GITHUB_SHA")
+    if sha:
+        return sha
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], text=True, stderr=subprocess.DEVNULL
+        ).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return "unknown"
+
+
+def write_benchmark_report(report_path: str | Path, key: str, payload: dict) -> None:
+    """Merge ``payload`` under ``key`` into the JSON report at ``report_path``.
+
+    Merges into any existing file rather than overwriting it (REQ-EVL-3):
+    the latency and throughput benchmarks run in the same pytest session and
+    each contributes its own top-level key to one shared report artifact,
+    same pattern as the retrieval eval report CI already uploads. A corrupt
+    or missing existing file is treated as an empty report rather than
+    failing the benchmark on its own reporting step.
+
+    Keep in sync: duplicated near-verbatim (along with ``git_sha()`` above)
+    in ``services/inh-ingestion-svc/tests/benchmark/benchmark_report.py`` --
+    separate Python packages, no shared dependency between them, and no test
+    catches the two drifting apart if one changes without the other.
+    """
+    path = Path(report_path)
+    report: dict = {}
+    if path.exists():
+        try:
+            loaded = json.loads(path.read_text())
+        except json.JSONDecodeError:
+            loaded = {}
+        # A valid-but-non-dict file (e.g. `[]`) parses fine but isn't
+        # mergeable -- treat it the same as corrupt rather than letting
+        # `report[key] = ...` raise TypeError below (#146 cross-review).
+        report = loaded if isinstance(loaded, dict) else {}
+    report[key] = {**payload, "git_sha": git_sha()}
+    path.write_text(json.dumps(report, indent=2, sort_keys=True))
 
 
 def summarize(latencies_ms: list[float], wall_time_s: float) -> BenchmarkSummary:
@@ -178,6 +230,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--api-url", default=DEFAULT_API_URL, help="public API base URL")
     parser.add_argument("--api-key", default=DEFAULT_API_KEY, help="X-API-Key value")
     parser.add_argument("--workspace-id", default=DEFAULT_WORKSPACE_ID, help="X-Workspace-Id value")
+    parser.add_argument(
+        "--report",
+        default=DEFAULT_BENCHMARK_REPORT,
+        help=f"JSON report path to write/merge (default {DEFAULT_BENCHMARK_REPORT})",
+    )
     return parser.parse_args(argv)
 
 
@@ -198,6 +255,19 @@ def main(argv: list[str] | None = None) -> int:
         limit=args.limit,
     )
     print(summary.format())
+    write_benchmark_report(
+        args.report,
+        "cli_search",
+        {
+            "count": summary.count,
+            "p50_ms": summary.p50_ms,
+            "p95_ms": summary.p95_ms,
+            "p99_ms": summary.p99_ms,
+            "min_ms": summary.min_ms,
+            "max_ms": summary.max_ms,
+            "qps": summary.qps,
+        },
+    )
     return 0
 
 

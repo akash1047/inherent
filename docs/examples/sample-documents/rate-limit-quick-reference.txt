@@ -1,0 +1,3 @@
+Inherent Knowledge Base — Throughput Guardrails Summary
+
+Every workspace's credentials are throttled to protect the platform from being overwhelmed by any single integration. Callers whose usage exceeds their allotment get a 429 response along with guidance on when a retry is likely to succeed. Larger deployments can arrange a higher throughput allowance with their account team, no code changes required.

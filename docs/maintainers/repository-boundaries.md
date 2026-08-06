@@ -1,3 +1,8 @@
+---
+search:
+  exclude: true
+---
+
 # Repository Boundaries
 
 This repository should stay focused on the OSS core runtime.

@@ -270,8 +270,18 @@ def test_content_duplicate_uploads_do_not_flood_search(client: httpx.Client) -> 
 
 
 def test_upload_status_lifecycle(client: httpx.Client) -> None:
-    """GET /v1/documents/{id} returns 200 (not 404) right after upload, then 'processed'."""
-    document_id = _upload(client, "sample.md", "text/markdown")
+    """GET /v1/documents/{id} returns 200 (not 404) right after upload, then 'processed'.
+
+    Uses content UNIQUE to this test so it exercises a genuine fresh-document
+    lifecycle. Re-uploading content another test already ingested would hit the
+    identical-content dedup short-circuit (#75) and return 'processed' at once,
+    never passing through the in-flight states this test asserts.
+    """
+    document_id = _upload_bytes(
+        client,
+        b"# Upload status lifecycle probe\nUnique bytes so dedup does not short-circuit.",
+        "status-lifecycle-probe.md",
+    )
 
     # Immediately after upload the row must exist with an in-flight status.
     resp = client.get(f"{API_URL}/v1/documents/{document_id}", headers=HEADERS)

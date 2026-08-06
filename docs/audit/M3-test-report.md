@@ -1,3 +1,8 @@
+---
+search:
+  exclude: true
+---
+
 # Defect-Register Remediation — M3 Test Report (P3 hardening) + Program Summary
 
 **Branch:** `fix/defect-register-remediation`

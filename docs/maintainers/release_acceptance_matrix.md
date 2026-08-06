@@ -1,3 +1,8 @@
+---
+search:
+  exclude: true
+---
+
 # Release Acceptance Matrix
 
 The suites that must pass before tagging a release, why each exists, and the
@@ -56,6 +61,19 @@ green `integration.yml` run as the final release gate.
 Locally you can reproduce it with `make dev` (stack up) followed by
 `make test-integration`.
 
+The retrieval-eval suite is a **hard gate**, not reporting-only (#139): it
+fails on any per-mode metric regression vs. the committed
+`corpus/retrieval_baseline.json` beyond `EVAL_GATE_TOLERANCE`. A green run on
+`main` ratchets the baseline up (never down) and appends to
+`corpus/retrieval_history.jsonl`; see
+[docs/testing.md § Retrieval-eval gate](../testing.md#retrieval-eval-gate-baseline-ratchet-and-trend-history-139).
+The golden corpus permanently includes a `multi_doc_crowding` category (#146)
+so future chunking/scoring/diversification changes are measured against it.
+
+The same Compose runs also upload `search-benchmark-report.json` /
+`ingestion-benchmark-report.json` (REQ-EVL-3) — visibility only, not a gate;
+see [docs/testing.md § Benchmark JSON report artifacts](../testing.md#benchmark-json-report-artifacts-req-evl-3).
+
 ## README claim → covering tests
 
 | README / product claim                                              | Covering suite(s) |
@@ -69,6 +87,7 @@ Locally you can reproduce it with `make dev` (stack up) followed by
 | Stable shared event + naming contracts between services            | contracts suite (#8) |
 | Vector-backed similarity search returns relevant passages          | compose e2e (ingestion-to-search) |
 | End-to-end: upload → process → searchable                          | compose e2e (`integration.yml`) |
+| Traffic-mined retrieval evals (feedback capture, scorecard, mode-comparison runs) | public-api `contract` (#3); compose e2e flywheel (`integration.yml`) |
 
 ## Pre-tag flow
 

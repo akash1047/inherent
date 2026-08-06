@@ -87,7 +87,7 @@ curl -s "$API_BASE/health/ready" | jq .
 {
   "status": "healthy",
   "timestamp": "2024-01-15T10:00:00.000000+00:00",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "service": "inh-public-api-svc",
   "checks": {
     "database": { "status": "healthy", "latency_ms": 4.2 },
@@ -122,8 +122,27 @@ Upload registers a file in storage and queues it for ingestion. The returned `do
 
 Allowed MIME types: `text/plain`, `text/markdown`, `text/csv`, `text/html`,
 `application/pdf`, `application/json`,
-`application/vnd.openxmlformats-officedocument.wordprocessingml.document`.
-Max size: 50 MB.
+`application/vnd.openxmlformats-officedocument.wordprocessingml.document` (DOCX),
+`application/vnd.openxmlformats-officedocument.spreadsheetml.sheet` (XLSX),
+`application/vnd.openxmlformats-officedocument.presentationml.presentation` (PPTX),
+`image/png` (OCR), `message/rfc822` (EML), `application/epub+zip` (EPUB),
+`application/rtf` / `text/rtf` (RTF), `application/vnd.oasis.opendocument.text`
+(ODT), `application/yaml`/`text/yaml`, `application/toml`,
+`application/xml`/`text/xml`, source code (`text/x-python` and other
+language-specific aliases — see the extension allowlist below),
+`application/x-subrip` (SRT), `text/vtt` (WebVTT) — see the full
+[supported file types](../reference/file-types.md) reference for extensions,
+chunking strategy, and optional-dependency notes.
+Max size: 50 MB. Binary formats are magic-byte sniffed against the declared
+`Content-Type` at upload; a mismatch (e.g. PNG bytes declared `text/plain`)
+is rejected with `400 Bad Request`. Legacy `application/msword` (.doc) and
+Outlook `application/vnd.ms-outlook` (.msg) are explicitly rejected with a
+`400` naming the supported replacement (.docx / .eml) rather than accepted
+and garbled. A generic or absent `Content-Type` (`application/octet-stream`)
+falls back to the filename's extension when that extension is registered
+(e.g. uploading `main.py` with no declared type) — see
+[supported file types](../reference/file-types.md) for the full extension
+list this fallback consults.
 
 ### Upload plain text
 
@@ -195,6 +214,47 @@ curl -s -X POST "$API_BASE/v1/documents" \
   | jq .
 ```
 
+### Upload XLSX
+
+```bash
+curl -s -X POST "$API_BASE/v1/documents" \
+  -H "X-API-Key: $API_KEY" \
+  -H "X-Workspace-Id: $WORKSPACE_ID" \
+  -F "file=@docs/examples/sample-documents/sample.xlsx;type=application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" \
+  | jq .
+```
+
+Extracted text is row-aware and sheet-boundary-preserving (`## Sheet: <name>`
+headers, pipe-delimited rows) — see [supported file types](../reference/file-types.md).
+
+### Upload PPTX
+
+```bash
+curl -s -X POST "$API_BASE/v1/documents" \
+  -H "X-API-Key: $API_KEY" \
+  -H "X-Workspace-Id: $WORKSPACE_ID" \
+  -F "file=@docs/examples/sample-documents/sample.pptx;type=application/vnd.openxmlformats-officedocument.presentationml.presentation" \
+  | jq .
+```
+
+Extracted text preserves slide boundaries (`## Slide <n>: <title>` headers),
+table rows, and speaker notes (under a `Notes:` line) — see
+[supported file types](../reference/file-types.md).
+
+### Upload PNG (OCR)
+
+```bash
+curl -s -X POST "$API_BASE/v1/documents" \
+  -H "X-API-Key: $API_KEY" \
+  -H "X-Workspace-Id: $WORKSPACE_ID" \
+  -F "file=@docs/examples/sample-documents/sample.png;type=image/png" \
+  | jq .
+```
+
+Text is extracted via Tesseract OCR. If the `ocr` extra or the `tesseract`
+system binary isn't installed, extraction degrades to a placeholder instead
+of failing the upload — see [supported file types](../reference/file-types.md).
+
 **Expected response (201):**
 
 ```json
@@ -233,7 +293,36 @@ curl -s -X POST "$API_BASE/v1/documents" \
   "type": "https://api.inherent.systems/errors/bad-request",
   "title": "Bad Request",
   "status": 400,
-  "detail": "Unsupported file type 'application/octet-stream'. Allowed types: text/plain, text/markdown, text/csv, text/html, application/pdf, application/json, application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+  "detail": "Unsupported file type 'application/octet-stream'. Allowed types: text/plain, text/markdown, text/csv, text/html, application/pdf, application/json, application/vnd.openxmlformats-officedocument.wordprocessingml.document, application/vnd.openxmlformats-officedocument.spreadsheetml.sheet, application/vnd.openxmlformats-officedocument.presentationml.presentation, image/png, message/rfc822, application/epub+zip, application/rtf, text/rtf, application/vnd.oasis.opendocument.text, application/yaml, text/yaml, application/toml, application/xml, text/xml, text/x-python, application/javascript, text/javascript, application/typescript, text/x-go, text/x-java-source, text/x-rustsrc, text/x-csrc, text/x-chdr, text/x-c++src, text/x-csharp, text/x-ruby, text/x-php, text/x-swift, text/x-kotlin, text/x-scala, application/x-sh, text/x-sh, application/sql, text/x-sql, text/x-r-source, text/x-lua, application/x-subrip, text/vtt"
+}
+```
+
+Note: `application/octet-stream` above is what a missing `Content-Type` header
+resolves to by default; the 400 in this example comes from `/etc/hosts`
+having no filename extension the registry recognizes, so the fallback
+described above has nothing to consult either.
+
+**Mislabeled file — bytes don't match the declared type (400, #117):**
+
+The `Content-Type` you declare is checked against the file's actual magic
+bytes, not trusted blindly. A binary file declared as a text type, or a file
+declared as one binary format whose bytes don't match that format's
+signature, is rejected before anything is stored:
+
+```bash
+curl -s -X POST "$API_BASE/v1/documents" \
+  -H "X-API-Key: $API_KEY" \
+  -H "X-Workspace-Id: $WORKSPACE_ID" \
+  -F "file=@docs/examples/sample-documents/sample.png;type=text/plain" \
+  | jq .
+```
+
+```json
+{
+  "type": "https://api.inherent.systems/errors/bad-request",
+  "title": "Bad Request",
+  "status": 400,
+  "detail": "File content does not match the declared content type 'text/plain': the bytes match the 'png' file signature instead."
 }
 ```
 
@@ -501,6 +590,17 @@ curl -s "$API_BASE/v1/chunks/$DOC_ID" \
 ]
 ```
 
+### Get a single chunk by id
+
+Fetch one chunk directly by its id within a document. Returns `404` if the chunk does not exist or belongs to a workspace you cannot access.
+
+```bash
+curl -s "$API_BASE/v1/chunks/$DOC_ID/$CHUNK_ID" \
+  -H "X-API-Key: $API_KEY" \
+  -H "X-Workspace-Id: $WORKSPACE_ID" \
+  | jq .
+```
+
 ### Get document context (all chunks as full text)
 
 Returns metadata + all chunks combined into `full_text`. Use this for MCP-style full-document context retrieval.
@@ -653,10 +753,12 @@ Returns **404** if no workflow exists for the document (or it is no longer query
 ## 9. Edit a Chunk
 
 Replace the content of a single chunk. Runs a Temporal workflow that updates PostgreSQL and
-re-embeds the chunk in Weaviate. The path index is the chunk's `chunk_index` (0-based).
+re-embeds the chunk in Weaviate. The path index is the chunk's `chunk_index` (0-based). The
+`workspace_id` query param is **required** and must be the workspace that actually owns
+`document_id` (#134) — the vector write is tenant-scoped to it.
 
 ```bash
-curl -s -X PATCH "$INGEST_BASE/chunks/$DOC_ID/0" \
+curl -s -X PATCH "$INGEST_BASE/chunks/$DOC_ID/0?workspace_id=$WORKSPACE_ID" \
   -H "X-API-Key: $INGEST_KEY" \
   -H "Content-Type: application/json" \
   -d '{ "content": "Updated chunk text goes here." }' \
@@ -673,7 +775,16 @@ curl -s -X PATCH "$INGEST_BASE/chunks/$DOC_ID/0" \
 }
 ```
 
-Returns **409** if an edit is already in progress for that chunk, **500** if the edit fails.
+Returns **404** if `document_id` isn't found in `workspace_id` (also returned when the document
+exists but belongs to a different workspace — no cross-tenant existence leak, and when
+`chunk_index` is out of range for the document), **409** if an edit
+is already in progress for that chunk, **500** if PostgreSQL updated successfully but the
+Weaviate re-embed did not (even after retries) — the chunk's new text is durable, but search
+results for it may stay stale until a retry succeeds; the failure is also recorded as an
+`ingestion_events` row visible via `GET /lineage/{document_id}`.
+
+Note: an edit does not recompute `start_char`/`end_char` in either store, so after a
+length-changing edit they no longer bracket the chunk's actual content.
 
 ---
 
@@ -860,6 +971,20 @@ curl -s -X POST "$INGEST_BASE/dead-letter/1/abandon" \
 
 ---
 
+## Eval feedback examples
+
+`eval_trial.py` — interactive retrieval-quality labeling. Ask questions about
+your corpus, mark which results were relevant, and each answer is filed as real
+eval feedback. Twenty questions gives you enough labeled cases for a first
+eval run. Requires `API_BASE`, `API_KEY`, `WORKSPACE_ID` env vars.
+
+`langgraph_feedback_agent.py` — the same feedback loop from a real agent:
+LangGraph tool wrappers that search Inherent and auto-report which chunks
+answered the question. Requires `langgraph`/`langchain-core` in your own
+environment (not a repo dependency).
+
+---
+
 ## Postman Collection
 
 Same endpoints as a Postman collection, for GUI-based testing.
@@ -957,8 +1082,16 @@ depend on it.
 | `sample.json` | `application/json` | `docs/examples/sample-documents/sample.json` |
 | `sample.csv` | `text/csv` | `docs/examples/sample-documents/sample.csv` |
 | `sample.html` | `text/html` | `docs/examples/sample-documents/sample.html` |
-| `sample.pdf` | `application/pdf` | Generate with any PDF tool; not committed (binary) |
-| `sample.docx` | `application/vnd.openxmlformats-officedocument.wordprocessingml.document` | Generate with LibreOffice/Word; not committed (binary) |
+| `sample.pdf` | `application/pdf` | `docs/examples/sample-documents/sample.pdf` |
+| `sample.docx` | `application/vnd.openxmlformats-officedocument.wordprocessingml.document` | `docs/examples/sample-documents/sample.docx` |
+| `sample.xlsx` | `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet` | `docs/examples/sample-documents/sample.xlsx` |
+| `sample.pptx` | `application/vnd.openxmlformats-officedocument.presentationml.presentation` | `docs/examples/sample-documents/sample.pptx` |
+| `sample.png` | `image/png` | `docs/examples/sample-documents/sample.png` |
+| `sample.yaml` | `application/yaml` | `docs/examples/sample-documents/sample.yaml` |
+| `sample.toml` | `application/toml` | `docs/examples/sample-documents/sample.toml` |
+| `sample.xml` | `application/xml` | `docs/examples/sample-documents/sample.xml` |
+| `sample.srt` | `application/x-subrip` | `docs/examples/sample-documents/sample.srt` |
+| `sample.vtt` | `text/vtt` | `docs/examples/sample-documents/sample.vtt` |
 
 ### Generate sample PDF (requires `enscript` + `ps2pdf`)
 

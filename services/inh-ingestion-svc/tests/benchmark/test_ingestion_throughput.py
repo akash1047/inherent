@@ -32,6 +32,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.benchmark.benchmark_report import write_benchmark_report
+
 try:  # httpx is in ingestion dev deps; fall back to stdlib if absent.
     import httpx
 
@@ -47,6 +49,9 @@ WORKSPACE_ID = os.environ.get("INTEGRATION_WORKSPACE_ID", "ws_local_001")
 BATCH_SIZE = int(os.environ.get("BENCHMARK_BATCH_SIZE", "5"))
 # Loose SLO: the whole batch must become searchable within this generous budget.
 TIMEOUT = int(os.environ.get("BENCHMARK_TIMEOUT", "300"))
+# Where this benchmark writes its JSON summary (REQ-EVL-3), picked up by CI as
+# an artifact the same way the public-api search benchmarks report theirs.
+BENCHMARK_REPORT = Path(os.environ.get("BENCHMARK_REPORT", "ingestion-benchmark-report.json"))
 
 HEADERS = {"X-API-Key": API_KEY, "X-Workspace-Id": WORKSPACE_ID}
 
@@ -132,5 +137,14 @@ def test_ingestion_batch_time_to_searchable() -> None:
     print(
         f"\ningestion throughput: {BATCH_SIZE} docs searchable in {elapsed:.1f}s "
         f"= {docs_per_sec:.3f} docs/sec"
+    )
+    write_benchmark_report(
+        BENCHMARK_REPORT,
+        "ingestion_throughput",
+        {
+            "batch_size": BATCH_SIZE,
+            "elapsed_s": elapsed,
+            "docs_per_sec": docs_per_sec,
+        },
     )
     assert elapsed < TIMEOUT, f"batch took {elapsed:.1f}s, exceeding loose budget {TIMEOUT}s"

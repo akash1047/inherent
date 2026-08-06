@@ -3,7 +3,8 @@
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import Field
+from inh_contracts.defaults import DEFAULT_S3_REGION
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -15,6 +16,10 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",
+        # Tests construct Settings by field name (e.g. eval_capture_disabled_workspaces=...);
+        # env loading still resolves via aliases. Without this, extra="ignore"
+        # silently drops by-name kwargs for aliased fields instead of erroring.
+        populate_by_name=True,
     )
 
     # Service configuration
@@ -32,9 +37,9 @@ class Settings(BaseSettings):
     mcp_port: int = 8001
     log_level: str = "INFO"
     environment: str = "development"
-    version: str = "0.1.0"
+    version: str = "0.2.0"
 
-    # Database (Read-only access)
+    # Database (reads + document/eval writes; not a read-only role)
     database_url: str = "postgresql://postgres:postgres@localhost:5432/knowledge_base"
 
     # MongoDB (Read-only — for workspace ownership lookups; control-plane truth)
@@ -105,7 +110,22 @@ class Settings(BaseSettings):
     aws_access_key_id: str = Field(default="", description="S3 access key ID")
     aws_secret_access_key: str = Field(default="", description="S3 secret access key")
     aws_s3_bucket: str = Field(default="inherent-documents", description="S3 bucket for documents")
-    aws_s3_region: str = Field(default="eu-central-1", description="S3 region")
+    # Default: see inh_contracts.defaults.DEFAULT_S3_REGION (#132) -- the single
+    # source of truth shared with ingestion-svc's s3_region field.
+    #
+    # Alias: ingestion-svc reads AWS_REGION (#132 blocker 1). Without accepting
+    # it here too, an operator who follows docs/deploy/production.md step 3
+    # ("set AWS_REGION=<your-region>") configures ingestion but leaves this
+    # service on DEFAULT_S3_REGION -- the exact drift #132 exists to prevent,
+    # now reintroduced one layer up (env var NAME instead of default VALUE).
+    # AWS_S3_REGION is tried first so it still overrides a stray AWS_REGION
+    # when an operator deliberately wants this service on a different region.
+    aws_s3_region: str = Field(
+        default=DEFAULT_S3_REGION,
+        validation_alias=AliasChoices("AWS_S3_REGION", "AWS_REGION"),
+        description="S3 region. AWS_S3_REGION wins if set; otherwise falls back "
+        "to AWS_REGION (the var ingestion-svc reads) so one var configures both.",
+    )
 
     # MQ (Redis / Valkey)
     mq_redis_url: str = Field(
@@ -224,6 +244,80 @@ class Settings(BaseSettings):
             "before it may default on. See docs/advanced-indexes.md."
         ),
     )
+
+    # Per-document diversification (#146) — EXPERIMENTAL, OFF BY DEFAULT.
+    #
+    # Unlike the #47 scaffolding above, this method IS implemented (it's a
+    # deterministic round-robin over already-fetched candidates, not a new
+    # model or index); it stays gated behind the same eval-gate policy
+    # (no default-on without a documented eval improvement vs the hybrid
+    # baseline + maintainer approval) because it changes ranking order, which
+    # the compose retrieval-eval gate needs to measure before this can default
+    # on. See docs/advanced-indexes.md and ADR 0004.
+    enable_diversification: bool = Field(
+        default=False,
+        description=(
+            "EXPERIMENTAL (#146), off by default. Opt-in per-document result "
+            "diversification: round-robins candidates across document_id before "
+            "truncating to the page size, so one highly-relevant document can't "
+            "crowd out every other result. Requires a documented eval improvement "
+            "vs the hybrid baseline + maintainer approval before it may default on."
+        ),
+    )
+    diversification_over_fetch_multiplier: int = Field(
+        default=5,
+        ge=1,
+        description=(
+            "When enable_diversification is on, fetch up to "
+            "min(100, limit * this) candidates from Weaviate before "
+            "diversifying and truncating back to limit, so there are enough "
+            "distinct documents in the pool to diversify across. Ignored "
+            "when enable_diversification is off. Must be >= 1 -- a value of "
+            "0 makes min(100, limit * 0) == 0, so the max() against the "
+            "base fetch_limit in _build_graphql never widens it, silently "
+            "defeating diversification's over-fetch even while the flag "
+            "reads as on."
+        ),
+    )
+
+    # Evals v1 — traffic-mined retrieval evals (design spec: evals-v1).
+    # Capture is ON by default (opt-out model): every search is recorded to
+    # eval_query_events by a fire-and-forget background task. Raw events are
+    # purged after eval_retention_days; promoted eval_cases persist.
+    eval_capture_enabled: bool = Field(
+        default=True,
+        alias="EVAL_CAPTURE_ENABLED",
+        description="Record search query events for evals (opt-out).",
+    )
+    eval_retention_days: int = Field(
+        default=30,
+        alias="EVAL_RETENTION_DAYS",
+        description="Days to keep raw eval_query_events rows before purge.",
+    )
+    eval_min_sample_size: int = Field(
+        default=50,
+        alias="EVAL_MIN_SAMPLE_SIZE",
+        description="Labeled-case count under which the scorecard flags low confidence.",
+    )
+    eval_run_concurrency: int = Field(
+        default=4,
+        alias="EVAL_RUN_CONCURRENCY",
+        description="Max concurrent replay searches during an eval run.",
+    )
+    eval_run_k: int = Field(
+        default=5,
+        alias="EVAL_RUN_K",
+        description="Ranking-metric cutoff k for eval runs (recall@k, nDCG@k).",
+    )
+    eval_capture_disabled_workspaces: str = Field(
+        default="",
+        alias="EVAL_CAPTURE_DISABLED_WORKSPACES",
+        description="Comma-separated workspace ids excluded from eval capture.",
+    )
+
+    def eval_capture_optout_set(self) -> set[str]:
+        """Parse the opt-out CSV into a set (whitespace/empty entries dropped)."""
+        return {w.strip() for w in self.eval_capture_disabled_workspaces.split(",") if w.strip()}
 
     # Health Checks
     health_check_timeout_seconds: float = 5.0

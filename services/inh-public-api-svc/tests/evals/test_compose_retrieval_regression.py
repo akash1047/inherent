@@ -1,9 +1,15 @@
-"""Compose-backed retrieval ranking regression (#33/#35).
+"""Compose-backed retrieval ranking regression (#33/#35, hard-gated per #37).
 
 Uploads the golden-corpus fixtures to the live local stack, then runs every
 golden query and scores the ranking against the judged relevances with
-recall@k / MRR / nDCG. Asserts a LOOSE baseline so it guards against gross
-ranking regressions without flaking.
+recall@k / MRR / nDCG. Two gates apply:
+
+1. Relative: no per-mode metric may regress more than ``EVAL_GATE_TOLERANCE``
+   below the committed baseline (``corpus/retrieval_baseline.json``), enforced
+   via ``tests/evals/eval_gate.py``. A green run on `main` ratchets the
+   baseline up (never down) -- see ``.github/workflows/integration.yml``.
+2. Absolute: a LOOSE backstop floor so a fresh checkout with an unset/zeroed
+   baseline still guards against gross regressions.
 
 Marked ``retrieval_eval`` + ``compose`` — deselected by default; run against a
 live stack with: ``make dev`` then ``uv run pytest -m 'retrieval_eval and compose'``.
@@ -19,33 +25,30 @@ from pathlib import Path
 import httpx
 import pytest
 
-from tests.evals.metrics import mrr, ndcg_at_k, recall_at_k
+from src.services.ranking_metrics import mrr, ndcg_at_k, recall_at_k
+from tests.evals.eval_gate import find_regressions, format_regressions, load_metrics
 
 pytestmark = [pytest.mark.retrieval_eval, pytest.mark.compose]
 
-# Where per-mode metrics are written for downstream reporting (#37). CI sets
-# EVAL_REPORT; locally it defaults beside this test so a stray run is obvious.
+# Where per-mode metrics are written for downstream reporting (#37) and for the
+# CI ratchet step to read after this test passes. CI sets EVAL_REPORT; locally
+# it defaults beside this test so a stray run is obvious.
 EVAL_REPORT_PATH = os.environ.get(
     "EVAL_REPORT", str(Path(__file__).resolve().parent / "eval-report.json")
 )
-# Committed governance baseline (reporting only -- the diff is printed, not a
-# new gate). See corpus/retrieval_baseline.json for the documented shape.
+# Committed governance baseline. The gate (below) hard-fails on any per-mode
+# metric that regresses beyond EVAL_GATE_TOLERANCE; a green run on `main`
+# ratchets this file up to the higher of (current, baseline) -- see
+# tests/evals/eval_gate.py and .github/workflows/integration.yml.
 BASELINE_PATH = Path(__file__).resolve().parent / "corpus" / "retrieval_baseline.json"
+EVAL_GATE_TOLERANCE = float(os.environ.get("EVAL_GATE_TOLERANCE", "0.02"))
 
 
-def _load_baseline() -> dict[str, dict[str, float]]:
-    try:
-        raw = json.loads(BASELINE_PATH.read_text())
-    except (OSError, ValueError):
-        return {}
-    # Drop documentation keys (anything starting with "_").
-    return {k: v for k, v in raw.items() if not k.startswith("_") and isinstance(v, dict)}
+def _write_and_summarize(summary: dict[str, dict[str, float]]) -> list:
+    """Persist metrics to EVAL_REPORT, print a baseline diff, return regressions.
 
-
-def _write_and_summarize(summary: dict[str, dict[str, float]]) -> None:
-    """Persist metrics to EVAL_REPORT and print a baseline-vs-current diff.
-
-    Best-effort: never raises, so it cannot break the eval run itself.
+    Writing the report is best-effort (never raises, so it cannot break the
+    eval run itself); computing regressions is not -- the caller asserts on it.
     """
     try:
         Path(EVAL_REPORT_PATH).write_text(json.dumps(summary, indent=2, sort_keys=True))
@@ -53,9 +56,11 @@ def _write_and_summarize(summary: dict[str, dict[str, float]]) -> None:
     except OSError as exc:  # pragma: no cover - reporting is non-fatal
         print(f"[retrieval-eval] could not write report to {EVAL_REPORT_PATH}: {exc}")
 
-    baseline = _load_baseline()
+    baseline = load_metrics(BASELINE_PATH)
     print("[retrieval-eval] summary (current vs baseline):")
-    for mode in sorted(summary):
+    # "_"-prefixed keys (e.g. "_by_category") are supplementary reporting, not
+    # per-mode metrics -- same convention as "_comment" in the baseline file.
+    for mode in sorted(m for m in summary if not m.startswith("_")):
         for metric in sorted(summary[mode]):
             cur = summary[mode][metric]
             base = baseline.get(mode, {}).get(metric)
@@ -65,6 +70,10 @@ def _write_and_summarize(summary: dict[str, dict[str, float]]) -> None:
                 delta = cur - base
                 sign = "+" if delta >= 0 else ""
                 print(f"  {mode}.{metric}: {cur:.3f} (baseline {base:.3f}, {sign}{delta:.3f})")
+
+    regressions = find_regressions(summary, baseline, tolerance=EVAL_GATE_TOLERANCE)
+    print(format_regressions(regressions))
+    return regressions
 
 
 API_URL = os.environ.get("PUBLIC_API_URL", "http://localhost:18000").rstrip("/")
@@ -120,6 +129,7 @@ def test_ranking_regression_against_golden_corpus(client, golden_corpus):
     queries = golden_corpus["queries"]
     relevant = golden_corpus["relevant"]
     relevance = golden_corpus["relevance"]
+    category = golden_corpus["category"]
 
     # 1. Upload every fixture the corpus references (dedup; reuse = reindex).
     fixtures = {j["document_id"] for j in golden_corpus["judgments"]}
@@ -134,26 +144,86 @@ def test_ranking_regression_against_golden_corpus(client, golden_corpus):
             )
         assert up.status_code == 201, f"upload {fn} failed: {up.status_code} {up.text}"
 
-    # 2. Wait until the corpus is searchable (a known query returns results).
-    probe = next(iter(queries.values()))
-    deadline = time.monotonic() + TIMEOUT
-    while time.monotonic() < deadline:
-        if _search(client, probe, "semantic"):
-            break
-        time.sleep(3)
-    else:
-        pytest.fail(f"corpus not searchable within {TIMEOUT}s")
+    # 2. Wait until the corpus is searchable. Checking only ONE probe query
+    # (the historical behavior) is a race: that single probe's own document
+    # can finish its extract->chunk->embed->index pipeline well before the
+    # rest of the corpus does, especially on a slow/CPU-only embedding
+    # runner, so scoring below can start while most documents are still
+    # mid-pipeline -- every query against a not-yet-indexed document then
+    # legitimately scores zero, not because ranking is bad but because
+    # nothing was there yet to rank. This produced a spuriously low
+    # measurement in the past (corpus/retrieval_history.jsonl's first entry,
+    # sha 201363a, pooled recall@5 ~0.21 across every mode -- a uniformity
+    # consistent with only a handful of documents being ready when scoring
+    # started, not a real ranking-quality signal) and was directly observed
+    # for a newly-added query during #146 development (see ADR 0004): the
+    # first eval run after adding two new fixtures scored 0/0/0 on that
+    # query, and an immediate re-run (once processing caught up) scored a
+    # perfect 1.0/1.0/1.0 with no code change in between. Every query must
+    # independently surface its own judged-relevant document (or, for
+    # abstention queries with no relevant document by construction, any
+    # non-empty result) before scoring starts.
+    def _query_ready(query: str, relevant_ids: set[str]) -> bool:
+        ranked = _search(client, query, "semantic", limit=20)
+        if not relevant_ids:
+            return bool(ranked)  # abstention: any result means the index is live
+        # ALL judged-relevant docs, not just one -- a multi-relevant query
+        # (e.g. multi_doc_crowding's q14, judged against two documents) is
+        # otherwise marked ready the moment the first of its relevant docs
+        # indexes, while the second is still mid-pipeline, reintroducing the
+        # exact race this function exists to close (#146 cross-review).
+        return relevant_ids.issubset(set(ranked))
 
-    # 3. Score each query per mode; report and assert a loose baseline.
+    deadline = time.monotonic() + TIMEOUT
+    unready = set(queries)
+    while unready and time.monotonic() < deadline:
+        for qid in list(unready):
+            if _query_ready(queries[qid], relevant.get(qid, set())):
+                unready.discard(qid)
+        if unready:
+            time.sleep(3)
+    if unready:
+        pytest.fail(
+            f"corpus not fully searchable within {TIMEOUT}s -- still not ready: "
+            f"{sorted(unready)}"
+        )
+
+    # 3. Score each query per mode; report and assert a loose baseline. Also
+    # break scores down per query category (#37 corpus expansion) -- reporting
+    # only, not gated, so it can't flake on a single thin category while still
+    # giving visibility into which archetype (exact-id/stale/paraphrase) is
+    # dragging a mode down.
+    #
+    # "abstention" queries are scored (and shown in the by-category breakdown)
+    # but excluded from the pooled recall/MRR/nDCG averages below: they have no
+    # relevant document by construction, so recall_at_k/mrr/ndcg_at_k always
+    # return 0.0 for them regardless of ranking quality. Pooling that
+    # structural zero into an average meant to track "is retrieval good" would
+    # just dilute the signal on every mode equally, not catch a regression.
     summary: dict[str, dict[str, float]] = {}
+    by_category: dict[str, dict[str, dict[str, list[float]]]] = {}
     for mode in ("semantic", "hybrid", "keyword"):
         recalls, mrrs, ndcgs = [], [], []
         for qid, query in queries.items():
             ranked = _search(client, query, mode, limit=5)
-            recalls.append(recall_at_k(ranked, relevant[qid], k=5))
-            mrrs.append(mrr(ranked, relevant[qid]))
-            ndcgs.append(ndcg_at_k(ranked, relevance[qid], k=5))
-        n = len(queries)
+            relevant_ids = relevant.get(qid, set())
+            r, m, n_ = (
+                recall_at_k(ranked, relevant_ids, k=5),
+                mrr(ranked, relevant_ids),
+                ndcg_at_k(ranked, relevance[qid], k=5),
+            )
+            cat_bucket = by_category.setdefault(mode, {}).setdefault(
+                category.get(qid, "general"), {"recall@5": [], "mrr": [], "ndcg@5": []}
+            )
+            cat_bucket["recall@5"].append(r)
+            cat_bucket["mrr"].append(m)
+            cat_bucket["ndcg@5"].append(n_)
+            if category.get(qid) == "abstention":
+                continue
+            recalls.append(r)
+            mrrs.append(m)
+            ndcgs.append(n_)
+        n = len(recalls)
         summary[mode] = {
             "recall@5": sum(recalls) / n,
             "mrr": sum(mrrs) / n,
@@ -161,12 +231,27 @@ def test_ranking_regression_against_golden_corpus(client, golden_corpus):
         }
         print(f"[retrieval-eval] {mode}: {summary[mode]}")
 
-    # Reporting/governance (#37): persist metrics + print a baseline diff. This
-    # is best-effort and does NOT introduce a new gate -- the only hard check is
-    # the loose recall assertion below.
-    _write_and_summarize(summary)
+    category_summary = {
+        mode: {
+            cat: {metric: sum(values) / len(values) for metric, values in metrics.items()}
+            for cat, metrics in cats.items()
+        }
+        for mode, cats in by_category.items()
+    }
+    print(f"[retrieval-eval] by category: {json.dumps(category_summary, indent=2)}")
 
-    # The best mode must clear the loose recall baseline.
+    # Persist metrics + print a baseline diff, then hard-gate on regressions
+    # (#37 -> hard gate): any per-mode metric that drops more than
+    # EVAL_GATE_TOLERANCE below the committed baseline fails the build. A green
+    # run on `main` ratchets the baseline up; it never moves down. The
+    # "_by_category" key is prefixed so eval_gate.py's loader drops it (same
+    # convention as "_comment" in retrieval_baseline.json) -- reporting only,
+    # never part of the enforced gate.
+    regressions = _write_and_summarize({**summary, "_by_category": category_summary})
+    assert not regressions, format_regressions(regressions)
+
+    # Absolute floor as a backstop under the relative gate above -- catches a
+    # collapse even on the first run, before any baseline has been set.
     best_recall = max(s["recall@5"] for s in summary.values())
     assert (
         best_recall >= MIN_MEAN_RECALL_AT_5

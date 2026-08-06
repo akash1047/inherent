@@ -1,0 +1,9 @@
+Inherent Knowledge Base — Release Notes (v1, superseded)
+
+This document describes chunking behavior in an earlier release and is kept
+only as a superseded reference; see release-notes-v2.txt for current behavior.
+
+Chunking: documents are split into chunks of 256 tokens with no overlap
+between consecutive chunks.
+
+Embeddings: generated per chunk using the configured embedding model.

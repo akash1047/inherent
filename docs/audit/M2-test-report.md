@@ -1,3 +1,8 @@
+---
+search:
+  exclude: true
+---
+
 # Defect-Register Remediation — M2 Test Report (P2 fixes)
 
 **Branch:** `fix/defect-register-remediation`

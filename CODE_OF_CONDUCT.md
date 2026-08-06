@@ -24,4 +24,4 @@ Project maintainers may remove comments, issues, pull requests, or contributions
 
 ## Reporting
 
-For conduct concerns, contact the maintainers through the channel listed in [SUPPORT.md](SUPPORT.md). For security issues, use [SECURITY.md](SECURITY.md) instead of public discussion.
+For conduct concerns, contact the maintainers through the channel listed in [SUPPORT.md](https://github.com/inherent-prime/inherent/blob/main/SUPPORT.md). For security issues, use [SECURITY.md](https://github.com/inherent-prime/inherent/blob/main/SECURITY.md) instead of public discussion.

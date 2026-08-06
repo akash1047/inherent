@@ -16,6 +16,7 @@ from httpx import ASGITransport, AsyncClient
 
 from src.main import create_app
 from src.models.api_key import APIKeyInfo
+from src.services import document_intake
 from src.services.auth import (
     ResolvedAuth,
     get_api_key_info,
@@ -44,6 +45,12 @@ CANONICAL_V1_KEYS = {
     "storage_url",
     "timestamp",
     "contract_version",
+    # Ingestion source labeling (inherent-systems/prime#187, consumer side:
+    # inherent-prime/inherent#141). connection_id/sync_id are NOT here: this
+    # producer only ever sends "source": "public-api" (see document_intake.py)
+    # and never sets connection_id/sync_id — those are connector-sourced-only
+    # fields this service has no reason to populate.
+    "source",
 }
 
 
@@ -108,9 +115,10 @@ async def _publish_upload_event(write_key, mock_db, mock_storage, mock_mq) -> di
     application.dependency_overrides[get_database] = lambda: mock_db
 
     with (
-        patch("src.api.v1.documents.get_storage_service", return_value=mock_storage),
-        patch(
-            "src.api.v1.documents.get_mq_service",
+        patch.object(document_intake, "get_storage_service", return_value=mock_storage),
+        patch.object(
+            document_intake,
+            "get_mq_service",
             new_callable=AsyncMock,
             return_value=mock_mq,
         ),
@@ -146,3 +154,13 @@ async def test_event_carries_contract_version(write_key, mock_db, mock_storage, 
 async def test_event_type_is_document_uploaded(write_key, mock_db, mock_storage, mock_mq):
     event = await _publish_upload_event(write_key, mock_db, mock_storage, mock_mq)
     assert event["event_type"] == "document.uploaded"
+
+
+async def test_event_source_is_public_api(write_key, mock_db, mock_storage, mock_mq):
+    """inherent-prime/inherent#141 pattern-sweep finding: this REST route (and
+    the MCP upload_document tool, which shares intake_document) is the only
+    in-repo publisher of document.uploaded — without "source": "public-api"
+    every upload memos as "unknown" on the ingestion-svc side, indistinguishable
+    from a message produced before the field existed."""
+    event = await _publish_upload_event(write_key, mock_db, mock_storage, mock_mq)
+    assert event["source"] == "public-api"

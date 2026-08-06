@@ -138,5 +138,12 @@ jobs:
             ${{ steps.meta.outputs.tags }}
             ${{ steps.latest.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # `labels` only bakes into each per-arch image config. For a
+          # multi-platform push, GHCR's package page reads the OCI
+          # *annotations* on the manifest index instead — without this the
+          # index carries no description/source/revision and the package page
+          # shows "No description provided" even though metadata-action
+          # generated the values (#112).
+          annotations: ${{ steps.meta.outputs.annotations }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

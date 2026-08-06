@@ -67,11 +67,32 @@ def create_app() -> FastAPI:
     # Register exception handlers for RFC 7807 responses
     setup_exception_handlers(app)
 
-    # Middleware stack (order matters - first added = outermost)
+    # Middleware stack. Starlette's add_middleware PREPENDS to the stack and
+    # builds it with reversed() (see BaseHTTPMiddleware / build_middleware_stack) --
+    # so the LAST middleware added is the OUTERMOST one and runs first on the
+    # request. Registration order below is therefore the reverse of the desired
+    # request flow (#149 follow-up: a same-order-as-here-but-not-reversed stack
+    # previously ran RateLimit/Audit before Auth ever set request.state, so every
+    # request looked unauthenticated to both).
     # Request flow: CORS -> Security -> Context -> Auth -> Audit -> Rate Limit -> Handler
     # Response flow: Handler -> Rate Limit -> Audit -> Auth -> Context -> Security -> CORS
 
-    # 1. CORS (outermost)
+    # 6. Rate limiting (added first = innermost; reads api_key_info from state)
+    app.add_middleware(RateLimitingMiddleware)
+
+    # 5. Audit logging (logs after response, reads api_key_info from state)
+    app.add_middleware(AuditLoggingMiddleware)
+
+    # 4. Authentication (populates request.state.api_key_info for downstream middleware)
+    app.add_middleware(AuthenticationMiddleware)
+
+    # 3. Request context (correlation IDs, timing)
+    app.add_middleware(RequestContextMiddleware)
+
+    # 2. Security headers
+    app.add_middleware(SecurityHeadersMiddleware)
+
+    # 1. CORS (added last = outermost)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_origins_list,
@@ -79,21 +100,6 @@ def create_app() -> FastAPI:
         allow_methods=settings.cors_allow_methods,
         allow_headers=settings.cors_allow_headers,
     )
-
-    # 2. Security headers
-    app.add_middleware(SecurityHeadersMiddleware)
-
-    # 3. Request context (correlation IDs, timing)
-    app.add_middleware(RequestContextMiddleware)
-
-    # 4. Authentication (populates request.state.api_key_info for downstream middleware)
-    app.add_middleware(AuthenticationMiddleware)
-
-    # 5. Audit logging (logs after response, reads api_key_info from state)
-    app.add_middleware(AuditLoggingMiddleware)
-
-    # 6. Rate limiting (reads api_key_info from state)
-    app.add_middleware(RateLimitingMiddleware)
 
     # Metrics endpoint
     if settings.metrics_enabled:

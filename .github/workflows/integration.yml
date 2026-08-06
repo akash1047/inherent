@@ -1,22 +1,70 @@
-name: Integration
+name: Integration & Eval-Gate Ratchet
 
-# Compose-backed ingestion-to-search integration test (#15).
-# This is a slow job (it builds and boots the full local stack incl. the
-# embedding service), so it does NOT run on every PR and does NOT gate merge.
-# It runs on pushes to main, nightly, and on demand.
+# This workflow runs three jobs, and only the first is a "test" in the usual
+# sense -- the other two mutate repo state as a side effect (#156):
+#   1. compose-integration   - Compose-backed ingestion-to-search integration
+#                               test (#15): boots the full local stack incl.
+#                               the embedding service, runs the retrieval-eval
+#                               hard gate, and uploads latency/throughput and
+#                               ingestion benchmark reports.
+#   2. eval-baseline-ratchet - MUTATES THE REPO: opens/updates a PR against
+#                               main that ratchets the retrieval-eval baseline
+#                               forward, and enables auto-merge on it (#146).
+#   3. eval-regression-alert - files or updates a GitHub issue when the
+#                               retrieval-eval gate regresses.
+# Job 1 is slow (it builds and boots the full local stack), so this workflow
+# does NOT run on every PR and does NOT gate merge. It runs on pushes to
+# main, nightly, and on demand.
 on:
   push:
     branches:
       - main
+    # The ratchet job below (see "Ratchet baseline + append history + open
+    # PR") only ever touches these three files, then auto-merges its own PR --
+    # a push to main. Without this exclusion, that merge re-triggers this
+    # workflow, which appends a new history line (new timestamp, so the
+    # commit is never a no-op) and opens+auto-merges another PR, forever:
+    # an unbounded main<->ratchet loop, each cycle up to the 40-minute
+    # Compose job below (#146 cross-review finding).
+    #
+    # README.md is on this list because the ratchet job also regenerates the
+    # published baseline table in it (#158). Excluding it costs nothing else:
+    # a README-only edit has no bearing on a Compose e2e run, and a README
+    # edit bundled with a service change still triggers the workflow (paths-
+    # ignore skips a run only when EVERY changed file matches).
+    paths-ignore:
+      - "services/inh-public-api-svc/tests/evals/corpus/retrieval_baseline.json"
+      - "services/inh-public-api-svc/tests/evals/corpus/retrieval_history.jsonl"
+      - "README.md"
   schedule:
     - cron: "0 4 * * *"
   workflow_dispatch:
+
+# Least-privilege default; the two governance jobs below each grant themselves
+# only the extra scope they need (contents: write to ratchet the baseline,
+# issues: write to file/update a regression alert).
+permissions:
+  contents: read
+
+# Serialize runs that share a ref so the baseline-ratchet push (below) can never
+# race a concurrent run on the same branch -- a nightly cron and a push-to-main
+# both target refs/heads/main and must not clobber each other's ratchet/history.
+# cancel-in-progress is false: every main run must complete and record its
+# scores, so no ratchet is silently dropped.
+concurrency:
+  group: integration-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   compose-integration:
     name: Compose ingestion-to-search
     runs-on: ubuntu-latest
     timeout-minutes: 40
+    # Expose whether the retrieval-eval hard gate specifically failed, so the
+    # alert job can fire on a *retrieval* regression only -- not on any unrelated
+    # compose failure (ingestion benchmark, latency SLO, ...).
+    outputs:
+      retrieval_failed: ${{ steps.retrieval_eval_gate.outcome == 'failure' }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -30,6 +78,12 @@ jobs:
         run: cp .env.example .env
 
       - name: Start the Compose stack
+        # The compose suite (throughput benchmark especially) issues far more
+        # than the default 100 req/min per key, so run the stack unthrottled;
+        # rate-limit enforcement is covered by the offline suites. Compose reads
+        # RATE_LIMIT_ENABLED from the shell env for its ${VAR:-true} default.
+        env:
+          RATE_LIMIT_ENABLED: "false"
         run: docker compose up -d --build --wait
 
       - name: Wait for the public API to be healthy
@@ -45,7 +99,19 @@ jobs:
       - name: Bootstrap dev workspace and API key
         run: make bootstrap
 
-      - name: Run public-api compose tests (integration + retrieval evals + benchmarks)
+      - name: Install public-api deps
+        working-directory: services/inh-public-api-svc
+        run: uv sync --frozen --extra dev --group dev
+
+      # The retrieval-eval hard gate runs as its own step so its pass/fail is
+      # distinguishable from every other compose test. continue-on-error lets a
+      # regression record its outcome (consumed by the job output + the
+      # "Enforce" step below and the alert job) without aborting the run before
+      # the report artifact is uploaded. The build still goes red -- see
+      # "Enforce retrieval-eval hard gate".
+      - name: Run retrieval-eval hard gate
+        id: retrieval_eval_gate
+        continue-on-error: true
         working-directory: services/inh-public-api-svc
         env:
           # Retrieval eval (#37) writes per-mode metrics here so we can publish
@@ -56,9 +122,25 @@ jobs:
           # take well over the 180s default to reach 'processed'. Give the
           # status/search polls a generous budget (job timeout-minutes caps it).
           INTEGRATION_TIMEOUT: "600"
-        run: |
-          uv sync --frozen --extra dev --group dev
-          uv run pytest -m compose
+        run: uv run pytest -m 'retrieval_eval and compose'
+
+      - name: Run remaining public-api compose tests (integration + benchmarks)
+        working-directory: services/inh-public-api-svc
+        env:
+          INTEGRATION_TIMEOUT: "600"
+        run: uv run pytest -m 'compose and not retrieval_eval'
+
+      # Search latency/throughput benchmark summary (REQ-EVL-3, #36): p50/p95/
+      # p99/QPS + git sha, written by test_search_latency_throughput.py's live
+      # tests (tests/benchmark/run_search_benchmark.py::write_benchmark_report)
+      # relative to the step's working-directory above.
+      - name: Upload search benchmark report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: search-benchmark-report
+          path: services/inh-public-api-svc/search-benchmark-report.json
+          if-no-files-found: ignore
 
       - name: Upload retrieval eval report
         if: always()
@@ -88,14 +170,307 @@ jobs:
           # Slow CPU-embedding runner + queued backlog (see above): give the
           # batch time-to-searchable benchmark a generous budget.
           BENCHMARK_TIMEOUT: "600"
+          # tests/temporal/test_reindex_collision_compose.py's _wait_processed
+          # reads INTEGRATION_TIMEOUT (default 180s). This step runs LAST,
+          # after every public-api upload above has already queued behind
+          # the same CPU embedder BENCHMARK_TIMEOUT is raised for -- so its
+          # documents can plausibly take longer than the 180s default to
+          # reach 'processed' too. Match BENCHMARK_TIMEOUT so the compose
+          # collision test fails on the behavior it pins, not on a timeout
+          # budget sized for a quiet stack (#110 follow-up review item 6).
+          INTEGRATION_TIMEOUT: "600"
         run: |
           uv sync --frozen --extra dev --group dev
           uv run pytest -m compose
 
+      # Ingestion throughput benchmark summary (REQ-EVL-3, #36): docs/sec +
+      # git sha, written by test_ingestion_throughput.py via
+      # tests/benchmark/benchmark_report.py::write_benchmark_report.
+      - name: Upload ingestion benchmark report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ingestion-benchmark-report
+          path: services/inh-ingestion-svc/ingestion-benchmark-report.json
+          if-no-files-found: ignore
+
+      # Re-raise the retrieval-eval gate's outcome now that its report has been
+      # uploaded: a regression must still turn the whole job (and main) red. The
+      # step above ran continue-on-error only to capture the outcome cleanly.
+      - name: Enforce retrieval-eval hard gate
+        if: steps.retrieval_eval_gate.outcome == 'failure'
+        run: |
+          echo "::error::retrieval-eval hard gate failed -- a per-mode metric regressed beyond tolerance vs the committed baseline. See the 'Run retrieval-eval hard gate' step and the retrieval-eval-report artifact."
+          exit 1
+
+      - name: Dump document state on failure
+        if: failure()
+        # The compose tests fail as "document <id> not processed within Ns"
+        # without saying whether the doc errored, dead-lettered, or was just
+        # slow behind the worker backlog. Dump the full document + dead-letter
+        # tables so the fate of every doc is visible. Defensive (|| true) so a
+        # diagnostic hiccup never masks the real test failure.
+        run: |
+          echo "### processed_documents"
+          docker compose exec -T postgres psql -U postgres -d knowledge_base -P pager=off \
+            -c "SELECT document_id, status, error_message, chunk_count, created_at, processed_at FROM processed_documents ORDER BY created_at;" || true
+          echo "### dead_letter_jobs"
+          docker compose exec -T postgres psql -U postgres -d knowledge_base -P pager=off \
+            -c "SELECT job_id, status, error, created_at FROM dead_letter_jobs ORDER BY created_at;" || true
+
       - name: Dump Compose logs on failure
         if: failure()
-        run: docker compose logs --no-color --tail=200
+        # Full ingestion log (not tail-limited): the doc lifecycle — including
+        # any Temporal activity failure or dead-letter — is logged here, and a
+        # stuck doc's lines are near the START of a 10-minute run, beyond any
+        # short tail. Other services stay tail-limited to keep output readable.
+        run: |
+          echo "### ingestion (full)"; docker compose logs --no-color inh-ingestion-svc || true
+          echo "### other services (tail)"; docker compose logs --no-color --tail=200 || true
 
       - name: Tear down
         if: always()
         run: docker compose down -v
+
+  # Retrieval-eval hard gate lives inside the pytest assertion itself
+  # (tests/evals/test_compose_retrieval_regression.py), so a regression already
+  # fails `compose-integration` above. This job only runs after a GREEN gate on
+  # `main` and ratchets the committed baseline up to the just-measured numbers
+  # (never down -- see tests/evals/eval_gate.py) plus appends a trend-history
+  # line, so "beats baseline" has both an enforced floor and a visible score
+  # over time (#37 -> hard gate + history).
+  #
+  # This job opens a PR rather than pushing straight to main. A direct-push
+  # design was tried first and always failed: branch protection on `main`
+  # rejects `github-actions[bot]` pushes ("Required tests before merge"), so
+  # every ratchet attempt hit "remote rejected" and the baseline silently
+  # stayed at its seeded zeros for as long as the direct-push version was
+  # live -- the exact "gate never actually rises" failure this job exists to
+  # prevent. A PR runs through the same required check (ci.yml, which also
+  # triggers on pull_request) and can be auto-merged once it's green.
+  #
+  # Getting a PR from this job to actually trigger ci.yml needs more than
+  # dropping `[skip ci]`: the default `GITHUB_TOKEN` is explicitly excluded
+  # from firing other workflow runs on the push/PR it creates (loop
+  # prevention), so a PR pushed and opened with `github.token` alone sits
+  # forever with no check to satisfy. `RATCHET_PR_TOKEN` (a PAT or GitHub App
+  # installation token with `contents:write`+`pull-requests:write`, added as a
+  # repo secret) lets ci.yml fire normally; without that secret configured
+  # this still degrades gracefully to a normal maintainer-merged PR -- the
+  # ratchet computation and PR still happen, they just need a manual re-run
+  # or merge to close the loop.
+  eval-baseline-ratchet:
+    name: Ratchet retrieval-eval baseline
+    needs: compose-integration
+    # Guard to the upstream repo only: on a fork this job would otherwise open
+    # a ratchet PR against the fork's main on every sync, creating a
+    # fork-vs-upstream divergence loop.
+    if: github.repository == 'inherent-prime/inherent' && github.ref == 'refs/heads/main' && success()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    # Serialize overlapping runs (a nightly firing alongside a push-triggered
+    # run) against the single shared ratchet branch instead of racing a
+    # force-push/PR-create against each other.
+    concurrency:
+      group: eval-baseline-ratchet
+      cancel-in-progress: false
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          # Falls back to the default token if the repo secret isn't set --
+          # see the "getting a PR to trigger ci.yml" note above.
+          token: ${{ secrets.RATCHET_PR_TOKEN || github.token }}
+
+      - name: Download retrieval eval report
+        uses: actions/download-artifact@v4
+        with:
+          name: retrieval-eval-report
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      # Ratchet + append-history on a dedicated branch, then push and open (or
+      # update) a PR against main instead of pushing to main directly. The
+      # branch is reused across runs rather than one-per-run, so an unmerged
+      # ratchet PR just gets updated in place instead of piling up duplicate
+      # PRs. If that PR is still open, its baseline/history are pulled
+      # forward before recomputing (instead of resetting to main's stale
+      # copy), so a not-yet-merged rise is never lost -- ratchet is
+      # max()-based and history is append-only across whichever of
+      # main/open-branch is currently ahead. No `[skip ci]` on the commit:
+      # the PR must trigger ci.yml so the required status check has
+      # something to pass before merge (see RATCHET_PR_TOKEN note above).
+      - name: Ratchet baseline + append history + open PR
+        env:
+          GH_TOKEN: ${{ secrets.RATCHET_PR_TOKEN || github.token }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          api=services/inh-public-api-svc
+          baseline="$api/tests/evals/corpus/retrieval_baseline.json"
+          history="$api/tests/evals/corpus/retrieval_history.jsonl"
+          report="$GITHUB_WORKSPACE/eval-report.json"
+          branch="chore/ratchet-retrieval-baseline"
+
+          git fetch origin main
+
+          # An *open* PR only -- `gh pr view`/`gh pr list` without --state
+          # open also match a PR that already merged (the branch survives a
+          # squash-merge unless auto-delete is on), which would silently skip
+          # `gh pr create` on every run after the first merge and strand
+          # future ratchets with no open PR to land through.
+          pr_number=$(gh pr list --head "$branch" --base main --state open \
+            --json number -q '.[0].number // empty')
+
+          branch_exists_remote=false
+          if git fetch origin "$branch"; then
+            branch_exists_remote=true
+          elif [ -n "$pr_number" ]; then
+            # An open PR means the branch DOES exist remotely -- a failed
+            # fetch here is transient (network blip), not "branch doesn't
+            # exist yet". Silently falling through (as a bare `2>/dev/null
+            # || true` would) leaves branch_exists_remote=false, so the
+            # pull-forward block below gets skipped -- the job would then
+            # rebuild from main's older copy, ratchet against it, and
+            # `git push --force-with-lease` with NO local remote-tracking
+            # ref for $branch at all. Verified empirically:
+            # --force-with-lease with no local ref for the target simply
+            # force-pushes (no error), so this would silently clobber the
+            # open PR's higher not-yet-merged baseline/history with a lower
+            # one and no signal that anything went wrong. Hard-fail instead
+            # and let the next scheduled/triggered run retry cleanly.
+            echo "::error::git fetch of $branch failed while PR #$pr_number is open -- refusing to rebuild from main only, which could silently overwrite a higher not-yet-merged baseline. Retrying on the next run."
+            exit 1
+          fi
+
+          git checkout -B "$branch" origin/main
+
+          if [ -n "$pr_number" ] && [ "$branch_exists_remote" = true ]; then
+            # Pull forward the still-open PR's own baseline/history instead
+            # of resetting to main's (necessarily older) copy, so its
+            # not-yet-merged progress isn't discarded by this run. Checked
+            # with `git cat-file -e` FIRST rather than piping `git show`
+            # straight into `> "$file"`: a shell redirect truncates its
+            # target before the command on its right even runs, so a bare
+            # `git show ... > "$file" || true` empties the file on ANY
+            # failure (a renamed path, a corrupt ref, an edited branch) --
+            # load_metrics() then treats that empty file as `{}`, and
+            # ratchet_baseline(current, {}) silently resets the baseline to
+            # just this run's numbers instead of the true accumulated floor.
+            # Only overwrite the checked-out (main) copy when the blob is
+            # confirmed to exist, so a lookup failure leaves it untouched.
+            if git cat-file -e "origin/$branch:$baseline" 2>/dev/null; then
+              git show "origin/$branch:$baseline" > "$baseline"
+            fi
+            if git cat-file -e "origin/$branch:$history" 2>/dev/null; then
+              git show "origin/$branch:$history" > "$history"
+            fi
+          fi
+
+          uv run --no-project python "$api/tests/evals/eval_gate.py" ratchet \
+            --report "$report" \
+            --baseline "$baseline" \
+            --out "$baseline"
+          jq -c --arg sha "$GITHUB_SHA" --arg date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{sha: $sha, date: $date, metrics: .}' "$report" >> "$history"
+
+          # Republish the baseline table in README.md from the just-ratcheted
+          # baseline (#158), so the advertised numbers can never drift from the
+          # enforced floor. Rendering is a pure function of $baseline, so this
+          # is a no-op whenever the ratchet didn't move a metric -- README.md
+          # then stays out of the commit below via `git diff --cached --quiet`,
+          # and README-only churn never reaches main. Not `|| true`: a failure
+          # here (missing markers, unreadable README) means the published
+          # numbers would silently freeze while CI stayed green, which is the
+          # same class of inert-gate bug this job exists to prevent.
+          #
+          # Run as `python -m` from inside $api, not as a bare script path from
+          # the repo root: the renderer imports load_metrics from eval_gate (to
+          # avoid a second copy of the doc-key-dropping parse), and only `-m`
+          # with $api as cwd puts the `tests` package on sys.path under
+          # `--no-project`. A bare `python $api/tests/evals/render_baseline_table.py`
+          # sets sys.path[0] to the script's own directory and dies on
+          # ModuleNotFoundError: No module named 'tests'.
+          ( cd "$api" && uv run --no-project python -m tests.evals.render_baseline_table \
+              --baseline tests/evals/corpus/retrieval_baseline.json \
+              --readme "$GITHUB_WORKSPACE/README.md" )
+
+          git add "$baseline" "$history" README.md
+          if git diff --cached --quiet; then
+            echo "no baseline/history change"; exit 0
+          fi
+          git commit -m "chore(evals): ratchet retrieval baseline"
+
+          # --force-with-lease compares against the remote-tracking ref we
+          # just fetched above -- without that fetch there's no ref to lease
+          # against and the push is rejected as "stale info" on any run after
+          # the first (the branch already exists remotely by then).
+          git push --force-with-lease origin "$branch"
+
+          if [ -z "$pr_number" ]; then
+            gh pr create --base main --head "$branch" \
+              --title "chore(evals): ratchet retrieval baseline" \
+              --body "Automated ratchet: baseline never decreases (max(current, baseline) per mode/metric), measured on \`$GITHUB_SHA\`. Opened as a PR because branch protection blocks direct github-actions[bot] pushes to main -- merge (or enable repo auto-merge) once the required check passes."
+            pr_number=$(gh pr list --head "$branch" --base main --state open \
+              --json number -q '.[0].number // empty')
+          else
+            echo "ratchet PR #$pr_number already open for $branch; pushed updated commit"
+          fi
+
+          if [ -n "$pr_number" ]; then
+            gh pr merge "$pr_number" --auto --squash || echo "::warning::could not enable auto-merge for PR #$pr_number -- merge it manually, or enable 'Allow auto-merge' on the repo so future ratchets need no action"
+          else
+            echo "::warning::ratchet PR was not found after create -- check for a race or gh API failure"
+          fi
+
+  # Post-merge regression only (per policy: this does not gate PRs, since the
+  # full stack is too slow/expensive to run on every PR). When the gate above
+  # fails on `main` or nightly, file (or update) a tracking issue instead of
+  # letting a regression sit silently until someone notices the red run.
+  eval-regression-alert:
+    name: File/update retrieval-eval regression issue
+    needs: compose-integration
+    # Fire only when the retrieval-eval gate specifically regressed -- not on any
+    # other compose failure (ingestion benchmark, latency SLO, flaky boot), which
+    # would file a mislabeled "retrieval-eval regression" issue and bury real
+    # ones. Keyed off the dedicated job output, not the coarse job result.
+    if: always() && needs.compose-integration.outputs.retrieval_failed == 'true'
+    runs-on: ubuntu-latest
+    # actions/checkout needs contents:read; a job-level `permissions` block
+    # REPLACES the workflow default, so issues:write alone would drop read and
+    # break checkout on a private repo.
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Open or update the regression issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          RUN_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          gh label create retrieval-eval-regression \
+            --repo "$GITHUB_REPOSITORY" \
+            --color FF0000 \
+            --description "Retrieval-eval CI gate regression (auto-filed)" 2>/dev/null || true
+          existing=$(gh issue list --repo "$GITHUB_REPOSITORY" \
+            --label retrieval-eval-regression --state open \
+            --json number --jq '.[0].number')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" \
+              --body "Regression detected again on \`$GITHUB_REF_NAME\`: $RUN_URL"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" \
+              --title "Retrieval-eval regression detected on $GITHUB_REF_NAME" \
+              --label retrieval-eval-regression \
+              --body "The compose retrieval-eval gate (tests/evals/test_compose_retrieval_regression.py) failed: $RUN_URL. See the run's step summary or the retrieval-eval-report artifact for which mode/metric regressed vs the committed baseline (services/inh-public-api-svc/tests/evals/corpus/retrieval_baseline.json)."
+          fi

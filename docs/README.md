@@ -9,7 +9,16 @@ then open the smallest relevant document.
 | If you need to... | Open this |
 | --- | --- |
 | Start the system locally and run the first upload/search flow | [getting-started/local.md](getting-started/local.md) |
+| Provision a throwaway Hetzner VM from a laptop (Object Storage state) | [getting-started/local-vm-test.md](getting-started/local-vm-test.md) |
+| Provision a Hetzner VM with Terraform (production path) | [getting-started/production.md](getting-started/production.md) |
+| Harden the demo stack before exposing it to real users/data | [deploy/production.md](deploy/production.md) |
+| Separate content by clearance, tenant, or need-to-know | [access-control.md](access-control.md) |
+| Replace a document that changed, or run a clean retrieval eval | [keeping-content-current.md](keeping-content-current.md) |
 | Copy request examples for every public endpoint | [examples/README.md](examples/README.md) |
+| Look up every REST endpoint, permission, and shape | [reference/rest-api.md](reference/rest-api.md) |
+| Look up every MCP tool, schema, and REST twin | [reference/mcp-tools.md](reference/mcp-tools.md) |
+| Look up operator env vars and defaults | [reference/configuration.md](reference/configuration.md) |
+| See what changed in each release | [release-notes.md](release-notes.md) (renders the root CHANGELOG) |
 | Use sample files for upload testing | [examples/sample-documents/](examples/sample-documents/) |
 | Check what belongs in the OSS repository | [maintainers/repository-boundaries.md](maintainers/repository-boundaries.md) |
 | Prepare or review a release | [maintainers/releasing.md](maintainers/releasing.md) |
@@ -34,8 +43,21 @@ For most coding or documentation tasks, read in this order:
 ```text
 docs/
   README.md                    agent-first discovery hub
+  index.md                     docs-site landing page (published)
+  access-control.md            workspace security boundary and per-tier pattern
+  keeping-content-current.md   reindex vs. new document, refresh, eval hygiene
+  reference/
+    rest-api.md                REST endpoint reference
+    mcp-tools.md               MCP tool reference
+    configuration.md           operator env-var reference
+  release-notes.md             site page rendering the root CHANGELOG.md
+  community/                   site pages rendering root CONTRIBUTING/CoC/SECURITY/SUPPORT
   getting-started/
     local.md                   local start, upload, ingest, and search guide
+    local-vm-test.md           laptop Hetzner VM test (Object Storage TF state)
+    production.md              Hetzner Terraform deploy (VM + compose release stack)
+  deploy/
+    production.md              hardening checklist for the demo stack
   examples/
     README.md                  endpoint-by-endpoint curl examples
     sample-documents/          files used by local upload examples
@@ -45,6 +67,8 @@ docs/
     releasing.md               release checklist
     repository-boundaries.md   OSS scope guardrails
 ```
+
+The `mkdocs.yml` at the repo root publishes this tree to GitHub Pages; `mkdocs build --strict` must stay green (CI: `.github/workflows/docs.yml`).
 
 ## Documentation Rules
 

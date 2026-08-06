@@ -1,19 +1,22 @@
 """MCP Server implementation for AI agent integration.
 
+Tool registry (#100)
+--------------------
+Every tool is declared exactly once, in the ``_TOOLS`` registry at the bottom
+of this module: name -> ToolDef(description, input_schema, permission,
+handler). ``list_tools`` and the ``call_tool`` dispatcher both iterate the
+registry, so a tool cannot be advertised without being callable, callable
+without being advertised, or dispatched without a permission — the four
+previously disjoint registration points (permission map, Tool() entry,
+dispatch elif, schema) cannot drift.
+
 Permission parity (#14)
 -----------------------
 Every tool validates the supplied API key and then checks that the key carries
 the permission the equivalent REST route requires (see ``src/services/auth.py``
 and the per-route dependencies). A key missing the required permission gets a
 clear ``Error: ...`` response and the tool body NEVER runs — exactly like the
-REST 403 path. Permission map:
-
-    search_documents / search_memory   -> "search"
-    get_document_context / list_documents -> "read"
-    get_citations                       -> "search"
-    verify_claim                        -> "read"
-    explain_lineage                     -> "read"
-    refresh_stale_source                -> "write"
+REST 403 path. Each tool's permission lives on its ``_TOOLS`` entry.
 
 Search-feature parity (#14)
 ---------------------------
@@ -27,17 +30,53 @@ Output convention (#40)
 Tools return ``list[TextContent]`` (existing convention). For the memory
 primitives the text payload embeds a JSON ``structured`` block so agents can
 parse the result deterministically while humans still get a readable summary.
+
+Workspace scoping parity (#138)
+--------------------------------
+Every tool that needs "which workspaces can this key touch" calls
+``src.services.auth.get_authorized_workspace_ids`` — the SAME rule REST's
+``_resolve_workspace`` enforces: a workspace-scoped key (``APIKeyInfo.
+workspace_id`` set) is bound to exactly that one workspace, never the
+owning user's full workspace set. Do NOT call
+``database.get_user_workspace_ids`` directly from a tool handler — that was
+the #138 defect (a scoped key could reach any workspace its owner owned via
+MCP, while REST correctly rejected the identical request with 403).
+
+Upload parity (#87 Task 3)
+---------------------------
+``upload_document`` is the MCP counterpart of POST /v1/documents, but TEXT
+content only: the tool accepts ``content`` as a UTF-8 string (not raw bytes),
+so ``content_type`` must be one of the supported text types
+(``text/plain``, ``text/markdown`` [default], ``text/csv``, ``text/html``).
+Binary uploads (PDF, DOCX, PNG, ...) remain REST-only by design — the tool
+rejects an unsupported ``content_type`` with a message pointing the caller at
+POST /v1/documents. Both surfaces share the exact same
+validate/dedup/store/enqueue pipeline via ``src.services.document_intake``.
 """
 
 import json
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 
+from inh_contracts.file_types import (
+    explicitly_unsupported_message_for_extension,
+    explicitly_unsupported_message_for_mime,
+    get_spec_for_extension,
+    mcp_mime_types,
+)
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
 
 from src.config.constants import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE
 from src.models.api_key import APIKeyInfo
+from src.models.evals import FeedbackRequest
+from src.services.auth import describe_workspace_denial, get_authorized_workspace_ids
+from src.services.compensation import mark_document_failed_with_retry
 from src.services.database import get_database
+from src.services.document_intake import intake_document
+from src.services.eval_feedback import EventNotFoundError, submit_feedback
+from src.services.eval_scorecard import build_scorecard
 from src.services.lineage import build_lineage
 from src.services.search import (
     SearchService,
@@ -49,17 +88,33 @@ from src.utils import get_logger
 
 logger = get_logger(__name__)
 
-# Required permission per tool — mirrors the REST per-route dependencies (#14).
-_TOOL_PERMISSIONS: dict[str, str] = {
-    "search_documents": "search",
-    "search_memory": "search",
-    "get_citations": "search",
-    "get_document_context": "read",
-    "list_documents": "read",
-    "verify_claim": "read",
-    "explain_lineage": "read",
-    "refresh_stale_source": "write",
-}
+# A tool handler receives the already-authenticated key and the raw arguments.
+ToolHandler = Callable[["APIKeyInfo", dict], Awaitable[list[TextContent]]]
+
+# The text MIME types upload_document accepts, derived from the single
+# FILE_TYPE_REGISTRY (#117) instead of a `.startswith("text/")` guess over
+# ALLOWED_MIME_TYPES. The registry's explicit `surfaces` field is what marks
+# a type MCP-eligible, so this can never drift from intake_document's own
+# understanding of the allow-list, and a future type can be text/*-shaped
+# without being (or not being) MCP-safe without the two disagreeing.
+# Binary types (PDF/DOCX/PNG) stay REST-only by design.
+SUPPORTED_TEXT_MIME_TYPES = mcp_mime_types()
+
+
+@dataclass(frozen=True)
+class ToolDef:
+    """Everything the server needs to know about one MCP tool (#100).
+
+    Declared once in the ``_TOOLS`` registry (bottom of this module, after the
+    handlers it references). ``list_tools`` and ``call_tool`` both iterate the
+    registry, so advertisement, dispatch, schema, and permission can't drift.
+    """
+
+    description: str
+    input_schema: dict
+    permission: str  # mirrors the REST per-route dependency (#14)
+    handler: ToolHandler
+
 
 # Schema shared by the two search-shaped tools so they stay identical (#14/#40).
 _SEARCH_INPUT_SCHEMA = {
@@ -69,7 +124,9 @@ _SEARCH_INPUT_SCHEMA = {
         "query": {"type": "string", "description": "The search query"},
         "workspace_id": {
             "type": "string",
-            "description": "Optional: specific workspace to search. If omitted, searches all your workspaces.",
+            "description": "Optional: specific workspace to search. If omitted, searches every "
+            "workspace your key is authorized for (a workspace-scoped key: exactly its bound "
+            "workspace; a key with no fixed workspace: every workspace you own).",
         },
         "limit": {
             "type": "integer",
@@ -104,6 +161,41 @@ _SEARCH_INPUT_SCHEMA = {
     "required": ["api_key", "query"],
 }
 
+# Schema for report_feedback (evals v1): an agent's verdict on one captured
+# search event (see src/models/evals.py FeedbackRequest).
+_FEEDBACK_INPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "api_key": {"type": "string", "description": "Your Inherent API key"},
+        "event_id": {
+            "type": "string",
+            "description": "The event_id returned on the search response you are judging",
+        },
+        "verdict": {
+            "type": "string",
+            "enum": ["answered", "partial", "not_relevant"],
+            "description": "Did the returned evidence answer the query?",
+        },
+        "useful_chunk_ids": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "chunk_ids from the results that actually answered it",
+        },
+        "note": {"type": "string", "description": "Optional short explanation"},
+    },
+    "required": ["api_key", "event_id", "verdict"],
+}
+
+# Schema for get_retrieval_health (evals v1): the workspace scorecard.
+_HEALTH_INPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "api_key": {"type": "string", "description": "Your Inherent API key"},
+        "workspace_id": {"type": "string", "description": "Workspace to report on"},
+    },
+    "required": ["api_key", "workspace_id"],
+}
+
 
 def create_mcp_server() -> Server:
     """Create and configure the MCP server."""
@@ -111,131 +203,10 @@ def create_mcp_server() -> Server:
 
     @server.list_tools()
     async def list_tools() -> list[Tool]:
-        """List available MCP tools with versioned, documented input schemas."""
+        """List available MCP tools straight from the registry (#100)."""
         return [
-            Tool(
-                name="search_documents",
-                description="Search for relevant documents and chunks using semantic, hybrid, or "
-                "keyword search. Omit workspace_id to search across ALL your workspaces. "
-                "Requires 'search' permission.",
-                inputSchema=_SEARCH_INPUT_SCHEMA,
-            ),
-            Tool(
-                name="search_memory",
-                description="Memory primitive: retrieve evidence chunks for a query (canonical "
-                "agent search). Same parameters and behaviour as search_documents; returns "
-                "structured results with scores and provenance. Requires 'search' permission.",
-                inputSchema=_SEARCH_INPUT_SCHEMA,
-            ),
-            Tool(
-                name="get_citations",
-                description="Run a search and return the claim-level Citation objects attached to "
-                "each result (chunk_id, document, character spans, score, provenance, freshness) "
-                "so an answer can cite its evidence. Requires 'search' permission.",
-                inputSchema=_SEARCH_INPUT_SCHEMA,
-            ),
-            Tool(
-                name="get_document_context",
-                description="Get the full content of a document for context. Requires 'read' "
-                "permission.",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "api_key": {"type": "string", "description": "Your Inherent API key"},
-                        "document_id": {
-                            "type": "string",
-                            "description": "The document ID to retrieve",
-                        },
-                    },
-                    "required": ["api_key", "document_id"],
-                },
-            ),
-            Tool(
-                name="list_documents",
-                description="List all documents. Omit workspace_id to list from ALL your "
-                "workspaces. Requires 'read' permission.",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "api_key": {"type": "string", "description": "Your Inherent API key"},
-                        "workspace_id": {
-                            "type": "string",
-                            "description": "Optional: specific workspace. If omitted, lists from all your workspaces.",
-                        },
-                        "page": {
-                            "type": "integer",
-                            "description": "Page number (default 1)",
-                            "default": 1,
-                        },
-                        "page_size": {
-                            "type": "integer",
-                            "description": "Items per page (default 20)",
-                            "default": 20,
-                        },
-                    },
-                    "required": ["api_key"],
-                },
-            ),
-            Tool(
-                name="verify_claim",
-                description="Memory primitive: verify how well a list of evidence passages "
-                "supports a claim (offline lexical strategy). Returns support_level "
-                "(strong/weak/none), score and reason. Requires 'read' permission.",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "api_key": {"type": "string", "description": "Your Inherent API key"},
-                        "claim": {
-                            "type": "string",
-                            "description": "The natural-language claim to verify",
-                        },
-                        "evidence": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": "Candidate supporting passages (e.g. retrieved chunk contents)",
-                        },
-                    },
-                    "required": ["api_key", "claim"],
-                },
-            ),
-            Tool(
-                name="explain_lineage",
-                description="Memory primitive: explain a document's (or chunk's) provenance and "
-                "freshness — source_uri, content_hash, ingested_at, is_stale and document_name — "
-                "from already-ingested data. Requires 'read' permission.",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "api_key": {"type": "string", "description": "Your Inherent API key"},
-                        "document_id": {
-                            "type": "string",
-                            "description": "The document ID to explain",
-                        },
-                        "chunk_id": {
-                            "type": "string",
-                            "description": "Optional: a specific chunk ID for chunk-level provenance",
-                        },
-                    },
-                    "required": ["api_key", "document_id"],
-                },
-            ),
-            Tool(
-                name="refresh_stale_source",
-                description="Memory primitive: re-ingest an already-uploaded document to clear "
-                "stale evidence (same logic as POST /v1/documents/{id}/refresh). Requires "
-                "'write' permission.",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "api_key": {"type": "string", "description": "Your Inherent API key"},
-                        "document_id": {
-                            "type": "string",
-                            "description": "The document ID to refresh (re-ingest)",
-                        },
-                    },
-                    "required": ["api_key", "document_id"],
-                },
-            ),
+            Tool(name=name, description=tool.description, inputSchema=tool.input_schema)
+            for name, tool in _TOOLS.items()
         ]
 
     @server.call_tool()
@@ -253,35 +224,23 @@ def create_mcp_server() -> Server:
             if not key_info:
                 return [TextContent(type="text", text="Error: Invalid or expired API key")]
 
+            # Registry lookup (#100): advertisement, permission, and dispatch
+            # all come from the same ToolDef, so they cannot disagree.
+            tool = _TOOLS.get(name)
+            if tool is None:
+                return [TextContent(type="text", text=f"Error: Unknown tool '{name}'")]
+
             # Permission parity with REST (#14): check BEFORE executing the body
             # so a denied key never reaches the search/db/verify services.
-            required = _TOOL_PERMISSIONS.get(name)
-            if required is None:
-                return [TextContent(type="text", text=f"Error: Unknown tool '{name}'")]
-            if not key_info.has_permission(required):
+            if not key_info.has_permission(tool.permission):
                 return [
                     TextContent(
                         type="text",
-                        text=f"Error: API key does not have '{required}' permission",
+                        text=f"Error: API key does not have '{tool.permission}' permission",
                     )
                 ]
 
-            if name in ("search_documents", "search_memory"):
-                return await _handle_search(key_info, arguments)
-            elif name == "get_citations":
-                return await _handle_get_citations(key_info, arguments)
-            elif name == "get_document_context":
-                return await _handle_get_context(key_info, arguments)
-            elif name == "list_documents":
-                return await _handle_list_documents(key_info, arguments)
-            elif name == "verify_claim":
-                return await _handle_verify_claim(key_info, arguments)
-            elif name == "explain_lineage":
-                return await _handle_explain_lineage(key_info, arguments)
-            elif name == "refresh_stale_source":
-                return await _handle_refresh_stale_source(key_info, arguments)
-            else:  # pragma: no cover - guarded by _TOOL_PERMISSIONS above
-                return [TextContent(type="text", text=f"Error: Unknown tool '{name}'")]
+            return await tool.handler(key_info, arguments)
 
         except Exception as e:
             logger.error("MCP tool error", tool=name, error=str(e))
@@ -306,45 +265,67 @@ async def _get_workspace_ids(
     """
     Determine which workspace IDs to use for a query.
 
+    Authorisation comes from ``get_authorized_workspace_ids`` — the SAME rule
+    REST's ``_resolve_workspace`` enforces (#138): a workspace-scoped key is
+    bound to exactly its one workspace (never the user's full owned set),
+    while a user-scoped key may use any workspace the user owns. Before the
+    #138 fix this function called ``database.get_user_workspace_ids``
+    directly, which only ever reflected the user's full owned set and ignored
+    ``key_info.workspace_id`` entirely — a scoped key could reach any
+    workspace its owner owned via MCP even though REST rejected that same
+    request with 403.
+
+    The rejection text comes from ``describe_workspace_denial`` — the SAME
+    wording REST's ``_resolve_workspace`` raises (#138 follow-up). A generic
+    "you don't have access" reads to an agent as "that workspace doesn't
+    exist" and invites it to guess other ids or give up; naming a scoped
+    key's own bound workspace costs nothing (it's the caller's own grant) and
+    lets the caller retry immediately with the right id.
+
     Returns:
         tuple of (workspace_ids list, error message or None)
     """
     database = await get_database()
+    authorized = await get_authorized_workspace_ids(key_info, database)
 
     if requested_workspace_id:
-        # User specified a workspace - verify they have access
-        user_workspaces = await database.get_user_workspace_ids(key_info.user_id)
-        if requested_workspace_id not in user_workspaces:
-            return [], f"Error: You don't have access to workspace '{requested_workspace_id}'"
+        # User specified a workspace - verify it is in the key's authorised set.
+        if requested_workspace_id not in authorized:
+            return [], f"Error: {describe_workspace_denial(key_info, requested_workspace_id)}"
         return [requested_workspace_id], None
     else:
-        # No workspace specified - use all user's workspaces
-        user_workspaces = await database.get_user_workspace_ids(key_info.user_id)
-        if not user_workspaces:
+        # No workspace specified - use every workspace the key is authorised
+        # for (exactly one, for a scoped key; every owned workspace otherwise).
+        if not authorized:
             return [], "No workspaces found. Upload documents to create a workspace."
-        return user_workspaces, None
+        return authorized, None
 
 
 async def _run_search(
     key_info: APIKeyInfo,
     arguments: dict,
-) -> tuple[list, str | None, str | None]:
+) -> tuple[list, list[str], str | None]:
     """Shared retrieval used by search_documents/search_memory/get_citations.
 
     Builds the SearchRequest via the shared ``build_search_request`` helper (so
     it matches REST exactly, #14), fans out over the authorised workspaces, and
-    returns (results, requested_workspace_id, error). ``results`` items are
+    returns (results, workspaces_searched, error). ``results`` items are
     ``(workspace_id, SearchResult)`` tuples sorted by score and truncated to the
-    requested limit.
+    requested limit. ``workspaces_searched`` is the ACTUAL set queried — not
+    the caller's ``workspace_id`` argument, which is often absent — so callers
+    can state real coverage instead of assuming "all workspaces" (#138
+    follow-up: a workspace-scoped key silently narrows this to one, and the
+    caller must be able to see that, not just guess it from an unqualified
+    "across all workspaces" claim).
     """
     requested_workspace_id = arguments.get("workspace_id")
     query = arguments.get("query", "")
     if not query:
-        return [], requested_workspace_id, "Error: Query is required"
+        return [], [], "Error: Query is required"
 
     workspace_ids, error = await _get_workspace_ids(key_info, requested_workspace_id)
     if error:
-        return [], requested_workspace_id, error
+        return [], [], error
 
     request = build_search_request(arguments)
     search_service: SearchService = await get_search_service()
@@ -356,7 +337,26 @@ async def _run_search(
             tagged.append((workspace_id, result))
 
     tagged.sort(key=_search_rank_key)
-    return tagged[: request.limit], requested_workspace_id, None
+    return tagged[: request.limit], workspace_ids, None
+
+
+def _coverage_note(workspace_ids: list[str]) -> str:
+    """Describe the ACTUAL set of workspaces a call covered, for use in both
+    the human summary and (as ``workspaces_searched``) the structured JSON
+    payload (#138 follow-up).
+
+    Never says "all workspaces" — that phrase is only true for a user-scoped
+    key with no narrower request, and reads as false coverage for a
+    workspace-scoped key (which is authorised for exactly one, regardless of
+    how many its owner owns) or for an explicit single-workspace request.
+    Stating the real, named set costs nothing and lets an agent verify
+    coverage instead of trusting prose.
+    """
+    if len(workspace_ids) == 1:
+        return f" in workspace '{workspace_ids[0]}'"
+    if not workspace_ids:
+        return ""
+    return f" across your {len(workspace_ids)} authorized workspaces ({', '.join(workspace_ids)})"
 
 
 def _search_rank_key(pair: tuple[str, object]) -> tuple[float, str, str]:
@@ -372,25 +372,27 @@ def _search_rank_key(pair: tuple[str, object]) -> tuple[float, str, str]:
 
 
 async def _handle_search(key_info: APIKeyInfo, arguments: dict) -> list[TextContent]:
-    """Handle search_documents / search_memory tools (#14/#40)."""
-    tagged, requested_workspace_id, error = await _run_search(key_info, arguments)
+    """Handle search_documents / search_memory tools (#14/#40).
+
+    The summary states the ACTUAL set of workspaces searched via
+    ``_coverage_note``, and the structured payload carries the same set as
+    ``workspaces_searched`` (#138 follow-up) — narrowing to a scoped key's one
+    workspace is correct behavior, but claiming "across all workspaces" while
+    only one was searched is a false affirmation an agent has no way to catch
+    from prose alone. ``workspaces_searched`` gives it a programmatic check.
+    """
+    tagged, workspace_ids, error = await _run_search(key_info, arguments)
     if error:
         return [TextContent(type="text", text=error)]
 
     query = arguments.get("query", "")
+    note = _coverage_note(workspace_ids)
     if not tagged:
-        note = (
-            f" in workspace '{requested_workspace_id}'"
-            if requested_workspace_id
-            else " across your workspaces"
+        return _structured(
+            f"No results found for: {query}{note}",
+            {"query": query, "results": [], "workspaces_searched": workspace_ids},
         )
-        return _structured(f"No results found for: {query}{note}", {"query": query, "results": []})
 
-    note = (
-        f" in workspace '{requested_workspace_id}'"
-        if requested_workspace_id
-        else " across all workspaces"
-    )
     summary = f"Found {len(tagged)} results for '{query}'{note}:\n\n"
     structured_results = []
     for i, (workspace_id, result) in enumerate(tagged, 1):
@@ -413,12 +415,20 @@ async def _handle_search(key_info: APIKeyInfo, arguments: dict) -> list[TextCont
             }
         )
 
-    return _structured(summary.rstrip(), {"query": query, "results": structured_results})
+    return _structured(
+        summary.rstrip(),
+        {"query": query, "results": structured_results, "workspaces_searched": workspace_ids},
+    )
 
 
 async def _handle_get_citations(key_info: APIKeyInfo, arguments: dict) -> list[TextContent]:
-    """Handle get_citations: run a search and return the Citation objects (#40)."""
-    tagged, requested_workspace_id, error = await _run_search(key_info, arguments)
+    """Handle get_citations: run a search and return the Citation objects (#40).
+
+    Carries ``workspaces_searched`` in the structured payload for the same
+    reason ``_handle_search`` does (#138 follow-up): the caller must be able
+    to verify actual coverage, not infer it from result count alone.
+    """
+    tagged, workspace_ids, error = await _run_search(key_info, arguments)
     if error:
         return [TextContent(type="text", text=error)]
 
@@ -429,42 +439,45 @@ async def _handle_get_citations(key_info: APIKeyInfo, arguments: dict) -> list[T
             citations.append({"workspace_id": workspace_id, **result.citation.model_dump()})
 
     if not citations:
-        return _structured(f"No citations found for: {query}", {"query": query, "citations": []})
-
-    summary = f"Found {len(citations)} citations for '{query}':\n\n"
-    for i, cit in enumerate(citations, 1):
-        summary += (
-            f"**{i}. {cit['document_name']}** (score: {cit['score']:.2f}) "
-            f"chunk {cit['chunk_id']}\n"
+        return _structured(
+            f"No citations found for: {query}",
+            {"query": query, "citations": [], "workspaces_searched": workspace_ids},
         )
 
-    return _structured(summary.rstrip(), {"query": query, "citations": citations})
+    note = _coverage_note(workspace_ids)
+    summary = f"Found {len(citations)} citations for '{query}'{note}:\n\n"
+    for i, cit in enumerate(citations, 1):
+        summary += (
+            f"**{i}. {cit['document_name']}** (score: {cit['score']:.2f}) chunk {cit['chunk_id']}\n"
+        )
+
+    return _structured(
+        summary.rstrip(),
+        {"query": query, "citations": citations, "workspaces_searched": workspace_ids},
+    )
 
 
 async def _handle_get_context(key_info: APIKeyInfo, arguments: dict) -> list[TextContent]:
-    """Handle get_document_context tool."""
+    """Handle get_document_context tool.
+
+    Delegates lookup + authorization to ``_resolve_document_for_user`` — the
+    SAME check every other document-scoped tool uses — instead of duplicating
+    it inline. Before #138 follow-up this handler had its own copy of the
+    check with its own distinguishable "you don't have access" message,
+    which was a cross-workspace existence oracle REST doesn't have; routing
+    through the shared helper means the undifferentiated-not-found rule is
+    expressed in exactly one place and this handler cannot drift from it.
+    """
     document_id = arguments.get("document_id", "")
 
     if not document_id:
         return [TextContent(type="text", text="Error: Document ID is required")]
 
+    document, _, error = await _resolve_document_for_user(key_info, document_id)
+    if error:
+        return [TextContent(type="text", text=error)]
+
     database = await get_database()
-
-    # Get document and verify user has access
-    document = await database.get_document_by_id(document_id)
-
-    if not document:
-        return [TextContent(type="text", text=f"Error: Document '{document_id}' not found")]
-
-    # Verify user has access to this workspace
-    user_workspaces = await database.get_user_workspace_ids(key_info.user_id)
-    if document.workspace_id not in user_workspaces:
-        return [
-            TextContent(
-                type="text", text=f"Error: You don't have access to document '{document_id}'"
-            )
-        ]
-
     chunks = await database.get_document_chunks_by_doc_id(document_id)
     full_text = "\n\n".join(chunk.content for chunk in chunks)
 
@@ -480,7 +493,13 @@ async def _handle_get_context(key_info: APIKeyInfo, arguments: dict) -> list[Tex
 
 
 async def _handle_list_documents(key_info: APIKeyInfo, arguments: dict) -> list[TextContent]:
-    """Handle list_documents tool."""
+    """Handle list_documents tool.
+
+    States the ACTUAL set of workspaces listed via ``_coverage_note`` and
+    carries it as ``workspaces_searched`` in a trailing structured JSON block
+    (#138 follow-up) — this handler previously said "across all workspaces"
+    even when a scoped key narrowed the listing to exactly one.
+    """
     # Clamp to the same bounds the REST route enforces (page>=1,
     # 1<=page_size<=MAX_PAGE_SIZE) so an agent can't request a negative SQL
     # OFFSET or dump the whole tenant in one call (#13).
@@ -511,24 +530,24 @@ async def _handle_list_documents(key_info: APIKeyInfo, arguments: dict) -> list[
         )
 
     if not documents:
-        workspace_note = (
-            f" in workspace '{requested_workspace_id}'" if requested_workspace_id else ""
+        return _structured(
+            f"No documents found{_coverage_note(workspace_ids)}",
+            {"total": 0, "page": page, "workspaces_searched": workspace_ids},
         )
-        return [TextContent(type="text", text=f"No documents found{workspace_note}")]
 
-    workspace_note = (
-        f" in workspace '{requested_workspace_id}'"
-        if requested_workspace_id
-        else " across all workspaces"
+    result_text = (
+        f"Found {total} documents{_coverage_note(workspace_ids)} (showing page {page}):\n\n"
     )
-    result_text = f"Found {total} documents{workspace_note} (showing page {page}):\n\n"
     for doc in documents:
         result_text += f"- **{doc.name}**\n"
         result_text += f"  ID: `{doc.id}`\n"
         result_text += f"  Type: {doc.source_type} | Size: {doc.size_bytes:,} bytes\n"
         result_text += f"  Chunks: {doc.chunk_count} | Status: {doc.status} | Workspace: {doc.workspace_id}\n\n"
 
-    return [TextContent(type="text", text=result_text)]
+    return _structured(
+        result_text.rstrip(),
+        {"total": total, "page": page, "workspaces_searched": workspace_ids},
+    )
 
 
 async def _handle_verify_claim(key_info: APIKeyInfo, arguments: dict) -> list[TextContent]:
@@ -543,27 +562,43 @@ async def _handle_verify_claim(key_info: APIKeyInfo, arguments: dict) -> list[Te
 
     verdict = verify_claim(claim, [str(e) for e in evidence])
     summary = (
-        f"Claim support: **{verdict.support_level}** (score: {verdict.score:.2f})\n"
-        f"{verdict.reason}"
+        f"Claim support: **{verdict.support_level}** (score: {verdict.score:.2f})\n{verdict.reason}"
     )
     return _structured(summary, verdict.model_dump())
 
 
 async def _resolve_document_for_user(key_info: APIKeyInfo, document_id: str):
-    """Fetch a document by id and verify the user owns its workspace.
+    """Fetch a document by id and verify the key is authorised for its workspace.
+
+    Authorisation via ``get_authorized_workspace_ids`` (#138): a
+    workspace-scoped key must own the document's exact workspace, not merely
+    any workspace its owning user has.
+
+    Returns an UNDIFFERENTIATED "not found" for both a missing document and
+    one that exists but is in a workspace the key isn't authorised for (#138
+    follow-up) — matching REST's ``GET /v1/documents/{id}``
+    (``src/api/v1/documents.py``), whose workspace-scoped query returns
+    ``None`` in both cases and so always answers `404`. A distinct "you
+    don't have access" message here would be a cross-workspace EXISTENCE
+    ORACLE: a caller could iterate document ids and learn exactly which ones
+    exist in a workspace it cannot read (e.g. a contractor key scoped to
+    ``ws_tier1`` probing which ids exist in ``ws_tier2``) — precisely what
+    REST's undifferentiated 404 exists to prevent. Do not reintroduce a
+    distinguishable message for the unauthorized branch.
 
     Returns (document, workspace_ids, error_text). On any access failure the
-    error_text is set and the document is None, so callers return without ever
-    reading further data.
+    error_text is set and the document is None, so callers return without
+    ever reading further data.
     """
     database = await get_database()
     document = await database.get_document_by_id(document_id)
+    not_found = f"Error: Document '{document_id}' not found"
     if not document:
-        return None, [], f"Error: Document '{document_id}' not found"
-    user_workspaces = await database.get_user_workspace_ids(key_info.user_id)
-    if document.workspace_id not in user_workspaces:
-        return None, user_workspaces, f"Error: You don't have access to document '{document_id}'"
-    return document, user_workspaces, None
+        return None, [], not_found
+    authorized = await get_authorized_workspace_ids(key_info, database)
+    if document.workspace_id not in authorized:
+        return None, authorized, not_found
+    return document, authorized, None
 
 
 async def _handle_explain_lineage(key_info: APIKeyInfo, arguments: dict) -> list[TextContent]:
@@ -665,7 +700,37 @@ async def _handle_refresh_stale_source(key_info: APIKeyInfo, arguments: dict) ->
     }
 
     mq = await get_mq_service()
-    await mq.publish(settings.mq_topic_document_uploaded, mq_message)
+    try:
+        await mq.publish(settings.mq_topic_document_uploaded, mq_message)
+    except Exception as exc:
+        # Compensate the pending reset above (#98). The document was just moved
+        # to 'pending'; if the enqueue fails it will never be re-ingested, so we
+        # must mark it failed — exactly as the REST twin
+        # (POST /v1/documents/{id}/refresh) does — instead of stranding it as
+        # permanently 'pending'. Both surfaces must leave the SAME state on an MQ
+        # outage (dual-surface failure parity, CLAUDE.md). The mark is retried
+        # with backoff; on exhaustion the helper emits the CRITICAL log + metric
+        # that flag the orphaned 'pending' row (#99).
+        logger.error(
+            "MQ publish failed during refresh — re-ingestion not enqueued",
+            error=str(exc),
+            document_id=document_id,
+        )
+        await mark_document_failed_with_retry(
+            database,
+            document_id,
+            workspace_id,
+            "refresh enqueue failed",
+            operation="refresh_enqueue",
+        )
+        return [
+            TextContent(
+                type="text",
+                text=(
+                    "Error: failed to queue the document for re-processing. Please try again later."
+                ),
+            )
+        ]
 
     payload = {
         "document_id": fields["document_id"],
@@ -676,6 +741,533 @@ async def _handle_refresh_stale_source(key_info: APIKeyInfo, arguments: dict) ->
         f"Document '{document.name}' ({document_id}) queued for re-ingestion (refresh).",
         payload,
     )
+
+
+async def _handle_report_feedback(key_info: APIKeyInfo, arguments: dict) -> list[TextContent]:
+    """Record agent feedback on a captured search event (evals v1).
+
+    Delegates to the shared ``submit_feedback`` service (same promotion rules
+    REST uses at POST /v1/evals/feedback) so the two surfaces never drift.
+    ``workspace_ids`` comes from ``get_authorized_workspace_ids`` (#138) so a
+    workspace-scoped key can only promote/attach feedback within its own
+    workspace, matching REST's ``[auth.workspace_id]`` (src/api/v1/evals.py).
+    """
+    database = await get_database()
+    workspace_ids = await get_authorized_workspace_ids(key_info, database)
+    req = FeedbackRequest(
+        event_id=arguments["event_id"],
+        verdict=arguments["verdict"],
+        useful_chunk_ids=arguments.get("useful_chunk_ids"),
+        note=arguments.get("note"),
+    )
+    try:
+        result = await submit_feedback(database, workspace_ids=workspace_ids, req=req)
+    except EventNotFoundError:
+        return [
+            TextContent(
+                type="text",
+                text=f"Error: unknown or expired event_id '{req.event_id}'",
+            )
+        ]
+    return [TextContent(type="text", text=result.model_dump_json())]
+
+
+async def _handle_get_retrieval_health(key_info: APIKeyInfo, arguments: dict) -> list[TextContent]:
+    """Return the workspace scorecard so agents can calibrate trust (evals v1).
+
+    Enforces the same authorised-workspace check every other tool uses (#138:
+    ``get_authorized_workspace_ids`` — key binding, not the user's full owned
+    set) before handing the workspace_id to ``build_scorecard``. The
+    rejection uses ``describe_workspace_denial`` — the same wording every
+    other workspace-argument rejection uses (#138 follow-up: this used to be
+    a THIRD distinct wording, "workspace not accessible with this key",
+    alongside REST's and ``_get_workspace_ids``'s).
+    """
+    database = await get_database()
+    workspace_ids = await get_authorized_workspace_ids(key_info, database)
+    workspace_id = arguments["workspace_id"]
+    if workspace_id not in workspace_ids:
+        return [
+            TextContent(
+                type="text", text=f"Error: {describe_workspace_denial(key_info, workspace_id)}"
+            )
+        ]
+    scorecard = await build_scorecard(database, workspace_id=workspace_id)
+    return [TextContent(type="text", text=scorecard.model_dump_json())]
+
+
+async def _handle_delete_document(key_info: APIKeyInfo, arguments: dict) -> list[TextContent]:
+    """Handle delete_document: retract a document from every store (#87).
+
+    Mirrors DELETE /v1/documents/{id}: same access check as the other
+    document-scoped tools (the caller must own the document's workspace), then
+    the shared deletion orchestrator removes vectors, the database row +
+    chunks, and best-effort the stored bytes. A vector-store failure raises
+    into the dispatcher's error path, leaving the document intact (retryable).
+    """
+    document_id = arguments.get("document_id", "")
+    if not document_id:
+        return [TextContent(type="text", text="Error: Document ID is required")]
+
+    document, _, error = await _resolve_document_for_user(key_info, document_id)
+    if error:
+        return [TextContent(type="text", text=error)]
+
+    from src.services.deletion import delete_document_everywhere
+
+    database = await get_database()
+    outcome = await delete_document_everywhere(database, document_id, document.workspace_id)
+    if not outcome.found:
+        return [TextContent(type="text", text=f"Error: Document '{document_id}' not found")]
+
+    payload = {
+        "document_id": document_id,
+        "workspace_id": document.workspace_id,
+        "deleted": True,
+        "chunks_deleted": outcome.chunks_deleted,
+        "vectors_deleted": outcome.vectors_deleted,
+        "storage_deleted": outcome.storage_deleted,
+    }
+    return _structured(
+        f"Document '{document.name}' ({document_id}) permanently deleted "
+        f"({outcome.chunks_deleted} chunks, {outcome.vectors_deleted} vectors removed).",
+        payload,
+    )
+
+
+async def _handle_get_document(key_info: APIKeyInfo, arguments: dict) -> list[TextContent]:
+    """Handle get_document: return one document's metadata as JSON (#87 parity).
+
+    Same access check as ``_handle_get_context`` / ``_resolve_document_for_user``
+    (get_document_by_id then verify the caller owns the workspace) but skips
+    fetching chunks/full_text — this is the metadata-only counterpart of GET
+    /v1/documents/{id}.
+    """
+    document_id = arguments.get("document_id", "")
+    if not document_id:
+        return [TextContent(type="text", text="Error: Document ID is required")]
+
+    document, _, error = await _resolve_document_for_user(key_info, document_id)
+    if error:
+        return [TextContent(type="text", text=error)]
+
+    return [TextContent(type="text", text=document.model_dump_json())]
+
+
+async def _handle_list_chunks(key_info: APIKeyInfo, arguments: dict) -> list[TextContent]:
+    """Handle list_chunks: return a document's chunks as JSON (#87 parity).
+
+    Same access check as ``get_document`` (the caller must own the document's
+    workspace) — same data as GET /v1/chunks/{document_id}.
+    """
+    document_id = arguments.get("document_id", "")
+    if not document_id:
+        return [TextContent(type="text", text="Error: Document ID is required")]
+
+    document, _, error = await _resolve_document_for_user(key_info, document_id)
+    if error:
+        return [TextContent(type="text", text=error)]
+
+    database = await get_database()
+    chunks = await database.get_document_chunks_by_doc_id(document.id)
+    payload = [chunk.model_dump() for chunk in chunks]
+    return _structured(f"{len(chunks)} chunks for document '{document.id}'", payload)
+
+
+async def _resolve_single_workspace_for_upload(
+    key_info: APIKeyInfo, requested_workspace_id: str | None
+) -> tuple[str | None, str | None]:
+    """Resolve exactly one target workspace for an upload.
+
+    Unlike read/search tools (which fan out over every owned workspace) or
+    the document-scoped write tools (delete_document / refresh_stale_source,
+    which resolve their workspace FROM the existing document), upload has no
+    document yet and must write to exactly one workspace. So:
+
+    - ``requested_workspace_id`` given: validate ownership via the same
+      ``_get_workspace_ids`` check every other tool uses (tenant scoping),
+      then use it.
+    - omitted: the caller must own EXACTLY one workspace, or the call is
+      rejected asking them to disambiguate with ``workspace_id`` — silently
+      picking one of several owned workspaces would be a surprising place to
+      write data.
+
+    Returns (workspace_id, error_text); on error workspace_id is None.
+    """
+    if requested_workspace_id:
+        workspace_ids, error = await _get_workspace_ids(key_info, requested_workspace_id)
+        if error:
+            return None, error
+        return workspace_ids[0], None
+
+    # #138: authorised set, not the user's full owned set — a scoped key
+    # narrows to its one workspace here too (len(owned) == 1), never forcing
+    # disambiguation among workspaces the key isn't even bound to.
+    database = await get_database()
+    owned = await get_authorized_workspace_ids(key_info, database)
+    if not owned:
+        return None, "Error: No workspaces found. Upload documents to create a workspace."
+    if len(owned) > 1:
+        return None, (
+            "Error: You have access to multiple workspaces; pass 'workspace_id' to "
+            "specify which one to upload to."
+        )
+    return owned[0], None
+
+
+def _default_upload_content_type(filename: str) -> str:
+    """The ``content_type`` ``upload_document`` uses when the caller omits
+    it, exactly as the tool schema's ``"default": "text/markdown"`` invites
+    (#117 review BLOCKER 2).
+
+    Derived from `filename`'s extension when the registry recognizes it AND
+    that type is MCP-eligible (e.g. ``notes.txt`` -> ``text/plain``,
+    ``data.csv`` -> ``text/csv``) -- falls back to ``text/markdown`` only for
+    an unrecognized or absent extension. Before this, the default was a flat
+    ``"text/markdown"`` regardless of filename, which meant the tool's own
+    documented default broke itself the moment #117's extension-consistency
+    check landed: calling ``upload_document(filename="notes.txt", ...)`` and
+    omitting the optional `content_type` -- exactly what the schema invites
+    -- got ``notes.txt`` defaulted to ``text/markdown`` and then rejected as
+    a mismatch against its own ``.txt`` extension.
+    """
+    if "." not in filename:
+        return "text/markdown"
+    extension = "." + filename.rsplit(".", 1)[-1]
+    spec = get_spec_for_extension(extension)
+    if spec is not None and "mcp" in spec.surfaces:
+        return spec.mime_types[0]
+    return "text/markdown"
+
+
+async def _handle_upload_document(key_info: APIKeyInfo, arguments: dict) -> list[TextContent]:
+    """Handle upload_document: text-only counterpart of POST /v1/documents (#87).
+
+    Rejects empty content and non-``text/*`` content types up front (binary
+    uploads are REST-only by design — the tool has no way to accept raw
+    bytes). Resolves a single target workspace (see
+    ``_resolve_single_workspace_for_upload``) then UTF-8 encodes the text and
+    delegates validation/dedup/storage/enqueue to the shared
+    ``intake_document`` service — the exact same pipeline POST /v1/documents
+    uses, so the two surfaces cannot drift.
+    """
+    filename = arguments.get("filename", "")
+    content = arguments.get("content", "")
+    declared_content_type = arguments.get("content_type")
+
+    if not filename:
+        return [TextContent(type="text", text="Error: filename is required")]
+    if not content:
+        return [TextContent(type="text", text="Error: content is required and cannot be empty")]
+
+    # Explicitly-unsupported formats (#124/#126 review blocker 3) -- checked
+    # BEFORE the content_type default is resolved below, against BOTH the
+    # declared content_type (if the caller passed one) and the filename
+    # extension. The extension check is what closes the actual hole: this
+    # tool's content_type is OPTIONAL and defaults from the filename
+    # extension when omitted (see `_default_upload_content_type`), and
+    # '.doc'/'.msg' have no FILE_TYPE_REGISTRY entry to derive a content
+    # type from -- so a caller who omits content_type for "report.doc" used
+    # to silently default to "text/markdown" (MCP-eligible) and sail
+    # straight through as if it were prose, the exact accept-then-garble
+    # outcome both issues forbid. Sourced from the SAME
+    # inh_contracts.EXPLICITLY_UNSUPPORTED table REST's intake_document
+    # reads, so the two surfaces cannot drift on which formats this covers.
+    rejection_message = (
+        declared_content_type and explicitly_unsupported_message_for_mime(declared_content_type)
+    ) or explicitly_unsupported_message_for_extension(filename)
+    if rejection_message is not None:
+        return [TextContent(type="text", text=f"Error: {rejection_message}")]
+
+    content_type = declared_content_type or _default_upload_content_type(filename)
+
+    if content_type not in SUPPORTED_TEXT_MIME_TYPES:
+        return [
+            TextContent(
+                type="text",
+                text=(
+                    f"Error: upload_document accepts only these text content types: "
+                    f"{', '.join(SUPPORTED_TEXT_MIME_TYPES)} (got '{content_type}'). "
+                    f"Other formats (PDF, DOCX, PNG, ...) are REST-only by design — use "
+                    f"POST /v1/documents instead."
+                ),
+            )
+        ]
+
+    workspace_id, error = await _resolve_single_workspace_for_upload(
+        key_info, arguments.get("workspace_id")
+    )
+    if error:
+        return [TextContent(type="text", text=error)]
+    assert workspace_id is not None  # narrowed by the error check above
+
+    database = await get_database()
+    result = await intake_document(
+        database=database,
+        workspace_id=workspace_id,
+        user_id=key_info.user_id,
+        content_bytes=content.encode("utf-8"),
+        filename=filename,
+        content_type=content_type,
+    )
+    return [TextContent(type="text", text=result.model_dump_json())]
+
+
+# =============================================================================
+# Tool registry — THE single place a tool exists (#100)
+# =============================================================================
+# Adding a tool = adding one entry here (plus its handler above). list_tools,
+# permission enforcement, and dispatch all derive from this dict, so a tool can
+# never be advertised-but-unusable or callable-but-hidden. Defined after the
+# handlers so the entries can reference them directly.
+
+_TOOLS: dict[str, ToolDef] = {
+    "search_documents": ToolDef(
+        description="Search for relevant documents and chunks using semantic, hybrid, or "
+        "keyword search. Omit workspace_id to search every workspace your key is authorized "
+        "for (a workspace-scoped key: exactly its bound workspace). Requires 'search' "
+        "permission.",
+        input_schema=_SEARCH_INPUT_SCHEMA,
+        permission="search",
+        handler=_handle_search,
+    ),
+    "search_memory": ToolDef(
+        description="Memory primitive: retrieve evidence chunks for a query (canonical "
+        "agent search). Same parameters and behaviour as search_documents; returns "
+        "structured results with scores and provenance. Requires 'search' permission.",
+        input_schema=_SEARCH_INPUT_SCHEMA,
+        permission="search",
+        handler=_handle_search,
+    ),
+    "get_citations": ToolDef(
+        description="Run a search and return the claim-level Citation objects attached to "
+        "each result (chunk_id, document, character spans, score, provenance, freshness) "
+        "so an answer can cite its evidence. Requires 'search' permission.",
+        input_schema=_SEARCH_INPUT_SCHEMA,
+        permission="search",
+        handler=_handle_get_citations,
+    ),
+    "get_document_context": ToolDef(
+        description="Get the full content of a document for context. Requires 'read' permission.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "api_key": {"type": "string", "description": "Your Inherent API key"},
+                "document_id": {
+                    "type": "string",
+                    "description": "The document ID to retrieve",
+                },
+            },
+            "required": ["api_key", "document_id"],
+        },
+        permission="read",
+        handler=_handle_get_context,
+    ),
+    "list_documents": ToolDef(
+        description="List all documents. Omit workspace_id to list from every workspace "
+        "your key is authorized for (a workspace-scoped key: exactly its bound workspace). "
+        "Requires 'read' permission.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "api_key": {"type": "string", "description": "Your Inherent API key"},
+                "workspace_id": {
+                    "type": "string",
+                    "description": "Optional: specific workspace. If omitted, lists from every "
+                    "workspace your key is authorized for (a workspace-scoped key: exactly its "
+                    "bound workspace).",
+                },
+                "page": {
+                    "type": "integer",
+                    "description": "Page number (default 1)",
+                    "default": 1,
+                },
+                "page_size": {
+                    "type": "integer",
+                    "description": "Items per page (default 20)",
+                    "default": 20,
+                },
+            },
+            "required": ["api_key"],
+        },
+        permission="read",
+        handler=_handle_list_documents,
+    ),
+    "verify_claim": ToolDef(
+        description="Memory primitive: verify how well a list of evidence passages "
+        "supports a claim (offline lexical strategy). Returns support_level "
+        "(strong/weak/none), score and reason. Requires 'read' permission.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "api_key": {"type": "string", "description": "Your Inherent API key"},
+                "claim": {
+                    "type": "string",
+                    "description": "The natural-language claim to verify",
+                },
+                "evidence": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Candidate supporting passages (e.g. retrieved chunk contents)",
+                },
+            },
+            "required": ["api_key", "claim"],
+        },
+        permission="read",
+        handler=_handle_verify_claim,
+    ),
+    "explain_lineage": ToolDef(
+        description="Memory primitive: explain a document's (or chunk's) provenance and "
+        "freshness — source_uri, content_hash, ingested_at, is_stale and document_name — "
+        "from already-ingested data. Requires 'read' permission.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "api_key": {"type": "string", "description": "Your Inherent API key"},
+                "document_id": {
+                    "type": "string",
+                    "description": "The document ID to explain",
+                },
+                "chunk_id": {
+                    "type": "string",
+                    "description": "Optional: a specific chunk ID for chunk-level provenance",
+                },
+            },
+            "required": ["api_key", "document_id"],
+        },
+        permission="read",
+        handler=_handle_explain_lineage,
+    ),
+    "refresh_stale_source": ToolDef(
+        description="Memory primitive: re-ingest an already-uploaded document to clear "
+        "stale evidence (same logic as POST /v1/documents/{id}/refresh). Requires "
+        "'write' permission.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "api_key": {"type": "string", "description": "Your Inherent API key"},
+                "document_id": {
+                    "type": "string",
+                    "description": "The document ID to refresh (re-ingest)",
+                },
+            },
+            "required": ["api_key", "document_id"],
+        },
+        permission="write",
+        handler=_handle_refresh_stale_source,
+    ),
+    "report_feedback": ToolDef(
+        description="ALWAYS call this after using search results: report whether the "
+        "returned evidence answered your query. Your feedback builds this workspace's "
+        "retrieval eval set and improves future quality measurement. Pass the "
+        "event_id from the search response. Requires 'search' permission.",
+        input_schema=_FEEDBACK_INPUT_SCHEMA,
+        permission="search",
+        handler=_handle_report_feedback,
+    ),
+    "get_retrieval_health": ToolDef(
+        description="Get the retrieval-quality scorecard for a workspace: answer rate, "
+        "verdict distribution, corpus gaps, labeled-case count, and last eval run. Use "
+        "it to calibrate how much to trust search results from this corpus. Requires "
+        "'search' permission.",
+        input_schema=_HEALTH_INPUT_SCHEMA,
+        permission="search",
+        handler=_handle_get_retrieval_health,
+    ),
+    "delete_document": ToolDef(
+        description="Memory primitive: permanently delete a document and all of its "
+        "derived data — vectors, chunks, and stored bytes (same logic as DELETE "
+        "/v1/documents/{id}). Use to retract knowledge that should no longer be "
+        "retrievable. Requires 'write' permission.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "api_key": {"type": "string", "description": "Your Inherent API key"},
+                "document_id": {
+                    "type": "string",
+                    "description": "The document ID to delete",
+                },
+            },
+            "required": ["api_key", "document_id"],
+        },
+        permission="write",
+        handler=_handle_delete_document,
+    ),
+    "get_document": ToolDef(
+        description="Get a single document's metadata (name, source_type, mime_type, "
+        "size, chunk_count, status, timestamps) — same data as GET "
+        "/v1/documents/{id}. Requires 'read' permission.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "api_key": {"type": "string", "description": "Your Inherent API key"},
+                "document_id": {
+                    "type": "string",
+                    "description": "The document ID to retrieve",
+                },
+            },
+            "required": ["api_key", "document_id"],
+        },
+        permission="read",
+        handler=_handle_get_document,
+    ),
+    "list_chunks": ToolDef(
+        description="List all chunks belonging to a document (id, content, chunk_index, "
+        "token_count) — same data as GET /v1/chunks/{document_id}. Requires 'read' "
+        "permission.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "api_key": {"type": "string", "description": "Your Inherent API key"},
+                "document_id": {
+                    "type": "string",
+                    "description": "The document ID whose chunks to list",
+                },
+            },
+            "required": ["api_key", "document_id"],
+        },
+        permission="read",
+        handler=_handle_list_chunks,
+    ),
+    "upload_document": ToolDef(
+        description="Upload TEXT content for ingestion (same pipeline as POST "
+        "/v1/documents, minus binary files — PDF/DOCX/PNG uploads are REST-only by "
+        "design). Content is UTF-8 text; content_type must be one of text/plain, "
+        "text/markdown (default), text/csv, text/html. Requires 'write' permission.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "api_key": {"type": "string", "description": "Your Inherent API key"},
+                "filename": {
+                    "type": "string",
+                    "description": "Name to store the document under",
+                },
+                "content": {
+                    "type": "string",
+                    "description": "The document's text content (UTF-8)",
+                },
+                "content_type": {
+                    "type": "string",
+                    "description": "MIME type of the content; must be text/* "
+                    "(default text/markdown). Binary types are rejected — use "
+                    "POST /v1/documents for binary uploads.",
+                    "default": "text/markdown",
+                },
+                "workspace_id": {
+                    "type": "string",
+                    "description": "Optional: target workspace. Required if your key "
+                    "has access to more than one workspace.",
+                },
+            },
+            "required": ["api_key", "filename", "content"],
+        },
+        permission="write",
+        handler=_handle_upload_document,
+    ),
+}
+
+# Derived view kept for callers/tests that only need the permission map.
+_TOOL_PERMISSIONS: dict[str, str] = {name: tool.permission for name, tool in _TOOLS.items()}
 
 
 async def run_mcp_server() -> None:

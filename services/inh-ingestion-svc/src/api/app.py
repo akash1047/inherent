@@ -17,8 +17,8 @@ import structlog
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
-from temporalio.client import Client
-from temporalio.exceptions import WorkflowAlreadyStartedError
+from temporalio.client import Client, WorkflowFailureError
+from temporalio.exceptions import TerminatedError, WorkflowAlreadyStartedError
 from temporalio.service import RPCError
 
 from src.api.auth import verify_api_key
@@ -80,7 +80,7 @@ class IngestAcceptedResponse(BaseModel):
 
     workflow_id: str
     document_id: str
-    status: Literal["started", "already_running"] = "started"
+    status: Literal["started", "already_running", "superseded_by_newer_request"] = "started"
 
 
 class IngestResultResponse(BaseModel):
@@ -196,7 +196,7 @@ def create_app(settings: Settings) -> FastAPI:
     app = FastAPI(
         title="Inherent Ingestion Service",
         description="Standalone HTTP API for triggering document ingestion via Temporal.",
-        version="0.4.1",
+        version="0.5.0",
         lifespan=lifespan,
     )
 
@@ -214,7 +214,7 @@ def create_app(settings: Settings) -> FastAPI:
         return HealthResponse(
             status="healthy" if manager.is_running else "degraded",
             temporal_worker=manager.is_running,
-            version="0.4.1",
+            version="0.5.0",
         )
 
     # ------------------------------------------------------------------
@@ -233,7 +233,14 @@ def create_app(settings: Settings) -> FastAPI:
         response_model=IngestAcceptedResponse,
         responses={
             200: {"model": IngestResultResponse, "description": "Completed (wait=true)"},
-            409: {"description": "Workflow already running for this document"},
+            409: {
+                "description": (
+                    "Workflow already running for this document, OR (wait=true only) "
+                    "this run was terminated mid-wait by a newer concurrent request for "
+                    "the same document (#110) -- check GET /ingest/{document_id}/status "
+                    "or the document's own status endpoint for the outcome that won."
+                )
+            },
         },
     )
     async def trigger_ingestion(
@@ -297,7 +304,49 @@ def create_app(settings: Settings) -> FastAPI:
         )
 
         if wait:
-            result: WorkflowResult = await handle.result()
+            # #110 blocker 4: this run can now be terminated out from under us
+            # by an UNRELATED concurrent MQ refresh/re-index for the same
+            # document_id (trigger_workflow_async's supersede_running=True
+            # default, see src/temporal/trigger.py) -- Temporal workflow ids
+            # are global, not scoped to how the run was started. Pre-#110 this
+            # path was safe uncaught: the workflow always caught its own
+            # exceptions and returned WorkflowResult(success=False, ...), so
+            # handle.result() effectively never raised. Post-#110 it can raise
+            # WorkflowFailureError(cause=TerminatedError) here, which without
+            # this except would surface as an unhandled 500. Report it as a
+            # clear 409 instead -- the caller's own request is not what
+            # failed; a newer one for the same document won the race.
+            try:
+                result: WorkflowResult = await handle.result()
+            except WorkflowFailureError as e:
+                if isinstance(e.cause, TerminatedError):
+                    logger.info(
+                        "Ingestion terminated by a newer request for this document",
+                        workflow_id=workflow_id,
+                        document_id=body.document_id,
+                    )
+                    return JSONResponse(
+                        status_code=409,
+                        content=IngestAcceptedResponse(
+                            workflow_id=workflow_id,
+                            document_id=body.document_id,
+                            status="superseded_by_newer_request",
+                        ).model_dump(),
+                    )
+                # Any other WorkflowFailureError (cancellation, timeout) is
+                # unexpected here -- the workflow normally reports its own
+                # failures via WorkflowResult(success=False, ...) rather than
+                # raising. Surface it rather than crashing without a body.
+                logger.error(
+                    "Unexpected workflow failure while waiting for result",
+                    workflow_id=workflow_id,
+                    document_id=body.document_id,
+                    error=str(e.cause),
+                )
+                raise HTTPException(
+                    status_code=500, detail=f"Ingestion workflow failed: {e.cause}"
+                ) from e
+
             return JSONResponse(
                 status_code=200,
                 content=IngestResultResponse(
@@ -358,21 +407,91 @@ def create_app(settings: Settings) -> FastAPI:
     @chunks_router.patch(
         "/{document_id}/{chunk_index}",
         response_model=ChunkEditResponse,
+        responses={404: {"description": "Document not found in the given workspace"}},
     )
     async def edit_chunk(
         document_id: str,
         chunk_index: int,
         body: ChunkEditRequest,
         request: Request,
+        workspace_id: str = Query(..., description="Workspace that must own document_id"),
     ):
-        """Edit a chunk via Temporal workflow (updates PG + re-embeds in Weaviate)."""
+        """Edit a chunk via Temporal workflow (updates PG + re-embeds in Weaviate).
+
+        Security (#134): before this fix, ChunkEditInput left workspace_id/
+        user_id unset, so the Weaviate write derived its collection/tenant
+        from "" -- no tenant scope at all. We now resolve document_id
+        against PostgreSQL and 404 unless its stored workspace_id equals the
+        caller's claimed workspace_id, then forward only the *resolved*
+        workspace_id/user_id (never caller-supplied) into ChunkEditInput, so
+        a self-consistent (document_id, workspace_id) pair always lands the
+        Weaviate write in the document's real tenant instead of "".
+
+        This is workspace<->document CONSISTENCY, not caller<->workspace
+        ENTITLEMENT -- narrower than what it may look like at a glance.
+        verify_api_key is one shared secret with no key->workspace binding
+        (unlike the public API's resolve_workspace_read, which validates
+        that the calling API key's owner is actually entitled to the
+        workspace before ever looking at a document). Here, workspace_id
+        stays entirely caller-asserted: this check only rejects a caller
+        that gets the pairing wrong, not one that already knows a valid
+        (document_id, workspace_id) pair for a workspace it doesn't own --
+        e.g. by reading one out of GET /dead-letter, which returns rows
+        across all workspaces. That gap is tracked separately (#177) and
+        intentionally not folded into this endpoint-level fix.
+        """
+        from src.temporal import shared_services
+
         client: Client = request.app.state.temporal_client
         settings: Settings = request.app.state.settings
+
+        db_svc = shared_services.get_db_service()
+        document = await db_svc.get_document_status(document_id)
+
+        # OWNERSHIP GUARD -- must run, and must keep returning exactly this
+        # response, before ANY other check on `document` (including the
+        # chunk_count check right below). Same response for "no such
+        # document" and "exists in a workspace you don't own" -- a
+        # distinguishable error would leak cross-tenant existence of the
+        # document_id. Do not reorder the chunk_count check above this one:
+        # it also 404s and it also reads from `document`, so swapping the
+        # order would let an attacker distinguish "wrong workspace" from
+        # "chunk_index out of range" for a document it doesn't own --
+        # reintroducing the #134 existence leak this guard exists to close.
+        if document is None or document.get("workspace_id") != workspace_id:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Document {document_id} not found in workspace {workspace_id}.",
+            )
+
+        # Reject an out-of-range chunk_index before doing any more work
+        # (#134 follow-up item 8): get_document_status already returned
+        # chunk_count for free, so this costs zero extra queries, and it
+        # saves a wasted embed_text round-trip (and, pre-the-#137-fix, a
+        # confusingly "successful" no-op) for a chunk that was never going
+        # to exist. NOTE: chunk_count is nullable (Column default=0, but the
+        # column itself allows NULL) and is legitimately 0 for a document
+        # that's still `pending`/`processing` -- every chunk_index 404s in
+        # that case, which is CORRECT (there is nothing to edit yet), not a
+        # symptom of the ownership guard above misfiring. This check only
+        # runs once ownership is already proven, so it is a distinct 404
+        # from the one above, not a workspace-scoping bug.
+        chunk_count = document.get("chunk_count") or 0
+        if chunk_index < 0 or chunk_index >= chunk_count:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"Chunk {chunk_index} not found for document {document_id} "
+                    f"(document has {chunk_count} chunks)."
+                ),
+            )
 
         workflow_input = ChunkEditInput(
             document_id=document_id,
             chunk_index=chunk_index,
             content=body.content,
+            workspace_id=document["workspace_id"],
+            user_id=document["user_id"],
         )
 
         workflow_id = f"chunk-edit-{document_id}-{chunk_index}"
@@ -585,11 +704,20 @@ def create_app(settings: Settings) -> FastAPI:
         # Increment retry count
         await db_svc.increment_dead_letter_retry(job_id)
 
-        # Re-trigger workflow
+        # Re-trigger workflow. supersede_running=False (#110 blocker 3): this
+        # replays a POTENTIALLY STALE payload (whatever failed and got
+        # dead-lettered, possibly long ago). If a healthy, newer run for the
+        # same document_id is meanwhile in flight (e.g. the user re-uploaded
+        # corrected content after the original failure), superseding it would
+        # silently terminate that newer run and overwrite it with this old
+        # payload. Keeping the default (raise-on-collision) behavior here
+        # means that case surfaces as the 500 below instead.
         original_message = job.get("original_message", {})
         trigger = request.app.state.trigger
         try:
-            workflow_id = await trigger.trigger_workflow_async(original_message)
+            workflow_id = await trigger.trigger_workflow_async(
+                original_message, supersede_running=False
+            )
             return {"retried": True, "job_id": job_id, "new_workflow_id": workflow_id}
         except Exception as e:
             # Reset status back to pending on failure

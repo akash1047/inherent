@@ -1,3 +1,8 @@
+---
+search:
+  exclude: true
+---
+
 # Org-Readiness Requirements
 
 **Status:** Draft · **Owner:** maintainers · **Last updated:** 2026-06-20

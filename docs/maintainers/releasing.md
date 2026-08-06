@@ -1,3 +1,8 @@
+---
+search:
+  exclude: true
+---
+
 # Releasing
 
 This repository does not assume an automated release train.
@@ -21,8 +26,27 @@ This repository does not assume an automated release train.
    locally via `make dev` + `make test-integration`).
 3. Confirm the latest `integration.yml` (Compose e2e gate) and coverage floors
    are green in CI.
-4. Summarize user-visible changes in the release notes or tag message.
-5. Tag from a clean commit history that does not include private planning artifacts.
+4. Cut the changelog: rename `[Unreleased]` in `CHANGELOG.md` to
+   `[X.Y.Z] — YYYY-MM-DD` (bare version + date — no codename or theme) and
+   add a fresh empty `[Unreleased]` above it. Thanks to the CLAUDE.md
+   release-tagging rule, every shipped change is already listed — do not
+   reconstruct history at release time.
+5. Tag from a clean commit history that does not include unpublished or private planning artifacts (`docs/superpowers/` specs and plans are public by policy).
+6. Publish the GitHub Release after pushing the final tag:
+   ```bash
+   gh release create vX.Y.Z --verify-tag \
+     --title "vX.Y.Z" \
+     --notes-file <notes.md>
+   ```
+   The title is the bare tag — no codename, no theme, no ` — <name>` suffix.
+   The notes body is the changelog section condensed to one-line bullets:
+   lead with a package-versions line, then Added/Changed/Fixed/Security/
+   Breaking/Upgrade category headings (each bullet ending `(#PR)`), and close
+   with a link to `CHANGELOG.md`. No prose intro, no TL;DR, no emoji beyond
+   `⚠️` on breaking bullets — an agent should be able to scan it. `-rcN` tags
+   get `--prerelease`.
+7. Verify the `Docs` workflow deployed green on `main` and the site's
+   Release Notes page shows the new version.
 
 The full set of gating suites, coverage floors, and the README-claim → test
 mapping is in the
@@ -76,8 +100,53 @@ job runs without pausing.
 4. In both cases, the workflow pauses on the `release-publish` environment until
    a reviewer approves the run in the **Actions** tab. Nothing is pushed to GHCR
    without that approval.
+5. After a **successful** Publish images run on a **final** `vX.Y.Z` tag (not
+   `-rcN`), [Hetzner e2e](https://github.com/inherent-prime/inherent/blob/main/.github/workflows/hetzner-e2e.yml) starts via
+   `workflow_run`. It pins the same release for checkout, GHCR image tag
+   `X.Y.Z`, and compose `compose_git_ref` (the tag). RC tags skip e2e.
+6. Re-run manually: Actions → **Hetzner e2e** → **Run workflow**. Form fields
+   and examples (Use workflow from vs `ref`, image tag, `cpx32`) live in
+   [infra/README.md § Manual run](https://github.com/inherent-prime/inherent/blob/main/infra/README.md#manual-run-github-form).
+   Short form: required `ref` (checkout + compose; must include `infra/`);
+   optional `inherent_version` (GHCR tag; empty = strip leading `v` from `ref`);
+   `server_type` default `cpx32`.
+7. **Publish a GitHub Release from the final tag** (Releases → Draft a new
+   release → pick `vX.Y.Z`). Title it `vX.Y.Z — <theme>` and paste the tag
+   message plus a link to the matching `CHANGELOG.md` entry. Writing notes into
+   the tag message or CHANGELOG alone does not make them visible — the
+   Releases tab is where consumers actually look, and the tagged git object
+   and GHCR package page do not surface either on their own (#112).
 
 `make release-images` prints these steps.
+
+### Hetzner / act e2e image parity
+
+Hetzner e2e and local `act` pull **published**
+`ghcr.io/inherent-prime/public-api-svc:${INHERENT_VERSION:-latest}` — not
+workspace source.
+
+If Weaviate has API-key auth enabled (release compose) but the image’s
+`SearchService` does not send `Authorization: Bearer`, compose e2e fails with
+public-api 500 / Weaviate 401. See
+[`docs/audit/act-hetzner-e2e-weaviate-401.md`](../audit/act-hetzner-e2e-weaviate-401.md).
+
+**Republish:** run workflow **Publish images** via `workflow_dispatch` (or push
+a `v*` tag). Publish requires `release-publish` environment approval. Prefer
+also republishing `ingestion-svc` in the same workflow run (matrix already
+builds both).
+
+**Smoke (required before re-running act):**
+
+```bash
+docker pull ghcr.io/inherent-prime/public-api-svc:latest
+docker run --rm --entrypoint grep \
+  ghcr.io/inherent-prime/public-api-svc:latest \
+  -n 'Bearer {self._api_key}' \
+  /app/services/inh-public-api-svc/src/services/search.py
+```
+
+Expect a matching line. No match → do not run Hetzner e2e; republish from
+current `main` first.
 
 ## Documentation Rule
 

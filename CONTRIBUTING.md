@@ -4,8 +4,8 @@ Thanks for contributing to the Inherent OSS core.
 
 ## Before You Start
 
-- Read the root [README.md](README.md) for repository scope.
-- Read [ADR 0001 — Agent Memory Substrate](docs/adr/0001-agent-memory-substrate.md) for the product boundary, guarantees, and non-goals before proposing larger changes. The [org-readiness requirements](docs/maintainers/org-readiness-requirements.md) map the issue backlog to that boundary.
+- Read the root [README.md](https://github.com/inherent-prime/inherent/blob/main/README.md) for repository scope.
+- Read [ADR 0001 — Agent Memory Substrate](https://github.com/inherent-prime/inherent/blob/main/docs/adr/0001-agent-memory-substrate.md) for the product boundary, guarantees, and non-goals before proposing larger changes. The [org-readiness requirements](https://github.com/inherent-prime/inherent/blob/main/docs/maintainers/org-readiness-requirements.md) map the issue backlog to that boundary.
 - Keep changes aligned with the OSS boundary. Do not add internal tooling, secrets, or private operational workflows.
 - Prefer small pull requests with a clear problem statement.
 
@@ -36,11 +36,11 @@ available below when you only need to touch one service.
 
 ### Pre-commit Hooks
 
-The repository root has a canonical [`.pre-commit-config.yaml`](.pre-commit-config.yaml)
+The repository root has a canonical [`.pre-commit-config.yaml`](https://github.com/inherent-prime/inherent/blob/main/.pre-commit-config.yaml)
 that runs shared file hygiene plus per-service Ruff + Black (and mypy + Bandit
 for the public API), each scoped to its service directory. Hooks shell out to
 `uv run`, so they use the pinned tool versions documented in
-[docs/developer/dependencies.md](docs/developer/dependencies.md).
+[docs/developer/dependencies.md](https://github.com/inherent-prime/inherent/blob/main/docs/developer/dependencies.md).
 
 Install the git hook once (any service venv works — `pre-commit` is a dev dep in
 all of them):
@@ -61,7 +61,7 @@ files you changed.
 
 ### Testing Profiles
 
-See [docs/testing.md](docs/testing.md) for the full test profiles and markers
+See [docs/testing.md](https://github.com/inherent-prime/inherent/blob/main/docs/testing.md) for the full test profiles and markers
 (fast unit, default offline, Compose e2e, and the specialized
 security/contract/eval/benchmark/retrieval_eval/failure_injection markers).
 Quick reference:
@@ -170,8 +170,8 @@ graphify .
 ## Issue Reports
 
 - Use GitHub issues for reproducible bugs and scoped feature requests.
-- Use [SUPPORT.md](SUPPORT.md) for usage questions and general support routes.
-- Use [SECURITY.md](SECURITY.md) for vulnerability reporting.
+- Use [SUPPORT.md](https://github.com/inherent-prime/inherent/blob/main/SUPPORT.md) for usage questions and general support routes.
+- Use [SECURITY.md](https://github.com/inherent-prime/inherent/blob/main/SECURITY.md) for vulnerability reporting.
 
 ## Scope Guidelines
 

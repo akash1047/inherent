@@ -18,6 +18,8 @@ Run the live benchmarks with::
 from __future__ import annotations
 
 import concurrent.futures
+import json
+import os
 import time
 
 import httpx
@@ -25,10 +27,16 @@ import pytest
 
 from tests.benchmark.run_search_benchmark import (
     BenchmarkSummary,
+    git_sha,
     percentile,
     run_one_search,
     summarize,
+    write_benchmark_report,
 )
+
+# Where the live benchmark tests write their JSON summary (REQ-EVL-3), picked
+# up by CI as an artifact the same way eval-report.json is (EVAL_REPORT env).
+BENCHMARK_REPORT = os.environ.get("BENCHMARK_REPORT", "search-benchmark-report.json")
 
 # Loose SLOs — generous so neither CI nor local laptops flake.
 P95_LATENCY_SLO_MS = 2000.0
@@ -97,6 +105,40 @@ def test_summarize_rejects_empty() -> None:
         summarize([], wall_time_s=1.0)
 
 
+def test_git_sha_prefers_github_sha_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GITHUB_SHA", "deadbeef")
+    assert git_sha() == "deadbeef"
+
+
+def test_write_benchmark_report_creates_file(tmp_path) -> None:
+    report_path = tmp_path / "report.json"
+    write_benchmark_report(report_path, "search_latency", {"p50_ms": 12.5})
+
+    written = json.loads(report_path.read_text())
+    assert written["search_latency"]["p50_ms"] == 12.5
+    assert "git_sha" in written["search_latency"]
+
+
+def test_write_benchmark_report_merges_existing_keys(tmp_path) -> None:
+    report_path = tmp_path / "report.json"
+    write_benchmark_report(report_path, "search_latency", {"p50_ms": 12.5})
+    write_benchmark_report(report_path, "search_throughput", {"qps": 42.0})
+
+    written = json.loads(report_path.read_text())
+    assert written["search_latency"]["p50_ms"] == 12.5
+    assert written["search_throughput"]["qps"] == 42.0
+
+
+def test_write_benchmark_report_survives_corrupt_existing_file(tmp_path) -> None:
+    report_path = tmp_path / "report.json"
+    report_path.write_text("not valid json{{{")
+
+    write_benchmark_report(report_path, "search_latency", {"p50_ms": 5.0})
+
+    written = json.loads(report_path.read_text())
+    assert written["search_latency"]["p50_ms"] == 5.0
+
+
 # ---------------------------------------------------------------------------
 # Live-stack benchmarks (deselected by default).
 # ---------------------------------------------------------------------------
@@ -112,6 +154,18 @@ def test_search_latency_p50_p95(client: httpx.Client, api_url: str, headers: dic
         f"\nsearch latency over {summary.count} queries: "
         f"p50={summary.p50_ms:.1f}ms p95={summary.p95_ms:.1f}ms "
         f"p99={summary.p99_ms:.1f}ms min={summary.min_ms:.1f}ms max={summary.max_ms:.1f}ms"
+    )
+    write_benchmark_report(
+        BENCHMARK_REPORT,
+        "search_latency",
+        {
+            "count": summary.count,
+            "p50_ms": summary.p50_ms,
+            "p95_ms": summary.p95_ms,
+            "p99_ms": summary.p99_ms,
+            "min_ms": summary.min_ms,
+            "max_ms": summary.max_ms,
+        },
     )
     assert (
         summary.p95_ms < P95_LATENCY_SLO_MS
@@ -137,6 +191,15 @@ def test_search_throughput(client: httpx.Client, api_url: str, headers: dict) ->
     print(
         f"\nsearch throughput: {summary.qps:.2f} QPS over {summary.count} requests "
         f"at concurrency {THROUGHPUT_CONCURRENCY} (wall {wall:.2f}s)"
+    )
+    write_benchmark_report(
+        BENCHMARK_REPORT,
+        "search_throughput",
+        {
+            "count": summary.count,
+            "qps": summary.qps,
+            "concurrency": THROUGHPUT_CONCURRENCY,
+        },
     )
     assert (
         summary.qps > MIN_THROUGHPUT_QPS
