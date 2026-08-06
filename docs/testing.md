@@ -16,7 +16,7 @@ that don't belong to any one package:
 Every test command below assumes you have synced dev dependencies first:
 
 ```bash
-make install      # syncs dev deps for both Python services
+make install      # syncs dev deps for all three Python packages (public-api, ingestion, inh-contracts)
 # or, per service:
 cd services/<svc> && uv sync --extra dev --group dev
 ```
@@ -24,6 +24,27 @@ cd services/<svc> && uv sync --extra dev --group dev
 Tool versions (pytest, pytest-asyncio, pytest-cov, ruff, black, mypy, bandit)
 are normalized across all three services — see
 [docs/developer/dependencies.md](developer/dependencies.md).
+
+## Postgres and what a local run actually covers
+
+`ci.yml` runs `service-checks` with a live Postgres service container. Locally,
+without Postgres up, both services' suites **skip** (not fail) every test
+that needs a database connection, with reason `PostgreSQL not available` — a
+local `make test`/`make check` green does **not** mean the full offline suite
+ran. Measured on a laptop with no Postgres: `inh-ingestion-svc` alone shows
+**382 passed, 365 skipped** (357 of those skips are `PostgreSQL not
+available`). To run the full suite locally (matching CI), start Postgres
+first, e.g. `docker compose up -d postgres` or `make dev`, then re-run
+`uv run pytest` (or `make test`) against that database.
+
+## Expected runtime
+
+`make test` takes **~6m10s** wall time (measured with no Postgres up):
+`inh-ingestion-svc` 24.8s (382 passed, 365 skipped), `inh-public-api-svc`
+5m37s (864 passed), `inh-contracts` 0.4s (154 passed), root `tests/` <0.1s (2
+passed) — public-api dominates the wall time. If your shell or agent harness
+defaults to a ~2-minute command timeout, raise it or run `make test` in the
+background before invoking it; it will not finish inside a default timeout.
 
 ## Default behavior
 
@@ -37,7 +58,16 @@ Run these from the relevant service directory (`cd services/<svc>`).
 
 ### Fast unit (innermost loop)
 
-Skips Compose, slow, and benchmark tests — the quickest signal:
+Skips Compose, slow, and benchmark tests. In `inh-public-api-svc` this marker
+filter excludes almost nothing — measured, `make test-fast` runs the
+**identical 864 tests** as the default profile there and finishes in
+**~5m44s**, only ~26s faster than `make test`'s 6m10s. Despite the name, this
+is not a quick local loop; treat the timeout guidance in
+[Expected runtime](#expected-runtime) the same way you would for `make test`.
+Coverage collection (on by default) is the actual cost, not the marker
+filter: `uv run pytest --no-cov` measured at **2m56s** for public-api versus
+**5m37s** with coverage on — pass `--no-cov` yourself for a fast inner loop;
+no Make target does this for you today.
 
 ```bash
 uv run pytest -m 'not compose and not slow and not benchmark'
@@ -46,7 +76,8 @@ uv run pytest -m 'not compose and not slow and not benchmark'
 Repo-wide shortcut:
 
 ```bash
-make test-fast        # runs the fast profile across both services
+make test-fast         # runs the fast profile across both services, inh-contracts, and root tests/
+                        # -- NOT meaningfully faster than `make test`; see above
 ```
 
 ### Default (offline)

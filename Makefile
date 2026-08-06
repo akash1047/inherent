@@ -151,12 +151,15 @@ test:
 	@uvx 'pytest==9.0.2' tests/ -q
 
 ## test-fast: Fast offline unit profile for both services (no compose/slow/benchmark).
-##            inh-contracts has no such markers, so it always runs in full --
-##            it takes well under a second either way.
+##            inh-contracts and the root suite have no such markers, so they
+##            always run in full -- both take well under a second either way,
+##            and skipping the root suite here would let a docker-compose.yml
+##            init regression through the innermost loop uncaught.
 test-fast:
 	@cd $(INGESTION_DIR) && uv run pytest -m 'not compose and not slow and not benchmark'
 	@cd $(PUBLIC_API_DIR) && uv run pytest -m 'not compose and not slow and not benchmark'
 	@cd $(CONTRACTS_DIR) && uv run pytest
+	@uvx 'pytest==9.0.2' tests/ -q
 
 ## test-integration: Run Compose-backed integration tests (requires a running stack).
 test-integration:
