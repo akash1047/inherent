@@ -182,15 +182,32 @@ class TestToolSchemas:
         assert props["chunk_id"]["type"] == "string"
 
     async def test_upload_document_schema_types(self):
-        """content_type is optional and defaults to text/markdown (text-only,
-        binary uploads stay REST-only by design, #87)."""
+        """content_type is optional (text-only, binary uploads stay REST-only
+        by design, #87). It carries NO schema `default` (#193 coordinator
+        review): a JSON Schema `default` is advertised to the CLIENT, and
+        many MCP clients/tool-calling layers pre-fill an omitted argument
+        from its advertised default before the server ever sees the call --
+        which would turn #197's filename-extension derivation into a fixed
+        "text/markdown" for every upload regardless of the real extension,
+        the exact defect #197 fixed. The fallback-to-text/markdown behavior
+        for an unrecognized/absent extension is documented in
+        `content_type`'s description text instead, which does not get
+        auto-populated onto omitted calls. See
+        `test_omitted_content_type_derives_from_filename_extension` and
+        `test_explicit_content_type_is_never_overridden_by_extension` below
+        for the behavior this schema shape protects."""
         tools = await _list_tools()
         schema = tools["upload_document"].inputSchema
         props = schema["properties"]
         assert props["filename"]["type"] == "string"
         assert props["content"]["type"] == "string"
         assert props["content_type"]["type"] == "string"
-        assert props["content_type"]["default"] == "text/markdown"
+        assert "default" not in props["content_type"], (
+            "content_type must not carry a schema 'default' -- see the "
+            "docstring above for why a client-visible default reintroduces "
+            "#197's bug for every MCP client that auto-fills omitted args "
+            "from their advertised default."
+        )
         assert "content_type" not in schema["required"]
         assert "workspace_id" in props
 
@@ -912,6 +929,63 @@ class TestUploadDocumentTool:
         stored_content_type = db.create_or_reset_pending_document.call_args.kwargs["content_type"]
         assert stored_content_type == "text/x-go"
         assert stored_content_type != "text/x-python"
+
+    async def test_explicit_content_type_is_never_overridden_by_extension(self):
+        """Coordinator adversarial-review regression pin (#193 blocker): an
+        EXPLICITLY declared content_type must always be honored as-is, even
+        when it disagrees with what the filename's extension would have
+        derived. This is the deliberate flip side of removing the schema's
+        `"default": "text/markdown"` -- that default was REMOVED (not just
+        left undocumented) specifically because a JSON Schema `default` is
+        advertised to the CLIENT, and several real MCP clients / tool-calling
+        layers pre-fill an omitted argument from its advertised default
+        before the server ever observes an omission. With the default
+        present, `content_type = declared_content_type or
+        _default_upload_content_type(filename)` received an explicit
+        "text/markdown" for EVERY upload whose caller omitted content_type
+        (not just genuinely-ambiguous ones), short-circuiting #197's
+        extension derivation entirely -- reproduced on this repo pre-fix:
+        uploading `main.go` this way stored content_type=text/markdown /
+        chunking_hint=prose instead of text/x-go / code.
+
+        Decision (explicit stated by review): an explicit declaration is
+        NEVER second-guessed against the filename -- this test pins that a
+        caller who legitimately wants "text/markdown" for a .go file (e.g.
+        a markdown-fenced code snippet saved with a misleading name) still
+        gets it. `check_extension_consistency` only rejects a BINARY-format
+        extension (`magic is not None`) declared under a mismatched type;
+        .go's "code" spec has no magic signature, so any declared text
+        content_type is accepted for it by design (see that function's own
+        docstring)."""
+        db = AsyncMock()
+        db.validate_api_key = AsyncMock(return_value=self._key())
+        db.get_user_workspace_ids = AsyncMock(return_value=["ws-1"])
+        db.get_document_id_by_content_hash = AsyncMock(return_value=None)
+        db.get_document_id_by_filename = AsyncMock(return_value=None)
+        db.create_or_reset_pending_document = AsyncMock(return_value=None)
+
+        storage = self._storage()
+        mq = self._mq()
+        p1, p2 = self._intake_patches(storage, mq)
+
+        with patch.object(mcp_server, "get_database", AsyncMock(return_value=db)), p1, p2:
+            content = await _call_tool(
+                "upload_document",
+                {
+                    "api_key": "x",
+                    "filename": "main.go",
+                    "content": "package main\n",
+                    "content_type": "text/markdown",
+                },
+            )
+
+        assert not content[0].text.startswith("Error"), content[0].text
+        stored_content_type = db.create_or_reset_pending_document.call_args.kwargs["content_type"]
+        assert stored_content_type == "text/markdown", (
+            "an EXPLICIT content_type must be honored as-is, never re-derived "
+            "from the filename extension"
+        )
+        assert stored_content_type != "text/x-go"
 
     async def test_legacy_doc_rejected_with_explicit_content_type(self):
         """#124/#126 review blocker 3: application/msword must get the same
