@@ -7,6 +7,18 @@ All notable changes to Inherent are documented here. The format follows
 
 ### Added
 
+- **`workspace_ownership_lookup_degraded_total` metric for
+  inh-public-api-svc's workspace-ownership lookups (#184).**
+  `DatabaseService.get_user_workspace_ids`'s Mongo and Postgres-fallback
+  sub-lookups, and `user_owns_workspace_in_mongo`'s raise-on-failure check,
+  now bump this counter (labeled `source`: `mongo` / `postgres_fallback` /
+  `mongo_ownership_check`) alongside their existing log line, mirroring the
+  `AUDIT_MESSAGES_DROPPED_TOTAL` precedent (inh-ingestion-svc, #18). Before
+  this, a degraded lookup was warning-log-only and could run degraded
+  indefinitely with nothing to alert on. Metric emission is
+  observability-only and never changes the swallow-vs-raise behavior of
+  either call path.
+
 - **XLSX and PPTX upload/extraction support (#118, #119).** Both are now
   `FILE_TYPE_REGISTRY` entries (#117): XLSX
   (`application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`,
@@ -655,6 +667,21 @@ All notable changes to Inherent are documented here. The format follows
   and no record. (#137)
 
 ### Security
+
+- **MCP's `call_tool` dispatcher now checks `key_info.is_expired()` itself,
+  closing a dispatcher-level failure-parity gap with REST (#180).** REST's
+  `require_api_key` (`services/inh-public-api-svc/src/services/auth.py`)
+  re-checks expiry after `validate_api_key` returns, rather than trusting the
+  DB layer alone. MCP's dispatcher
+  (`services/inh-public-api-svc/src/mcp_server/server.py`) previously
+  dispatched straight to the tool handler once `validate_api_key` returned a
+  non-`None` key, trusting every current and future `DatabaseService`
+  implementation to independently filter expired rows. The real
+  Postgres-backed implementation already does this (so it was not
+  exploitable through it), but any alternate implementation that returned an
+  already-expired `key_info` would have been silently accepted by MCP while
+  the identical request was correctly rejected by REST. Pinned in
+  `tests/contract/test_failure_parity.py::TestExpiredKeyDispatcherParity`.
 
 - **Seven more inh-ingestion-svc endpoints trusted a caller-supplied
   `workspace_id`/`document_id`/`job_id` with no ownership check, closing the

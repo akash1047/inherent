@@ -25,8 +25,14 @@ import pytest
 from src.models.api_key import APIKeyInfo
 from src.services.auth import get_authorized_workspace_ids
 from src.services.database import DatabaseService
+from src.services.metrics import workspace_ownership_lookup_degraded_total
 
 pytestmark = pytest.mark.asyncio
+
+
+def _degraded_count(source: str) -> float:
+    """Current value of the #184 degraded-lookup counter for one source label."""
+    return workspace_ownership_lookup_degraded_total.labels(source=source)._value.get()
 
 
 class _FakeCursor:
@@ -246,3 +252,111 @@ async def test_mongo_failure_during_ownership_check_raises_not_swallows():
     ):
         with pytest.raises(ConnectionError):
             await database.user_owns_workspace_in_mongo("user-1", "ws-a")
+
+
+# ---------------------------------------------------------------------------
+# #184: the log-and-swallow / raise paths above must also be observable via
+# metric, not just a warning log or the exception itself. These drive the
+# REAL DatabaseService methods (same rationale as the rest of this file) with
+# only the Mongo/Postgres driver internals faked, so a regression that
+# reintroduces a silent swallow (or drops the metric bump on the raise path)
+# shows up here even though every input mock stays "correctly" configured.
+# ---------------------------------------------------------------------------
+
+
+async def test_mongo_workspace_listing_failure_increments_degraded_metric():
+    """get_user_workspace_ids's Mongo branch log-and-swallows a Mongo failure
+    (a listing convenience, unlike user_owns_workspace_in_mongo's raise) --
+    but the swallow must be observable as a RATE, not just a warning log,
+    mirroring AUDIT_MESSAGES_DROPPED_TOTAL (inh-ingestion-svc, #18)."""
+    database = DatabaseService()
+    database.session_factory = _fake_pg_history([])  # PG fallback: empty, no error
+
+    class _ExplodingCollection:
+        def find(self, _filter, _projection=None):
+            raise ConnectionError("mongo is down")
+
+    class _ExplodingDB:
+        def __getitem__(self, name):
+            assert name == "workspaces"
+            return _ExplodingCollection()
+
+    class _ExplodingClient:
+        def __getitem__(self, _name):
+            return _ExplodingDB()
+
+    before = _degraded_count("mongo")
+
+    with patch(
+        "src.services.mongo_client.get_mongo_client",
+        return_value=_ExplodingClient(),
+    ):
+        # The swallow means this must still return normally (empty set, since
+        # the PG fallback above is also empty) -- not raise. Metric emission
+        # must not change that behavior (CLAUDE.md: a metric emission failing
+        # must not break the request -- here it's the metric SUCCEEDING that
+        # must not change the swallow's own semantics).
+        result = await database.get_user_workspace_ids("user-1")
+
+    assert result == []
+    assert _degraded_count("mongo") == before + 1
+
+
+async def test_pg_workspace_fallback_failure_increments_degraded_metric():
+    """Twin of the Mongo test above: the PG-fallback branch's own swallow
+    must also be observable, with its own distinct label so the two failure
+    sources aren't conflated on a dashboard."""
+    database = DatabaseService()
+    mongo = _FakeMongoCollection(find_docs=[], find_one_result=None)
+
+    class _ExplodingSessionCM:
+        async def __aenter__(self):
+            raise ConnectionError("db degraded")
+
+        async def __aexit__(self, *_exc):
+            return False
+
+    database.session_factory = lambda: _ExplodingSessionCM()
+    before = _degraded_count("postgres_fallback")
+
+    with patch(
+        "src.services.mongo_client.get_mongo_client",
+        return_value=_FakeMongoClient(mongo),
+    ):
+        result = await database.get_user_workspace_ids("user-1")
+
+    assert result == []
+    assert _degraded_count("postgres_fallback") == before + 1
+
+
+async def test_mongo_ownership_check_failure_increments_metric_before_raising():
+    """#184: the raise path doesn't swallow (#138 blocker-2, still true) but
+    now ALSO increments the degraded-lookup counter, with its OWN label
+    (never conflated with the listing-convenience "mongo" label above), before
+    propagating -- so a spike in these raises is visible on a dashboard, not
+    only as scattered 5xx/error responses across every scoped-key request."""
+    database = DatabaseService()
+
+    class _ExplodingCollection:
+        async def find_one(self, _filter):
+            raise ConnectionError("mongo is down")
+
+    class _ExplodingDB:
+        def __getitem__(self, name):
+            assert name == "workspaces"
+            return _ExplodingCollection()
+
+    class _ExplodingClient:
+        def __getitem__(self, _name):
+            return _ExplodingDB()
+
+    before = _degraded_count("mongo_ownership_check")
+
+    with patch(
+        "src.services.mongo_client.get_mongo_client",
+        return_value=_ExplodingClient(),
+    ):
+        with pytest.raises(ConnectionError):
+            await database.user_owns_workspace_in_mongo("user-1", "ws-a")
+
+    assert _degraded_count("mongo_ownership_check") == before + 1

@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from src.config import settings
 from src.models.api_key import APIKeyInfo
 from src.models.document import Document, DocumentChunk
+from src.services.metrics import record_workspace_ownership_lookup_degraded
 from src.utils import get_logger
 
 if TYPE_CHECKING:
@@ -816,6 +817,11 @@ class DatabaseService:
                 user_id=user_id,
                 error=str(exc),
             )
+            # Make the degraded lookup observable (#184) — a warning log
+            # alone can run degraded indefinitely with nothing to alert on,
+            # the same gap AUDIT_MESSAGES_DROPPED_TOTAL (inh-ingestion-svc,
+            # #18) closed for the audit consumer's own drop-on-swallow path.
+            record_workspace_ownership_lookup_degraded(source="mongo")
 
         # Fallback: any workspace the user has uploaded to in PG. Catches
         # legacy data + cushions a transient Mongo outage.
@@ -839,6 +845,8 @@ class DatabaseService:
                 user_id=user_id,
                 error=str(exc),
             )
+            # Same observability gap as the Mongo branch above (#184).
+            record_workspace_ownership_lookup_degraded(source="postgres_fallback")
 
         return list(ws_ids)
 
@@ -893,13 +901,22 @@ class DatabaseService:
 
         client = get_mongo_client()
         db = client[settings.mongodb_db_name]
-        # No try/except here — a Mongo failure must propagate (see docstring).
-        doc = await db["workspaces"].find_one(
-            {
-                "_id": {"$in": workspace_id_filters},
-                "user_id": {"$in": user_id_filters},
-            }
-        )
+        try:
+            doc = await db["workspaces"].find_one(
+                {
+                    "_id": {"$in": workspace_id_filters},
+                    "user_id": {"$in": user_id_filters},
+                }
+            )
+        except Exception:
+            # Still propagates — a Mongo failure must reach the caller (see
+            # docstring); this is NOT a swallow. Only makes the failure
+            # observable as a RATE (#184) before the bare `raise` re-raises
+            # the original exception with its original traceback, so callers
+            # (get_authorized_workspace_ids) see the exact same exception as
+            # before this metric existed.
+            record_workspace_ownership_lookup_degraded(source="mongo_ownership_check")
+            raise
         return doc is not None
 
     # Multi-workspace document queries
