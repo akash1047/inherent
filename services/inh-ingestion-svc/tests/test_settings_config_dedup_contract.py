@@ -45,6 +45,7 @@ def cleanup_test_data():
     """No-op override so this module's tests run without a live database."""
     yield
 
+
 # Golden values, kept identical to the public-api service's copy on purpose:
 # these two constants are the cross-service contract.
 GOLDEN_EMBEDDING_URL = "http://text-embeddings-inference:80"

@@ -1134,9 +1134,8 @@ class DatabaseService:
 
         with self.get_session() as session:
             row = session.execute(
-                self.processed_documents.select().with_only_columns(
-                    self.processed_documents.c.active_run_id
-                )
+                self.processed_documents.select()
+                .with_only_columns(self.processed_documents.c.active_run_id)
                 .where(self.processed_documents.c.document_id == document_id)
             ).first()
 

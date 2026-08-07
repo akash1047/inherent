@@ -1034,9 +1034,7 @@ class TestExpiredKeyDispatcherParity:
         # exactly the alternate-backend scenario #180 describes.
         db.validate_api_key = AsyncMock(return_value=self._expired_key())
 
-        result = await _call_mcp_tool(
-            "list_documents", {"api_key": "ink_expired"}, db
-        )
+        result = await _call_mcp_tool("list_documents", {"api_key": "ink_expired"}, db)
 
         # Byte-for-byte the same wording REST's require_api_key raises for an
         # expired key (src/services/auth.py), just "Error: "-prefixed per the
@@ -1055,8 +1053,6 @@ class TestExpiredKeyDispatcherParity:
         db = _mock_db()
         db.get_documents_multi_workspace = AsyncMock(return_value=([], 0))
 
-        result = await _call_mcp_tool(
-            "list_documents", {"api_key": "ink_k"}, db
-        )
+        result = await _call_mcp_tool("list_documents", {"api_key": "ink_k"}, db)
 
         assert "Error" not in result[0].text

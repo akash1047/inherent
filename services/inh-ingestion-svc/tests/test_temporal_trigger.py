@@ -531,9 +531,7 @@ class TestWorkflowIdConflictPolicySupersedesStaleRun:
         assert kwargs.get("id_conflict_policy") == WorkflowIDConflictPolicy.TERMINATE_EXISTING
 
     @pytest.mark.asyncio
-    async def test_async_trigger_supersedes_a_still_open_prior_run(
-        self, sample_upload_message
-    ):
+    async def test_async_trigger_supersedes_a_still_open_prior_run(self, sample_upload_message):
         """Behavioral regression guard for the actual stall (#110).
 
         Fakes the real Temporal server contract: a start_workflow call for an

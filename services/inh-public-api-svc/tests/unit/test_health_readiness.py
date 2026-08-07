@@ -75,7 +75,9 @@ async def test_weaviate_check_passes_configured_timeout_to_is_connected():
     mock_search_service = AsyncMock()
     mock_search_service.is_connected = AsyncMock(return_value=True)
 
-    with patch.object(health_mod, "get_search_service", AsyncMock(return_value=mock_search_service)):
+    with patch.object(
+        health_mod, "get_search_service", AsyncMock(return_value=mock_search_service)
+    ):
         await health_mod._check_weaviate()
 
     mock_search_service.is_connected.assert_awaited_once_with(

@@ -159,9 +159,7 @@ async def _check_weaviate() -> ComponentHealth:
         # is_connected's own timeout handling is ever bypassed) -- see
         # SearchService.is_connected's docstring (#203).
         is_connected = await asyncio.wait_for(
-            search_service.is_connected(
-                timeout=settings.weaviate_health_check_timeout_seconds
-            ),
+            search_service.is_connected(timeout=settings.weaviate_health_check_timeout_seconds),
             timeout=settings.weaviate_health_check_timeout_seconds,
         )
 

@@ -323,9 +323,9 @@ class TestExtractTextActivity:
             "JSON extraction failed: could not parse the document (Expecting value: line 1 column 1 (char 0)).",
         ]
         for message in messages:
-            assert DocumentIngestionWorkflow._classify_error(message) == "extraction_failed", (
-                message
-            )
+            assert (
+                DocumentIngestionWorkflow._classify_error(message) == "extraction_failed"
+            ), message
 
     def test_legacy_xls_content_type_is_unregistered(self):
         """#118: legacy .xls (application/vnd.ms-excel, OLE2 binary format --

@@ -134,9 +134,9 @@ def test_stale_reindex_does_not_clobber_a_newer_one(client: httpx.Client):
     assert body.get("chunk_count", 0) >= 1
 
     text = _full_text(client, doc_id)
-    assert "VERSION-3" in text, (
-        f"expected the LAST re-upload's content to have won, got: {text[:200]!r}"
-    )
+    assert (
+        "VERSION-3" in text
+    ), f"expected the LAST re-upload's content to have won, got: {text[:200]!r}"
     assert "VERSION-2" not in text
 
     # The regression this pins: pre-fencing, VERSION-2's terminated run kept

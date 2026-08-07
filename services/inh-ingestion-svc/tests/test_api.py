@@ -411,9 +411,9 @@ class TestIngestTrigger:
             json=example,
             headers={"X-API-Key": VALID_API_KEY},
         )
-        assert resp.status_code == 202, (
-            f"IngestRequest's own documented example was rejected: {resp.json()}"
-        )
+        assert (
+            resp.status_code == 202
+        ), f"IngestRequest's own documented example was rejected: {resp.json()}"
 
 
 # ---------------------------------------------------------------------------
@@ -539,9 +539,7 @@ class TestDeadLetterRetrySupersedePolicy:
         _, kwargs = fake_trigger.trigger_workflow_async.await_args
         assert kwargs.get("supersede_running") is False
 
-    def test_retry_collision_with_healthy_run_resets_to_pending_and_500s(
-        self, client: TestClient
-    ):
+    def test_retry_collision_with_healthy_run_resets_to_pending_and_500s(self, client: TestClient):
         """End-to-end (real TemporalWorkflowTrigger, not a further-mocked
         fake) proof of the protection: supersede_running=False makes a
         same-id collision raise WorkflowAlreadyStartedError (the SDK default

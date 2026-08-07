@@ -348,9 +348,7 @@ class TestWorkflowPublishesCompletion:
         activity_error.__cause__ = real_cause
         assert str(activity_error) == "Activity task failed"  # sanity: the trap is real
 
-        fake = FakeWorkflowModule(
-            dict(HAPPY_OUTPUTS), raising={"extract_text": activity_error}
-        )
+        fake = FakeWorkflowModule(dict(HAPPY_OUTPUTS), raising={"extract_text": activity_error})
         wf = document_ingestion.DocumentIngestionWorkflow()
         with patch.object(document_ingestion, "workflow", fake):
             result = await wf.run(make_workflow_input())

@@ -394,9 +394,7 @@ class TemporalWorkflowTrigger:
                 error=str(e),
             )
 
-    async def trigger_workflow_async(
-        self, message: dict, *, supersede_running: bool = True
-    ) -> str:
+    async def trigger_workflow_async(self, message: dict, *, supersede_running: bool = True) -> str:
         """Trigger a workflow without waiting for completion.
 
         This method starts a workflow and returns immediately with the

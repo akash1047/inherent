@@ -579,9 +579,9 @@ class TestHeaderBlockOverlapInteraction:
         max_size = _token_budget_char_cap(512)
         small = _chunk_prose(self._eml_with_recipients(1), "doc", max_size, 200)
         large = _chunk_prose(self._eml_with_recipients(40), "doc", max_size, 200)
-        assert len(large) <= len(small) * 3, (
-            f"chunk count exploded: {len(small)} (1 recipient) -> {len(large)} (40 recipients)"
-        )
+        assert (
+            len(large) <= len(small) * 3
+        ), f"chunk count exploded: {len(small)} (1 recipient) -> {len(large)} (40 recipients)"
 
     def test_every_chunk_carries_subject_regardless_of_header_size(self):
         from src.temporal.activities.chunk import _token_budget_char_cap
@@ -590,9 +590,9 @@ class TestHeaderBlockOverlapInteraction:
         for n in (1, 10, 20, 40):
             chunks = _chunk_prose(self._eml_with_recipients(n), "doc", max_size, 200)
             missing = [c for c in chunks if "Subject: Q3 revenue numbers" not in c.content]
-            assert not missing, (
-                f"{n} recipients: {len(missing)}/{len(chunks)} chunks missing Subject:"
-            )
+            assert (
+                not missing
+            ), f"{n} recipients: {len(missing)}/{len(chunks)} chunks missing Subject:"
 
     def test_overlap_never_exceeds_half_the_effective_budget(self):
         # Direct check on the clamp itself, independent of chunk-count

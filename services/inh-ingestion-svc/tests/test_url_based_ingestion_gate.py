@@ -106,7 +106,9 @@ class TestFetchDocumentAzureGate:
     @patch("src.temporal.activities.fetch.track_event")
     @patch("src.temporal.shared_services.get_storage_service")
     @pytest.mark.asyncio
-    async def test_enabled_without_url_raises(self, mock_get_storage, mock_track, mock_get_settings):
+    async def test_enabled_without_url_raises(
+        self, mock_get_storage, mock_track, mock_get_settings
+    ):
         """With the gate explicitly enabled, the pre-existing url-required
         validation still applies underneath it."""
         mock_track.return_value = _track_event_cm()
@@ -159,7 +161,9 @@ class TestExtractTextAzureGate:
     @patch("src.config.settings.get_settings")
     @patch("src.temporal.shared_services.get_storage_service")
     @pytest.mark.asyncio
-    async def test_disabled_by_default_blocks_even_with_url(self, mock_get_storage, mock_get_settings):
+    async def test_disabled_by_default_blocks_even_with_url(
+        self, mock_get_storage, mock_get_settings
+    ):
         mock_get_storage.return_value = MagicMock()
         mock_get_settings.return_value = MagicMock(allow_url_based_ingestion=False)
 
@@ -179,7 +183,9 @@ class TestExtractTextAzureGate:
     @patch("src.temporal.shared_services.get_staging_service")
     @patch("src.temporal.shared_services.get_storage_service")
     @pytest.mark.asyncio
-    async def test_enabled_with_url_fetches(self, mock_get_storage, mock_get_staging, mock_get_settings):
+    async def test_enabled_with_url_fetches(
+        self, mock_get_storage, mock_get_staging, mock_get_settings
+    ):
         """With the gate explicitly enabled and a storage_url present, the
         existing direct-fetch behavior is unchanged -- content reaches the
         extractor rather than failing before it's read."""

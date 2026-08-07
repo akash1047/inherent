@@ -234,26 +234,20 @@ class TestRequireStoragePathWorkspacePrefix:
     def test_workspaces_prefix_convention_allowed(self):
         """The historical intg-svc/GCS layout: workspaces/{workspace_id}/...
         (inh_contracts.events.DocumentUploadMessage's own example)."""
-        result = require_storage_path_workspace_prefix(
-            "workspaces/ws1/1234-document.pdf", "ws1"
-        )
+        result = require_storage_path_workspace_prefix("workspaces/ws1/1234-document.pdf", "ws1")
         assert result == "ws1"
 
     def test_bare_workspace_id_prefix_convention_allowed(self):
         """inh-public-api-svc's current StorageService.generate_key layout:
         {workspace_id}/{uuid}/{filename}, no 'workspaces/' literal."""
-        result = require_storage_path_workspace_prefix(
-            "ws1/550e8400-e29b/document.pdf", "ws1"
-        )
+        result = require_storage_path_workspace_prefix("ws1/550e8400-e29b/document.pdf", "ws1")
         assert result == "ws1"
 
     def test_mismatched_workspace_prefix_denied(self):
         """The core #210 exploit payload: attacker's own workspace_id paired
         with a victim's genuine storage_path."""
         with pytest.raises(HTTPException) as exc_info:
-            require_storage_path_workspace_prefix(
-                "workspaces/ws_victim/secret.pdf", "ws_attacker"
-            )
+            require_storage_path_workspace_prefix("workspaces/ws_victim/secret.pdf", "ws_attacker")
         assert exc_info.value.status_code == 403
 
     def test_mismatched_bare_prefix_denied(self):
@@ -290,9 +284,7 @@ class TestRequireStoragePathWorkspacePrefix:
         """The flip side of the traversal test above: '..' components that
         collapse back into the CLAIMED workspace's own subtree are fine --
         this function only cares about the final, normalized prefix."""
-        result = require_storage_path_workspace_prefix(
-            "workspaces/ws1/sub/../document.pdf", "ws1"
-        )
+        result = require_storage_path_workspace_prefix("workspaces/ws1/sub/../document.pdf", "ws1")
         assert result == "ws1"
 
     def test_blank_workspace_id_rejected_before_path_is_even_read(self):
@@ -634,9 +626,7 @@ class TestDeadLetterEscalationChainClosed:
     to change.
     """
 
-    def test_list_route_passes_callers_own_workspace_id_to_the_db_call(
-        self, client: TestClient
-    ):
+    def test_list_route_passes_callers_own_workspace_id_to_the_db_call(self, client: TestClient):
         """Route-plumbing check ONLY: GET /dead-letter?workspace_id=ws_attacker
         calls DatabaseService.get_dead_letter_jobs with EXACTLY the caller's
         own claimed workspace_id, never anything else (e.g. never omits it,
@@ -695,9 +685,7 @@ class TestDeadLetterEscalationChainClosed:
             )
         assert resp.status_code == 404
 
-    def test_end_to_end_route_wiring_never_asks_for_another_workspace(
-        self, client: TestClient
-    ):
+    def test_end_to_end_route_wiring_never_asks_for_another_workspace(self, client: TestClient):
         """Route-plumbing check ONLY (see the previous test's docstring for
         why this is a narrower claim than "the chain is broken"): across the
         full request path (auth -> boundary validation -> DB call), the

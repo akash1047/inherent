@@ -34,7 +34,11 @@ class TestDatabaseServiceExtended:
         )
 
         await db_service.store_processed_document(
-            message=msg, chunks=[], text_length=0, processing_time_ms=0, tenant_id=tenant_id,
+            message=msg,
+            chunks=[],
+            text_length=0,
+            processing_time_ms=0,
+            tenant_id=tenant_id,
             workflow_run_id="test-run",
         )
 
@@ -78,7 +82,10 @@ class TestDatabaseServiceExtended:
         ]
 
         await db_service.store_processed_document(
-            message=msg, chunks=chunks, text_length=4, processing_time_ms=0,
+            message=msg,
+            chunks=chunks,
+            text_length=4,
+            processing_time_ms=0,
             workflow_run_id="test-run",
         )
 
@@ -117,7 +124,10 @@ class TestDatabaseServiceExtended:
         ]
 
         await db_service.store_processed_document(
-            message=msg, chunks=chunks, text_length=50, processing_time_ms=0,
+            message=msg,
+            chunks=chunks,
+            text_length=50,
+            processing_time_ms=0,
             workflow_run_id="test-run",
         )
 
@@ -149,7 +159,11 @@ class TestDatabaseServiceExtended:
         )
 
         await db_service.store_processed_document(
-            message=msg, chunks=[], text_length=0, processing_time_ms=0, tenant_id=tenant_id,
+            message=msg,
+            chunks=[],
+            text_length=0,
+            processing_time_ms=0,
+            tenant_id=tenant_id,
             workflow_run_id="test-run",
         )
 
@@ -179,7 +193,10 @@ class TestDatabaseServiceExtended:
         )
 
         await db_service.store_processed_document(
-            message=msg, chunks=[], text_length=0, processing_time_ms=0,
+            message=msg,
+            chunks=[],
+            text_length=0,
+            processing_time_ms=0,
             workflow_run_id="test-run",
         )
 

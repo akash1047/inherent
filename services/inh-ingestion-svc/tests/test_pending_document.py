@@ -263,9 +263,7 @@ class TestClaimOrderingIsMonotonic:
         assert doc["active_run_id"] == "run-B"
 
     @pytest.mark.asyncio
-    async def test_b_store_still_commits_after_a_claims_late(
-        self, db_service: DatabaseService
-    ):
+    async def test_b_store_still_commits_after_a_claims_late(self, db_service: DatabaseService):
         """The user-visible guarantee, not just the internal column: even
         after A's claim arrives late, B's OWN store step (which claimed
         first, in this reproduction) must still be able to commit -- #110's
