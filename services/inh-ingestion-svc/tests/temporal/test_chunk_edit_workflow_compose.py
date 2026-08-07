@@ -133,7 +133,14 @@ async def test_permanent_weaviate_failure_is_reported_not_swallowed_live(
         compose_client,
         task_queue=TASK_QUEUE,
         workflows=[ChunkEditWorkflow],
-        activities=[mock_pg_update_succeeds, weaviate_activity, failure_recorder],
+        # Bound __call__, not the instance -- see the same note in
+        # test_chunk_edit_workflow.py. temporalio's _Definition.from_callable
+        # returns None for a class instance, so the Worker rejects it.
+        activities=[
+            mock_pg_update_succeeds,
+            weaviate_activity.__call__,
+            failure_recorder.__call__,
+        ],
     ):
         result = await compose_client.execute_workflow(
             ChunkEditWorkflow.run,

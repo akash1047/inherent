@@ -18,11 +18,23 @@ requirement -- an ephemeral Temporal test-server binary download from
 temporal.download. Neither is available in this session's sandboxed proxy
 (temporal.download is policy-blocked here; confirmed via repeated
 `connect_rejected`/403 in the proxy status endpoint), so these tests were
-authored and are believed correct but could NOT be executed in this sandbox.
+authored and believed correct but could NOT be executed in this sandbox.
 The direct, sandbox-executable regression coverage for the same defect is in
 tests/test_chunk_edit_activity.py::TestUpdateChunkWeaviateReraises (activity
 re-raises instead of swallowing) and ::TestRecordChunkEditWeaviateFailure
 (the compensating mark-failed activity).
+
+"Believed correct" turned out to be wrong, and CI is where it surfaced: both
+tests raised ``TypeError: Activity <unknown> missing attributes, was it
+decorated with @activity.defn?``. Passing a class INSTANCE as an activity
+does not work -- ``temporalio.activity._Definition.from_callable`` returns
+None for an instance even when ``__call__`` carries ``@activity.defn``, and
+the instance has no ``__name__``, hence "<unknown>". The bound
+``instance.__call__`` resolves correctly. Verified directly against
+temporalio 1.21.1 rather than inferred from the traceback.
+
+Read that as the standing caveat it is: any test in this file can only be
+proven by CI, so a change here is unverified until the run comes back.
 """
 
 from __future__ import annotations
@@ -131,8 +143,13 @@ async def test_permanent_weaviate_failure_is_reported_not_swallowed():
             workflows=[ChunkEditWorkflow],
             activities=[
                 mock_pg_update_succeeds,
-                weaviate_activity,
-                failure_recorder,
+                # Bound __call__, not the instance: temporalio resolves an
+                # activity via _Definition.from_callable, which returns None
+                # for a class instance even when __call__ carries
+                # @activity.defn -- the Worker then raises "Activity <unknown>
+                # missing attributes". Passing the bound method resolves.
+                weaviate_activity.__call__,
+                failure_recorder.__call__,
             ],
         ):
             result = await env.client.execute_workflow(
@@ -184,7 +201,7 @@ async def test_transient_weaviate_failure_then_success_is_reported_success():
             env.client,
             task_queue=TASK_QUEUE,
             workflows=[ChunkEditWorkflow],
-            activities=[mock_pg_update_succeeds, flaky],
+            activities=[mock_pg_update_succeeds, flaky.__call__],
         ):
             result = await env.client.execute_workflow(
                 ChunkEditWorkflow.run,
