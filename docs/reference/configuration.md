@@ -111,10 +111,11 @@ and binds all datastore ports to `127.0.0.1`.
 
 | Variable | Default | Effect | Secret |
 | --- | --- | --- | --- |
-| `STORAGE_BACKEND` | `s3` | `s3` / `gcs` / `local` | no |
+| `STORAGE_BACKEND` | `s3` | `s3` / `gcs` / `local` / `azure` | no |
 | `STORAGE_BUCKET` | `inherent-documents` | Bucket name; must match public-api's `AWS_S3_BUCKET` (#176) — mostly a fallback, since uploads carry their own bucket in the event payload | no |
 | `AWS_S3_ENDPOINT` / `AWS_REGION` | unset / `us-east-1` | S3-compatible endpoint + region. Region must match public-api's `AWS_S3_REGION` (#132) — public-api also reads this var directly | no |
 | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | unset | S3 credentials | yes |
+| `ALLOW_URL_BASED_INGESTION` | `false` | Gates `storage_backend="azure"` on `fetch_document`/`extract_text`. There is no real Azure Blob client in this codebase — `azure` means "fetch `storage_url` directly", which bypasses the #210 `storage_path`/`workspace_id` check entirely (#214). Off by default; enabling it leaves only #34's SSRF guard between a caller-supplied URL and the tenant's store | no |
 
 ### MQ
 

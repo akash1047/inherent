@@ -55,6 +55,23 @@ class Settings(BaseSettings):
     local_storage_path: str = Field("", alias="LOCAL_STORAGE_PATH")
     intg_service_url: str = Field("http://localhost:4000", alias="INTG_SERVICE_URL")
 
+    # #214: storage_backend="azure" has no real Azure Blob client anywhere in
+    # this codebase (no AzureStorageBackend class, no azure-* SDK dependency)
+    # -- fetch.py/extract.py instead treat it as "fetch storage_url directly"
+    # (StorageService.read_file_from_url), completely bypassing the #210
+    # storage_path/workspace_id prefix check (there is no workspace-prefixed
+    # invariant to check a caller-supplied URL against). No in-repo caller
+    # ever sets storage_backend="azure" (public-api-svc's document_intake.py
+    # always emits "s3"), so this is dead weight from every legitimate path
+    # and reachable only as an attacker-controlled bypass via POST /ingest's
+    # caller-supplied storage_backend field. Off by default: an operator who
+    # actually needs direct-URL ingestion must opt in explicitly, at which
+    # point they are accepting that #34's SSRF guard (blocks
+    # internal/metadata/loopback targets) is the ONLY remaining check on
+    # what gets fetched into a tenant. See fetch.py/extract.py's azure
+    # branch and CHANGELOG.md for the full story.
+    allow_url_based_ingestion: bool = Field(False, alias="ALLOW_URL_BASED_INGESTION")
+
     # =========================================================================
     # Message Queue Configuration
     # =========================================================================

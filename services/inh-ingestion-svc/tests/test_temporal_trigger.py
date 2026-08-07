@@ -6,7 +6,11 @@ import pytest
 
 import src.temporal.trigger as trigger_mod
 from src.models.document import DocumentUploadMessage
-from src.temporal.trigger import TemporalWorkflowTrigger, get_workflow_trigger
+from src.temporal.trigger import (
+    TemporalWorkflowTrigger,
+    build_ingestion_source_memo,
+    get_workflow_trigger,
+)
 
 
 # Override the package-level DB-dependent autouse fixture (tests/conftest.py)
@@ -300,6 +304,60 @@ class TestBuildSourceMemo:
     # never reach a valid `upload_message` for this method to build a memo
     # from in the first place -- there is nothing for _build_source_memo to
     # guard against.
+
+
+class TestBuildIngestionSourceMemo:
+    """Unit tests for the module-level build_ingestion_source_memo (#178).
+
+    Extracted out of TemporalWorkflowTrigger._build_source_memo so
+    POST /ingest (src/api/app.py) can build the identical memo shape for its
+    hardcoded source="api-direct" without duplicating (and risking drift
+    from) the MQ-path memo logic. TestBuildSourceMemo above pins that the
+    staticmethod still produces identical output by delegating here; these
+    tests exercise the shared function directly, including the app.py-style
+    call shape (source only, no connection_id/sync_id).
+    """
+
+    def test_source_only_call_omits_connector_fields(self):
+        """The exact call shape src/api/app.py uses: a direct/manual trigger
+        has no connector to attribute a connection_id/sync_id to."""
+        memo = build_ingestion_source_memo(source="api-direct")
+        assert memo == {"source": "api-direct"}
+
+    def test_connector_sourced_call_includes_connection_and_sync_id(self):
+        memo = build_ingestion_source_memo(
+            source="connector:notion", connection_id="conn_123", sync_id="sync_456"
+        )
+        assert memo == {
+            "source": "connector:notion",
+            "connection_id": "conn_123",
+            "sync_id": "sync_456",
+        }
+
+    def test_none_source_defaults_to_unknown(self):
+        memo = build_ingestion_source_memo(source=None)
+        assert memo == {"source": "unknown"}
+
+    def test_falsy_connector_ids_are_omitted_not_included_as_empty(self):
+        memo = build_ingestion_source_memo(source="api-direct", connection_id="", sync_id="")
+        assert memo == {"source": "api-direct"}
+        assert "connection_id" not in memo
+        assert "sync_id" not in memo
+
+    def test_static_method_delegates_to_shared_function(self):
+        """_build_source_memo must produce byte-identical output to calling
+        build_ingestion_source_memo directly -- pins the #178 refactor
+        didn't change the MQ path's existing (#141) behavior."""
+        upload_message = _make_upload_message(
+            source="connector:notion", connection_id="conn_123", sync_id="sync_456"
+        )
+        via_staticmethod = TemporalWorkflowTrigger._build_source_memo(upload_message)
+        via_shared_function = build_ingestion_source_memo(
+            source=upload_message.source,
+            connection_id=upload_message.connection_id,
+            sync_id=upload_message.sync_id,
+        )
+        assert via_staticmethod == via_shared_function
 
 
 class TestTriggerWorkflowAsyncMemoIntegration:

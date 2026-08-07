@@ -58,6 +58,52 @@ if TYPE_CHECKING:
 logger = structlog.get_logger(__name__)
 
 
+def build_ingestion_source_memo(
+    source: str | None,
+    connection_id: str | None = None,
+    sync_id: str | None = None,
+) -> dict[str, str]:
+    """Build the Temporal memo every ``DocumentIngestionWorkflow.run`` start
+    site attaches, describing where an ingestion came from
+    (inherent-systems/prime#187, and its #178 extension below).
+
+    Extracted out of ``TemporalWorkflowTrigger._build_source_memo`` (#178) so
+    the memo SHAPE lives in exactly one place. #141 added this memo to the
+    two MQ-driven start sites in this module; ``POST /ingest``
+    (``src/api/app.py``) was a third start site #141 didn't cover, because
+    its request model (``IngestRequest``) carries no ``source``/
+    ``connection_id``/``sync_id`` fields to build one from -- there was
+    nothing to port #141's fix onto without inventing something. Rather than
+    have the REST route hand-roll its own ``{"source": ...}`` dict (drifting
+    from this shape the moment either one changes independently), it calls
+    this same function directly with a hardcoded ``source="api-direct"``
+    (see ``app.py``'s ``_DIRECT_API_INGESTION_SOURCE``) -- a manual/API-direct
+    trigger has no connector to attribute the memo to, so
+    ``connection_id``/``sync_id`` are always omitted on that path.
+
+    Args:
+        source: The ingestion source label, e.g. ``"connector:notion"`` or
+            ``"api-direct"``. ``None``/empty maps to ``"unknown"`` rather
+            than an empty memo value, so every started workflow always shows
+            SOME label in the Temporal UI summary panel.
+        connection_id: Connector connection id, if this ingestion came from
+            a connector sync. Omitted from the memo entirely when absent.
+        sync_id: Connector sync-run id, same omission rule as
+            ``connection_id``.
+
+    Returns:
+        A ``dict[str, str]`` suitable for ``Client.start_workflow(...,
+        memo=...)``. Always has a ``"source"`` key; ``connection_id``/
+        ``sync_id`` keys are present only when their argument was truthy.
+    """
+    memo: dict[str, str] = {"source": source or "unknown"}
+    if connection_id:
+        memo["connection_id"] = connection_id
+    if sync_id:
+        memo["sync_id"] = sync_id
+    return memo
+
+
 class TemporalWorkflowTrigger:
     """Triggers Temporal workflows from MQ messages.
 
@@ -156,13 +202,17 @@ class TemporalWorkflowTrigger:
         ``trigger_workflow_async`` for the path the MQ consumer actually
         uses). Either way, this keeps the memo a value that is always correct
         or entirely absent -- never a truncated, misleadingly-plausible one.
+
+        Delegates to the module-level ``build_ingestion_source_memo`` (#178)
+        so this MQ-message-shaped extraction and ``POST /ingest``'s
+        hardcoded-source call share one memo-shape implementation instead of
+        drifting independently.
         """
-        memo: dict[str, str] = {"source": upload_message.source or "unknown"}
-        if upload_message.connection_id:
-            memo["connection_id"] = upload_message.connection_id
-        if upload_message.sync_id:
-            memo["sync_id"] = upload_message.sync_id
-        return memo
+        return build_ingestion_source_memo(
+            source=upload_message.source,
+            connection_id=upload_message.connection_id,
+            sync_id=upload_message.sync_id,
+        )
 
     async def _record_dead_letter(
         self,

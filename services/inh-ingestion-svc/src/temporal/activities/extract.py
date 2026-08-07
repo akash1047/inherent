@@ -97,6 +97,19 @@ async def _extract_text_inner(input: ExtractTextInput) -> ExtractTextOutput:
             bucket=input.storage_bucket,
         )
     elif input.storage_backend == "azure":
+        # #214: same gate as fetch.py's azure branch -- keep both in sync.
+        # This activity runs AFTER fetch_document in the workflow, but must
+        # not assume fetch_document's own gate already ran (activities are
+        # independently retryable/replayable and must each be safe to call
+        # on their own; see docs/developer/learnings.md on trusting an
+        # earlier step's check instead of re-checking at the point of use).
+        from src.config.settings import get_settings
+
+        if not get_settings().allow_url_based_ingestion:
+            raise RuntimeError(
+                "Storage backend 'azure' (direct URL fetch) is disabled "
+                "(ALLOW_URL_BASED_INGESTION is not set) -- see #214"
+            )
         if input.storage_url:
             content = storage_service.read_file_from_url(input.storage_url)
         else:

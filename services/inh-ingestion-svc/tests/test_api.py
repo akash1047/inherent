@@ -278,6 +278,143 @@ class TestIngestTrigger:
         )
         assert resp.status_code == 422
 
+    # -------------------------------------------------------------------
+    # Security (#210): storage_path must belong to the claimed workspace_id.
+    # See tests/test_ingestion_ownership.py::TestRequireStoragePathWorkspacePrefix
+    # for the underlying helper's full matrix; these pin the check is
+    # actually WIRED into this route (a passing unit test for the helper
+    # proves nothing if the route never calls it).
+    # -------------------------------------------------------------------
+
+    def test_cross_tenant_storage_path_rejected_with_403(self, client: TestClient):
+        """The #210 exploit payload end-to-end: attacker's own workspace_id
+        paired with a victim's genuine storage_path. Must 403 and never
+        reach Temporal -- start_workflow must not be called at all."""
+        payload = {
+            **_INGEST_PAYLOAD,
+            "workspace_id": "ws_attacker",
+            "storage_path": "workspaces/ws_victim/secret.pdf",
+        }
+        resp = client.post(
+            "/ingest",
+            json=payload,
+            headers={"X-API-Key": VALID_API_KEY},
+        )
+        assert resp.status_code == 403
+        client._mock_temporal_client.start_workflow.assert_not_called()
+
+    def test_own_storage_path_still_accepted(self, client: TestClient):
+        """Sanity check on the fix: a genuinely-owned storage_path (the
+        happy path every other test in this class exercises) must keep
+        working -- the fix is a mismatch check, not a blanket new
+        restriction."""
+        resp = client.post(
+            "/ingest",
+            json=_INGEST_PAYLOAD,
+            headers={"X-API-Key": VALID_API_KEY},
+        )
+        assert resp.status_code == 202
+        client._mock_temporal_client.start_workflow.assert_called_once()
+
+    def test_bare_workspace_prefix_convention_also_accepted(self, client: TestClient):
+        """inh-public-api-svc's current StorageService.generate_key layout
+        (no 'workspaces/' literal) must be accepted too -- the check isn't
+        hardcoded to one historical layout."""
+        payload = {
+            **_INGEST_PAYLOAD,
+            "storage_path": "ws_001/550e8400-e29b/document.pdf",
+        }
+        resp = client.post(
+            "/ingest",
+            json=payload,
+            headers={"X-API-Key": VALID_API_KEY},
+        )
+        assert resp.status_code == 202
+
+    def test_blank_workspace_id_rejected_with_422(self, client: TestClient):
+        payload = {**_INGEST_PAYLOAD, "workspace_id": "   "}
+        resp = client.post(
+            "/ingest",
+            json=payload,
+            headers={"X-API-Key": VALID_API_KEY},
+        )
+        assert resp.status_code == 422
+        client._mock_temporal_client.start_workflow.assert_not_called()
+
+    def test_empty_workspace_id_rejected_with_422(self, client: TestClient):
+        """Field(..., min_length=1) layer: a fully-empty workspace_id must
+        be rejected at the Pydantic boundary before ownership.py even runs
+        (falsy-vs-absent trap -- Field(...) alone enforces PRESENCE, not
+        non-emptiness)."""
+        payload = {**_INGEST_PAYLOAD, "workspace_id": ""}
+        resp = client.post(
+            "/ingest",
+            json=payload,
+            headers={"X-API-Key": VALID_API_KEY},
+        )
+        assert resp.status_code == 422
+        client._mock_temporal_client.start_workflow.assert_not_called()
+
+    # -------------------------------------------------------------------
+    # #178: workflow starts from this route must carry the source memo.
+    # -------------------------------------------------------------------
+
+    def test_workflow_start_carries_api_direct_source_memo(self, client: TestClient):
+        """POST /ingest is inherently a direct/manual trigger -- no
+        connector to attribute it to -- so it carries a hardcoded
+        source='api-direct' memo, consistent with the trigger.py MQ-path
+        convention (#141) rather than showing no memo at all."""
+        client.post(
+            "/ingest",
+            json=_INGEST_PAYLOAD,
+            headers={"X-API-Key": VALID_API_KEY},
+        )
+        _, kwargs = client._mock_temporal_client.start_workflow.call_args
+        assert kwargs["memo"] == {"source": "api-direct"}
+
+    def test_403_detail_states_both_accepted_storage_path_forms(self, client: TestClient):
+        """Attacker-persona review finding: naming the mismatch without
+        stating what a CORRECT value looks like leaves an operator on a
+        third layout with nothing to act on. The error itself is the only
+        place this will be read at the moment it matters -- it must spell
+        out both accepted conventions, not just point at the docs."""
+        payload = {
+            **_INGEST_PAYLOAD,
+            "workspace_id": "ws_attacker",
+            "storage_path": "workspaces/ws_victim/secret.pdf",
+        }
+        resp = client.post(
+            "/ingest",
+            json=payload,
+            headers={"X-API-Key": VALID_API_KEY},
+        )
+        assert resp.status_code == 403
+        detail = resp.json()["detail"]
+        # Both accepted forms, with the CALLER's own claimed workspace_id
+        # substituted in -- an operator can copy-paste a fix directly from
+        # the error, not just learn the general shape from docs.
+        assert "workspaces/ws_attacker/" in detail
+        assert "ws_attacker/" in detail
+
+    def test_documented_request_example_is_self_consistent(self, client: TestClient):
+        """Regression guard (attacker-persona finding): IngestRequest's
+        OpenAPI json_schema_extra example is what a reader gets prefilled on
+        the auto-generated /docs page's "Try it out" -- if its storage_path
+        doesn't actually belong to its own workspace_id, a reader's first
+        experience of this endpoint is the #210 403 it's supposed to be
+        demonstrating. Posts the LITERAL example object (read straight out
+        of the OpenAPI schema, not hand-copied) and asserts it is accepted."""
+        schema = client.get("/openapi.json").json()
+        example = schema["components"]["schemas"]["IngestRequest"]["example"]
+        resp = client.post(
+            "/ingest",
+            json=example,
+            headers={"X-API-Key": VALID_API_KEY},
+        )
+        assert resp.status_code == 202, (
+            f"IngestRequest's own documented example was rejected: {resp.json()}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Status Tests

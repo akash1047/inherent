@@ -683,6 +683,83 @@ All notable changes to Inherent are documented here. The format follows
   the identical request was correctly rejected by REST. Pinned in
   `tests/contract/test_failure_parity.py::TestExpiredKeyDispatcherParity`.
 
+- **`POST /ingest` (inh-ingestion-svc) accepted a caller-supplied
+  `storage_path` alongside a caller-supplied `workspace_id` with no check
+  that the two were related — a cross-tenant read path that #175/#177 had
+  explicitly scoped this route out of on the reasoning that it is "a
+  creation endpoint with nothing to own yet."** That reasoning was wrong:
+  the endpoint doesn't just create a `processed_documents` row, it READS an
+  object the caller names. A caller holding the single shared
+  `INGESTION_API_KEY` could pair another tenant's genuine `storage_path`
+  with their OWN `workspace_id`; the pipeline fetched those bytes,
+  extracted, chunked, embedded, and filed the result into the attacker's
+  own Weaviate tenant — readable afterwards through the attacker's own
+  legitimate key, via ordinary search, with no need to compromise the
+  victim's workspace at all.
+
+  There is no existing PostgreSQL row for this endpoint to resolve
+  ownership against (unlike every other route #175/#177 hardened), so the
+  fix checks the one thing that IS knowable up front: the storage layout is
+  workspace-prefixed, so `storage_path` must name the claimed `workspace_id`
+  as its own path prefix (`workspaces/{workspace_id}/...` or
+  `{workspace_id}/...` — both conventions are live in this codebase, see
+  `src/api/ownership.py::require_storage_path_workspace_prefix`). The path
+  is normalized (`posixpath.normpath`) before the prefix is read off it, so
+  a `..`-disguised path can't nominally satisfy the check while actually
+  resolving into a different workspace's subtree. Mismatch → **403**;
+  `workspace_id` is additionally hardened the same three-layer way #177's
+  post-review fix established (`Field(..., min_length=1)` on the request
+  body, the shared `require_workspace_id` boundary check, and the resolver
+  itself raising on a blank claim rather than silently widening).
+
+  **This is NOT tenant-safety and must not be described as such.**
+  `INGESTION_API_KEY` is one shared secret with no key→workspace binding
+  (#177 follow-up, still open) — every tenant presents the identical
+  secret. This fix proves `storage_path` is CONSISTENT with the
+  `workspace_id` the caller CLAIMS; it does not, and cannot, prove the
+  caller is ENTITLED to claim that `workspace_id`. A caller who knows or
+  guesses a genuine `workspaces/{victim}/...` path can still pair it with
+  `workspace_id={victim}` and pass this check. Only the key→workspace
+  binding tracked in #177 closes that gap; until it lands, `POST /ingest`
+  remains only as safe as every other route this codebase gates with
+  `verify_api_key` alone. Pattern sweep (both services, for the same
+  "caller-supplied fetch target with no workspace check" shape) found one
+  more instance NOT covered by this fix and NOT fixable the same way:
+  `storage_backend="azure"` on this same route fetches via an arbitrary
+  caller-supplied `storage_url` instead of `storage_path`, bypassing this
+  check entirely — no workspace-prefixed invariant exists for an arbitrary
+  URL to be checked against. Filed as #214 rather than silently expanding
+  this fix's scope or leaving it unmentioned. (#210)
+- **`storage_backend="azure"` (the #214 bypass above) is now OFF by
+  default.** `fetch_document` and `extract_text` (`inh-ingestion-svc`) both
+  treat `storage_backend="azure"` as "fetch `storage_url` directly" — there
+  is no real Azure Blob client anywhere in this codebase, and no in-repo
+  caller ever sets `storage_backend="azure"` (`inh-public-api-svc`'s intake
+  path always emits `s3`). Both activities now reject this branch with a
+  clear error unless the new `ALLOW_URL_BASED_INGESTION` setting (default
+  `false`) is explicitly turned on, closing #214's `storage_path`-less
+  vector for every deployment that hasn't opted in. **This is not full
+  closure**: an operator who does turn it on is knowingly left with only
+  #34's SSRF guard (blocks metadata/loopback/RFC1918 targets, permits any
+  other reachable http/https URL) between a caller-supplied URL and their
+  tenant's Weaviate store — the gate controls whether the vector exists at
+  all, not what it can reach once enabled. Both activities carry their own
+  copy of the gate rather than trusting the workflow's earlier step, since
+  Temporal activities are independently retryable/replayable. (#214)
+- **`POST /ingest` started `DocumentIngestionWorkflow` with no `source`
+  memo, the one of three start sites #141 didn't cover.** `trigger.py`'s two
+  MQ-driven start sites have carried a `{"source": ..., "connection_id":
+  ..., "sync_id": ...}` Temporal memo since #141, so operators can tell a
+  connector sync apart from a manual/API trigger in the Temporal UI summary
+  panel. This direct HTTP path showed no memo at all — not even
+  `"unknown"` — because its request model (`IngestRequest`) has no
+  `source`/`connection_id`/`sync_id` fields to build one from. Rather than
+  add unused fields with nothing to populate them, this route now calls the
+  same memo-shape function (extracted to module-level
+  `build_ingestion_source_memo` in `trigger.py`, `_build_source_memo`
+  delegates to it) with a hardcoded `source="api-direct"` — this path is
+  inherently a direct/manual trigger with no connector to attribute it to.
+  (#178)
 - **Seven more inh-ingestion-svc endpoints trusted a caller-supplied
   `workspace_id`/`document_id`/`job_id` with no ownership check, closing the
   `GET /dead-letter` → `PATCH /chunks` cross-tenant harvesting vector #134
