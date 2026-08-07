@@ -49,11 +49,14 @@ content only: the tool accepts ``content`` as a UTF-8 string (not raw bytes),
 so ``content_type`` must be one of the MCP-eligible types in
 ``inh_contracts.file_types.FILE_TYPE_REGISTRY`` — every spec whose
 ``surfaces`` includes ``"mcp"`` (see ``SUPPORTED_TEXT_MIME_TYPES`` below for
-the live set derived from it; #193 review: do not hardcode a type list here
-again — several of the eligible types are not ``text/*`` MIME types at all,
-e.g. ``application/typescript``, ``application/x-sh``, ``application/sql``,
-``application/yaml``, so "TEXT content" describes the wire transport, not the
-declared MIME type). Omitting ``content_type`` derives it from ``filename``'s
+the live set derived from it, and ``docs/reference/file-types.md`` for the
+generated, exhaustive list; #193 review: do not hardcode a type list here
+again — this docstring is a plain string literal, not an f-string, so it
+CANNOT be regenerated at import time the way ``SUPPORTED_TEXT_MIME_TYPES``
+and the schema description below are; some MCP-eligible types are not
+``text/*`` MIME types at all, per the registry's ``surfaces`` field, so
+"TEXT content" describes the wire transport, not the declared MIME type).
+Omitting ``content_type`` derives it from ``filename``'s
 extension when recognized as MCP-eligible, falling back to
 ``text/markdown`` otherwise (see ``_default_upload_content_type``). Binary
 uploads (PDF, DOCX, PNG, ...) remain REST-only by design — the tool rejects
@@ -122,6 +125,24 @@ SUPPORTED_TEXT_MIME_TYPES = mcp_mime_types()
 # `list_tools` response, so a second full copy there was ~640 duplicated
 # characters of pure context cost with no reader who couldn't already see the
 # property description in the same payload.
+#
+# Deliberately NOT a JSON Schema `enum` either (#193 coordinator review, item
+# 6 -- tried and reverted): the MCP SDK's `call_tool` wrapper validates
+# arguments against `inputSchema` via jsonschema BEFORE the handler ever
+# runs (`validate_input=True` by default, see
+# `mcp.server.lowlevel.server.Server.call_tool`). An `enum` restricted to
+# SUPPORTED_TEXT_MIME_TYPES would make the framework reject any
+# EXPLICITLY-declared out-of-set value -- including the ones this tool
+# deliberately accepts at the schema level so its OWN handler can give
+# actionable guidance (a legacy `.doc` gets a "convert to .docx" message; a
+# binary type like `application/pdf` gets "use POST /v1/documents instead")
+# -- with a generic "'application/pdf' is not one of [...]" error instead,
+# silently deleting that guidance. Proven by running the existing contract
+# suite with `enum` added: `test_legacy_doc_rejected_with_explicit_content_type`,
+# `test_binary_content_type_rejected_with_rest_only_message`, and
+# `test_unsupported_text_content_type_rejected_at_mcp_boundary` all failed
+# this way. A prose list costs the same bytes but does not intercept calls
+# before the handler runs.
 _SUPPORTED_TEXT_MIME_TYPES_TEXT = ", ".join(SUPPORTED_TEXT_MIME_TYPES)
 
 
@@ -941,19 +962,27 @@ async def _resolve_single_workspace_for_upload(
 
 def _default_upload_content_type(filename: str) -> str:
     """The ``content_type`` ``upload_document`` uses when the caller omits
-    it, exactly as the tool schema's ``"default": "text/markdown"`` invites
-    (#117 review BLOCKER 2).
+    it. This is a SERVER-side fallback only -- it is documented in the
+    ``content_type`` property's description text, not advertised as a JSON
+    Schema ``default`` (#193 coordinator review BLOCKER: the schema used to
+    carry ``"default": "text/markdown"``, which many MCP clients auto-fill
+    onto an omitted argument before the server ever sees the omission,
+    turning every upload into an explicit "text/markdown" declaration and
+    short-circuiting the extension derivation below for every caller whose
+    client does that -- removed for that reason; see the ``content_type``
+    property's description in ``_TOOLS["upload_document"]`` for the honest,
+    client-visible explanation of this fallback).
 
     Derived from `filename`'s extension when the registry recognizes it AND
     that type is MCP-eligible (e.g. ``notes.txt`` -> ``text/plain``,
     ``data.csv`` -> ``text/csv``) -- falls back to ``text/markdown`` only for
-    an unrecognized or absent extension. Before this, the default was a flat
-    ``"text/markdown"`` regardless of filename, which meant the tool's own
-    documented default broke itself the moment #117's extension-consistency
-    check landed: calling ``upload_document(filename="notes.txt", ...)`` and
-    omitting the optional `content_type` -- exactly what the schema invites
-    -- got ``notes.txt`` defaulted to ``text/markdown`` and then rejected as
-    a mismatch against its own ``.txt`` extension.
+    an unrecognized or absent extension. Historically (#117 review BLOCKER 2)
+    the default was a flat ``"text/markdown"`` regardless of filename, which
+    meant the tool's own documented default broke itself the moment #117's
+    extension-consistency check landed: calling
+    ``upload_document(filename="notes.txt", ...)`` and omitting the optional
+    `content_type` got ``notes.txt`` defaulted to ``text/markdown`` and then
+    rejected as a mismatch against its own ``.txt`` extension.
 
     #197 fix: resolving the spec's ``mime_types[0]`` unconditionally was
     correct only by accident, because every spec registered at the time

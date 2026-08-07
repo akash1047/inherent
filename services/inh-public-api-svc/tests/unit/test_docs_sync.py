@@ -120,11 +120,18 @@ def test_examples_readme_400_error_matches_registry():
 
 def test_examples_readme_mentions_every_mime_type():
     """Every registered MIME type must appear somewhere in
-    docs/examples/README.md (the 400 example above already guarantees this
-    when it passes, but this assertion is independent of that string's exact
-    wording -- it still catches a dropped/renamed type even if someone edits
-    the 400 example's phrasing without also updating the dedicated
-    'Allowed MIME types' line near the top of the Upload section)."""
+    docs/examples/README.md. This is a whole-file substring scan, so it
+    catches a type dropped from the WHOLE document (e.g. removed from both
+    the 'Allowed MIME types' line and the 400 example, or never added for a
+    newly-registered type) -- it does NOT independently pin the dedicated
+    'Allowed MIME types' line: because the 400 JSON example already mentions
+    every registered type (verified by
+    `test_examples_readme_400_error_matches_registry` above), a type dropped
+    from ONLY the 'Allowed MIME types' line still passes this whole-file
+    scan as long as the 400 example still mentions it (proven by mutation:
+    removing `application/toml` from only that line leaves this test
+    green). If the 'Allowed MIME types' line itself needs a drift pin,
+    that requires an assertion scoped to that line's text, not this one."""
     text = EXAMPLES_DOC_PATH.read_text()
     for mime in all_mime_types():
         assert mime in text, f"{mime} not mentioned anywhere in {EXAMPLES_DOC_PATH}"

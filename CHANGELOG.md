@@ -372,6 +372,25 @@ All notable changes to Inherent are documented here. The format follows
   stale list was also corrected to describe the mechanism instead of a
   literal type enumeration.
 
+- **MCP `upload_document` schema advertised a client-visible `content_type`
+  default, defeating #197's extension-derived default for any client that
+  auto-fills an omitted argument from its advertised default (#193 review
+  follow-up).** The `content_type` schema property still carried
+  `"default": "text/markdown"` after the #193 fix above — a JSON Schema
+  `default` is sent to the CLIENT, and several real MCP clients pre-fill an
+  omitted argument from it before the server ever observes an omission, so
+  `content_type = declared_content_type or _default_upload_content_type(...)`
+  received an explicit `"text/markdown"` on every such client's upload
+  regardless of the real extension, silently reintroducing #197's "code
+  file mislabelled as prose" defect through the schema (measured: `main.go`
+  with `content_type` absent stored `text/x-go`/`chunking_hint=code`; with
+  the client-filled `text/markdown` default it stored
+  `text/markdown`/`chunking_hint=prose`). The `default` is removed; the
+  fallback behavior is documented in the property's `description` text only
+  (never advertised as a schema default), and an explicitly-declared
+  `content_type` is still always honored as-is, never re-derived from the
+  filename.
+
 - **PDF and JSON extractors retried deterministic (unfixable) failures 3x
   (#195).** `_extract_pdf_text`/`_extract_json_text`
   (`services/inh-ingestion-svc/src/temporal/activities/extract.py`) left
