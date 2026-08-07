@@ -519,23 +519,52 @@ The retry table in §2.3 is the mechanical policy; this section is what it
 means for a document that hits a real failure.
 
 **Non-retryable errors are deterministic content errors.** `extract_text`
-raises a plain `RuntimeError` for failures that *might* succeed on retry
-(a storage read blip, a missing optional library) — those keep Temporal's
-default retry budget. But a failure that is guaranteed to repeat given the
-same bytes — no registry entry for the content type, a registry entry with
-no wired extractor, a corrupt/password-protected DOCX/XLSX/PPTX, an
-XLSX/PPTX cost-guard cap exceeded — raises
-`temporalio.exceptions.ApplicationError(..., non_retryable=True)`
-(`services/inh-ingestion-svc/src/temporal/activities/extract.py:255-305` for
-the two registry-dispatch failure modes; similarly at `:355-359`,
-`:384-391` for DOCX, `:586-605`, `:627-634`, `:674-681` for XLSX, `:776-780`,
-`:787-794`, `:800-805`, `:833-840`, `:849-856` for PPTX). Temporal fails the
-activity after the **first** attempt instead of burning the full retry
-budget on a bug retrying cannot fix — the same terminal `failed` status is
-reached faster, and every message is actionable (never a bare library
-exception or a heap-address `repr` leaking into `error_message`, e.g. the
-DOCX extractor's explicit re-wrap of python-docx's own leaky exception,
-`extract.py:366-391`).
+keeps Temporal's default retry budget for failures that *might* succeed on
+retry — a storage read blip (`extract.py:81-108`), a missing optional
+library being installed on a redeployed worker image
+(`type="MissingExtractionDependency"`, one site per format), or a
+`MemoryError` from a load-dependent page/row/slide/chapter-iteration loop
+(deliberately left *outside* every wrap below — see the next paragraph). But
+a failure that is guaranteed to repeat given the same bytes raises
+`temporalio.exceptions.ApplicationError(..., non_retryable=True)`, so
+Temporal fails the activity after the **first** attempt instead of burning
+the full retry budget on a bug retrying cannot fix — the same terminal
+`failed` status is reached faster, and every message is actionable (never a
+bare library exception or a heap-address `repr` leaking into
+`error_message`, e.g. the DOCX extractor's explicit re-wrap of python-docx's
+own leaky exception, `extract.py:456-479`). Every format's deterministic
+failure modes (`extract.py`, function → line range):
+`_resolve_extractor` (no registry entry / entry with no wired extractor)
+`:314-330`; `_extract_json_text` (malformed JSON) `:229-236`;
+`_extract_pdf_text` (missing library, corrupt/truncated/password-protected)
+`:382-410`; `_extract_docx_text` (missing library, corrupt/wrong-OOXML)
+`:443-480`; `_extract_xlsx_text` (missing library, corrupt/password-
+protected, cell-count cap, text-length cap) `:674-770`; `_extract_pptx_text`
+(missing library, corrupt/password-protected, slide-count cap, text-length
+cap) `:864-945`; `_extract_epub_text` (corrupt zip, DRM/encrypted, missing/
+unparseable container.xml or content.opf, no rootfile, no spine, no
+extractable chapter) `:1186-1341`; `_extract_rtf_text` (missing library,
+parse failure, empty extraction) `:1408-1450`; `_extract_odt_text` (corrupt
+zip, missing/unparseable content.xml, no `office:body`, empty extraction)
+`:1557-1617`; `_extract_subtitle_text` (no cue with a recognizable timestamp
+line) `:1769-1776` (#195, #206 — the last of these four, EPUB/RTF/ODT/SRT,
+closed a pattern-sweep gap #195 filed rather than expanding its own scope).
+
+**MemoryError is never swept into `non_retryable=True`.** Every wrap above
+is scoped to the construction/parse call ONLY (`PdfReader()`,
+`load_workbook()`, `Presentation()`, `Document()`, `zipfile.ZipFile()` +
+`ET.fromstring()`, `rtf_to_text()`) — the page/row/slide/chapter-iteration
+loop that follows is deliberately left unwrapped (or, for RTF, an explicit
+`except MemoryError: raise` precedes the broad `except Exception`). A
+`MemoryError` from a pathological file is a load-dependent condition, not a
+property of the bytes, so it must stay retryable — a retry, possibly on a
+less-contended worker, could plausibly resolve it. An earlier version of the
+PDF fix wrapped the whole page loop and would have permanently
+dead-lettered exactly this case; `_extract_pdf_text`'s docstring documents
+the review follow-up, and `TestPdfFailurePaths`/`TestEpubFailurePaths`/
+`TestRtfFailurePaths`/`TestOdtFailurePaths`/`TestSubtitleFailurePaths` in
+`test_extraction_by_type.py` each pin that this stays true for their own
+extractor.
 
 **The dead-letter path.** A terminal workflow failure — after retries are
 exhausted, or immediately for a non-retryable error — is recorded via

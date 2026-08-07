@@ -19,6 +19,7 @@ import zipfile
 from email.message import EmailMessage
 
 import pytest
+from temporalio.exceptions import ApplicationError
 
 from src.temporal.activities.extract import (
     _extract_eml_text,
@@ -288,10 +289,13 @@ class TestExtractEpubText:
 
     def test_no_spine_fails_clearly(self):
         """Failure-path fixture: an EPUB with an empty spine must fail with
-        an actionable error, not crash or silently produce empty text."""
+        an actionable, non-retryable error (#206: deterministic given fixed
+        content bytes -- Temporal must not retry it), not crash or silently
+        produce empty text."""
         epub_bytes = _build_epub(chapters=[], spine=False)
-        with pytest.raises(RuntimeError, match="spine"):
+        with pytest.raises(ApplicationError, match="spine") as exc_info:
             _extract_epub_text(epub_bytes, "no-spine.epub")
+        assert exc_info.value.non_retryable
 
     # -- #125 review blocker 1: manifest hrefs are URL references. EPUB 3
     # requires spaces/non-ASCII to be percent-encoded, so a real EPUB's
@@ -385,7 +389,8 @@ class TestExtractEpubText:
     def test_encrypted_epub_fails_clearly_not_crash(self):
         """Failure-path fixture: DRM/encrypted EPUB (signalled by the
         standard META-INF/encryption.xml manifest) must fail with a clear,
-        actionable error_message -- never a raw parser crash (#125)."""
+        actionable, NON-RETRYABLE error_message -- never a raw parser crash
+        (#125), and never retried 3x for a deterministic failure (#206)."""
         chapters = ["<p>Encrypted chapter -- should never be reached.</p>"]
         base = _build_epub(chapters=chapters)
 
@@ -398,14 +403,17 @@ class TestExtractEpubText:
                 b'<encryption xmlns="urn:oasis:names:tc:opendocument:xmlns:container"/>',
             )
 
-        with pytest.raises(RuntimeError, match="[Ee]ncrypt|DRM"):
+        with pytest.raises(ApplicationError, match="[Ee]ncrypt|DRM") as exc_info:
             _extract_epub_text(buf.getvalue(), "protected.epub")
+        assert exc_info.value.non_retryable
 
     def test_corrupt_zip_fails_clearly_not_crash(self):
-        """Failure-path fixture: a corrupt zip must raise a clear
-        RuntimeError, never an uncaught zipfile.BadZipFile crash."""
-        with pytest.raises(RuntimeError, match="[Cc]orrupt|zip"):
+        """Failure-path fixture: a corrupt zip must raise a clear,
+        non-retryable ApplicationError (#206), never an uncaught
+        zipfile.BadZipFile crash."""
+        with pytest.raises(ApplicationError, match="[Cc]orrupt|zip") as exc_info:
             _extract_epub_text(b"not a zip file at all", "broken.epub")
+        assert exc_info.value.non_retryable
 
 
 # ---------------------------------------------------------------------------
@@ -457,8 +465,12 @@ class TestExtractRtfText:
         assert "\\fs28" not in text
 
     def test_empty_rtf_fails_clearly(self):
-        with pytest.raises(RuntimeError, match="no extractable text|empty"):
+        """#206: deterministic given fixed content bytes -- must be a
+        non-retryable ApplicationError, not a bare RuntimeError Temporal
+        retries 3x for no reason."""
+        with pytest.raises(ApplicationError, match="no extractable text|empty") as exc_info:
             _extract_rtf_text(r"{\rtf1\ansi\par}".encode("ascii"), "empty.rtf")
+        assert exc_info.value.non_retryable
 
 
 # ---------------------------------------------------------------------------
@@ -582,16 +594,19 @@ class TestExtractOdtText:
         assert "spacing" in lines[0]
 
     def test_corrupt_zip_fails_clearly_not_crash(self):
-        """Failure-path fixture: a corrupt zip must raise a clear
-        RuntimeError, never an uncaught zipfile.BadZipFile crash."""
-        with pytest.raises(RuntimeError, match="[Cc]orrupt|zip"):
+        """Failure-path fixture: a corrupt zip must raise a clear,
+        non-retryable ApplicationError (#206), never an uncaught
+        zipfile.BadZipFile crash."""
+        with pytest.raises(ApplicationError, match="[Cc]orrupt|zip") as exc_info:
             _extract_odt_text(b"not a zip file at all", "broken.odt")
+        assert exc_info.value.non_retryable
 
     def test_docx_payload_under_odt_extension_fails_clearly(self):
         """Failure-path fixture named explicitly in the task: a file whose
         extension says .odt but whose zip contains a DOCX payload
-        (word/document.xml, no content.xml) must fail with an actionable
-        error, never silently extract garbage or crash."""
+        (word/document.xml, no content.xml) must fail with an actionable,
+        non-retryable error (#206), never silently extract garbage or
+        crash."""
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w") as zf:
             zf.writestr(
@@ -604,5 +619,6 @@ class TestExtractOdtText:
             )
         docx_shaped_bytes = buf.getvalue()
 
-        with pytest.raises(RuntimeError, match="content.xml|not a valid ODT"):
+        with pytest.raises(ApplicationError, match="content.xml|not a valid ODT") as exc_info:
             _extract_odt_text(docx_shaped_bytes, "mislabeled.odt")
+        assert exc_info.value.non_retryable

@@ -14,6 +14,7 @@ a positive extraction test").
 
 import io
 import json
+import zipfile
 from pathlib import Path
 
 import openpyxl
@@ -23,10 +24,13 @@ from temporalio.exceptions import ApplicationError
 
 from src.temporal.activities.extract import (
     _extract_docx_text,
+    _extract_epub_text,
     _extract_html_text,
     _extract_json_text,
+    _extract_odt_text,
     _extract_pdf_text,
     _extract_pptx_text,
+    _extract_rtf_text,
     _extract_subtitle_text,
     _extract_xlsx_text,
     _extract_xml_text,
@@ -761,6 +765,341 @@ class TestJsonFailurePaths:
             _extract_json_text(b'{"key": "value", "unterminated": ')
         message = str(exc_info.value)
         assert "corrupt" in message or "not actually" in message
+
+
+# ---------------------------------------------------------------------------
+# #206 -- EPUB/RTF/ODT/subtitle: pattern-sweep completion of #195's defect
+# class (bare RuntimeError retried 3x on a deterministic, unfixable-by-retry
+# failure) for the last four extractors in this module. Same fix shape:
+# ApplicationError(non_retryable=True) naming the likely cause, MemoryError
+# left completely unconverted wherever a parse/construction call could
+# plausibly raise it (#195 review follow-up, see _extract_pdf_text above).
+# ---------------------------------------------------------------------------
+
+
+def _zip_with(files: dict[str, bytes]) -> bytes:
+    """Build an in-memory zip archive from `{member_name: content}` -- used
+    below to construct minimal, deliberately-malformed EPUB/ODT fixtures
+    without checking in opaque binary blobs (mirrors
+    test_extraction_longtail.py's own in-memory zip fixtures)."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for name, data in files.items():
+            zf.writestr(name, data)
+    return buf.getvalue()
+
+
+_VALID_EPUB_CONTAINER_XML = (
+    b'<?xml version="1.0" encoding="UTF-8"?>'
+    b'<container version="1.0" '
+    b'xmlns="urn:oasis:names:tc:opendocument:xmlns:container">'
+    b'<rootfiles><rootfile full-path="OEBPS/content.opf" '
+    b'media-type="application/oebps-package+xml"/></rootfiles>'
+    b"</container>"
+)
+
+_EPUB_CONTAINER_XML_NO_ROOTFILE = (
+    b'<?xml version="1.0" encoding="UTF-8"?>'
+    b'<container version="1.0" '
+    b'xmlns="urn:oasis:names:tc:opendocument:xmlns:container">'
+    b"<rootfiles/></container>"
+)
+
+_VALID_EPUB_OPF_NO_SPINE = (
+    b'<?xml version="1.0" encoding="UTF-8"?>'
+    b'<package xmlns="http://www.idpf.org/2007/opf" version="3.0">'
+    b"<manifest/><spine/></package>"
+)
+
+_VALID_EPUB_OPF_UNREACHABLE_CHAPTER = (
+    b'<?xml version="1.0" encoding="UTF-8"?>'
+    b'<package xmlns="http://www.idpf.org/2007/opf" version="3.0">'
+    b'<manifest><item id="chap1" href="chap1.xhtml" '
+    b'media-type="application/xhtml+xml"/></manifest>'
+    b'<spine><itemref idref="chap1"/></spine></package>'
+)
+
+
+class TestEpubFailurePaths:
+    """#206: `_extract_epub_text` raised a bare `RuntimeError` at all 10 of
+    its failure sites -- corrupt zip (x2: construction and central-directory
+    read), DRM/encryption, missing/unparseable META-INF/container.xml,
+    no rootfile declared, missing/unparseable content.opf, no spine, and
+    "spine but no chapter produced extractable text". Every one is a pure
+    function of `content`'s bytes -- the same input fails identically on
+    every Temporal retry attempt -- so all ten now raise a non-retryable
+    ApplicationError, same fix shape as #195's PDF/JSON and #118/#119's
+    XLSX/PPTX/DOCX precedents in this module.
+
+    Every except clause in `_extract_epub_text` catches a NARROW exception
+    type (zipfile.BadZipFile, KeyError, ET.ParseError) -- never a broad
+    `except Exception` -- so a MemoryError raised anywhere in this call
+    chain (e.g. a pathological zip central directory, or a huge XML part)
+    is never caught by these clauses and propagates completely unconverted;
+    `test_memory_error_propagates_not_wrapped` below pins that this stays
+    true rather than trusting it by inspection alone.
+    """
+
+    def test_corrupt_zip_raises_non_retryable(self):
+        with pytest.raises(ApplicationError, match="EPUB extraction failed") as exc_info:
+            _extract_epub_text(b"not a zip file at all", "broken.epub")
+        assert exc_info.value.non_retryable
+
+    def test_drm_protected_raises_non_retryable(self):
+        """DRM/encrypted EPUBs signal via the standard
+        META-INF/encryption.xml manifest -- checked and rejected before any
+        chapter is parsed."""
+        epub_bytes = _zip_with(
+            {
+                "META-INF/encryption.xml": (
+                    b'<encryption xmlns="urn:oasis:names:tc:opendocument:xmlns:container"/>'
+                ),
+            }
+        )
+        with pytest.raises(ApplicationError, match="EPUB extraction failed") as exc_info:
+            _extract_epub_text(epub_bytes, "protected.epub")
+        assert exc_info.value.non_retryable
+        message = str(exc_info.value).lower()
+        assert "drm" in message or "encrypt" in message
+
+    def test_missing_container_xml_raises_non_retryable(self):
+        epub_bytes = _zip_with({"mimetype": b"application/epub+zip"})
+        with pytest.raises(ApplicationError, match="EPUB extraction failed") as exc_info:
+            _extract_epub_text(epub_bytes, "no-container.epub")
+        assert exc_info.value.non_retryable
+        assert "container.xml" in str(exc_info.value)
+
+    def test_unparseable_container_xml_raises_non_retryable(self):
+        epub_bytes = _zip_with({"META-INF/container.xml": b"<not valid xml"})
+        with pytest.raises(ApplicationError, match="EPUB extraction failed") as exc_info:
+            _extract_epub_text(epub_bytes, "bad-container.epub")
+        assert exc_info.value.non_retryable
+
+    def test_no_rootfile_raises_non_retryable(self):
+        epub_bytes = _zip_with({"META-INF/container.xml": _EPUB_CONTAINER_XML_NO_ROOTFILE})
+        with pytest.raises(ApplicationError, match="EPUB extraction failed") as exc_info:
+            _extract_epub_text(epub_bytes, "no-rootfile.epub")
+        assert exc_info.value.non_retryable
+        assert "rootfile" in str(exc_info.value)
+
+    def test_missing_content_opf_raises_non_retryable(self):
+        epub_bytes = _zip_with({"META-INF/container.xml": _VALID_EPUB_CONTAINER_XML})
+        with pytest.raises(ApplicationError, match="EPUB extraction failed") as exc_info:
+            _extract_epub_text(epub_bytes, "no-opf.epub")
+        assert exc_info.value.non_retryable
+        assert "content.opf" in str(exc_info.value)
+
+    def test_unparseable_content_opf_raises_non_retryable(self):
+        epub_bytes = _zip_with(
+            {
+                "META-INF/container.xml": _VALID_EPUB_CONTAINER_XML,
+                "OEBPS/content.opf": b"<not valid xml",
+            }
+        )
+        with pytest.raises(ApplicationError, match="EPUB extraction failed") as exc_info:
+            _extract_epub_text(epub_bytes, "bad-opf.epub")
+        assert exc_info.value.non_retryable
+
+    def test_no_spine_raises_non_retryable(self):
+        epub_bytes = _zip_with(
+            {
+                "META-INF/container.xml": _VALID_EPUB_CONTAINER_XML,
+                "OEBPS/content.opf": _VALID_EPUB_OPF_NO_SPINE,
+            }
+        )
+        with pytest.raises(ApplicationError, match="EPUB extraction failed") as exc_info:
+            _extract_epub_text(epub_bytes, "no-spine.epub")
+        assert exc_info.value.non_retryable
+        assert "spine" in str(exc_info.value)
+
+    def test_no_extractable_chapters_raises_non_retryable(self):
+        """Spine references a real manifest item whose href is not actually
+        present in the zip -- the chapter is skipped (logged, not
+        renumbered -- #125 review blocker 1), and since it was the only
+        spine item, the terminal "spine but nothing extracted" case fires."""
+        epub_bytes = _zip_with(
+            {
+                "META-INF/container.xml": _VALID_EPUB_CONTAINER_XML,
+                "OEBPS/content.opf": _VALID_EPUB_OPF_UNREACHABLE_CHAPTER,
+                # Deliberately no OEBPS/chap1.xhtml member.
+            }
+        )
+        with pytest.raises(ApplicationError, match="EPUB extraction failed") as exc_info:
+            _extract_epub_text(epub_bytes, "empty-spine.epub")
+        assert exc_info.value.non_retryable
+        assert "no chapter" in str(exc_info.value)
+
+    def test_memory_error_propagates_not_wrapped(self, monkeypatch):
+        """Review follow-up mirrored from #195's PDF fix: MemoryError must
+        never be reclassified as non_retryable -- it's a load-dependent
+        condition, not a property of the input bytes. Simulated at the
+        `zipfile.ZipFile` construction call, the first thing this extractor
+        does."""
+
+        def _raise_memory_error(*args, **kwargs):
+            raise MemoryError("simulated: OOM opening zip")
+
+        monkeypatch.setattr(zipfile, "ZipFile", _raise_memory_error)
+
+        with pytest.raises(MemoryError):
+            _extract_epub_text(b"irrelevant, ZipFile is mocked", "book.epub")
+
+
+class TestRtfFailurePaths:
+    """#206: `_extract_rtf_text` raised a bare `RuntimeError` at all 3 of its
+    failure sites -- missing `striprtf` dependency, a genuine parse failure,
+    and empty extraction. Missing-dependency is deterministic per
+    worker/image (same reasoning as every other MissingExtractionDependency
+    case in this module); the other two are deterministic given fixed
+    `content` bytes. The parse-failure site wraps ONLY the `rtf_to_text`
+    call (the preceding `.decode("latin-1")` step never raises -- latin-1
+    maps every byte value 1:1, see the function's docstring) and explicitly
+    re-raises MemoryError before the broad `except Exception` -- mirrors
+    PDF's construction-only wrap (#195 review follow-up) so a load-dependent
+    OOM parsing a pathological RTF is never reclassified as non-retryable.
+    """
+
+    def test_missing_dependency_raises_non_retryable(self, monkeypatch):
+        import builtins
+
+        real_import = builtins.__import__
+
+        def _blocking_import(name, *args, **kwargs):
+            if name == "striprtf.striprtf":
+                raise ImportError("simulated: striprtf not installed")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", _blocking_import)
+
+        with pytest.raises(ApplicationError, match="striprtf not available") as exc_info:
+            _extract_rtf_text(b"irrelevant", "sample.rtf")
+        assert exc_info.value.non_retryable
+
+    def test_parse_failure_raises_non_retryable(self, monkeypatch):
+        """striprtf itself is lenient (rarely raises on malformed control
+        words in practice), so the parse-failure wrapping is exercised
+        directly by monkeypatching `rtf_to_text` to simulate the shape a
+        pathological/corrupt control-word stream could produce -- proves the
+        wrapping fires, not just that it's unreachable in normal use."""
+        import striprtf.striprtf as striprtf_module
+
+        def _raise(*args, **kwargs):
+            raise ValueError("simulated: malformed control word group")
+
+        monkeypatch.setattr(striprtf_module, "rtf_to_text", _raise)
+
+        with pytest.raises(ApplicationError, match="RTF extraction failed") as exc_info:
+            _extract_rtf_text(r"{\rtf1\ansi Hello\par}".encode("ascii"), "sample.rtf")
+        assert exc_info.value.non_retryable
+
+    def test_empty_extraction_raises_non_retryable(self):
+        with pytest.raises(ApplicationError, match="RTF extraction failed") as exc_info:
+            _extract_rtf_text(r"{\rtf1\ansi\par}".encode("ascii"), "empty.rtf")
+        assert exc_info.value.non_retryable
+        assert "no extractable text" in str(exc_info.value)
+
+    def test_memory_error_during_parse_propagates_not_wrapped(self, monkeypatch):
+        import striprtf.striprtf as striprtf_module
+
+        def _raise_memory_error(*args, **kwargs):
+            raise MemoryError("simulated: OOM parsing deeply nested RTF groups")
+
+        monkeypatch.setattr(striprtf_module, "rtf_to_text", _raise_memory_error)
+
+        with pytest.raises(MemoryError):
+            _extract_rtf_text(r"{\rtf1\ansi Hello\par}".encode("ascii"), "sample.rtf")
+
+
+_VALID_ODT_CONTENT_XML_EMPTY_BODY = (
+    b'<?xml version="1.0" encoding="UTF-8"?>'
+    b"<office:document-content "
+    b'xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" '
+    b'xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0">'
+    b"<office:body><office:text></office:text></office:body>"
+    b"</office:document-content>"
+)
+
+
+class TestOdtFailurePaths:
+    """#206: `_extract_odt_text` raised a bare `RuntimeError` at all 6 of its
+    failure sites -- corrupt zip (x2: construction and central-directory
+    read), missing content.xml, unparseable content.xml, missing
+    office:body/office:text, and empty extraction. Same narrow-except
+    discipline as EPUB above (only zipfile.BadZipFile/KeyError/
+    ET.ParseError are caught), so MemoryError is never caught by these
+    clauses either -- see `test_memory_error_propagates_not_wrapped`."""
+
+    def test_corrupt_zip_raises_non_retryable(self):
+        with pytest.raises(ApplicationError, match="ODT extraction failed") as exc_info:
+            _extract_odt_text(b"not a zip file at all", "broken.odt")
+        assert exc_info.value.non_retryable
+
+    def test_missing_content_xml_raises_non_retryable(self):
+        """Also the exact signal for a mislabeled DOCX-under-.odt upload:
+        DOCX has word/document.xml, not content.xml, at the zip root."""
+        odt_bytes = _zip_with({"[Content_Types].xml": b"<Types/>"})
+        with pytest.raises(ApplicationError, match="ODT extraction failed") as exc_info:
+            _extract_odt_text(odt_bytes, "mislabeled.odt")
+        assert exc_info.value.non_retryable
+        assert "content.xml" in str(exc_info.value)
+
+    def test_unparseable_content_xml_raises_non_retryable(self):
+        odt_bytes = _zip_with({"content.xml": b"<not valid xml"})
+        with pytest.raises(ApplicationError, match="ODT extraction failed") as exc_info:
+            _extract_odt_text(odt_bytes, "bad.odt")
+        assert exc_info.value.non_retryable
+
+    def test_missing_body_raises_non_retryable(self):
+        odt_bytes = _zip_with({"content.xml": b'<?xml version="1.0"?><root/>'})
+        with pytest.raises(ApplicationError, match="ODT extraction failed") as exc_info:
+            _extract_odt_text(odt_bytes, "no-body.odt")
+        assert exc_info.value.non_retryable
+        assert "office:body" in str(exc_info.value)
+
+    def test_empty_body_raises_non_retryable(self):
+        odt_bytes = _zip_with({"content.xml": _VALID_ODT_CONTENT_XML_EMPTY_BODY})
+        with pytest.raises(ApplicationError, match="ODT extraction failed") as exc_info:
+            _extract_odt_text(odt_bytes, "empty.odt")
+        assert exc_info.value.non_retryable
+        assert "no extractable text" in str(exc_info.value)
+
+    def test_memory_error_propagates_not_wrapped(self, monkeypatch):
+        def _raise_memory_error(*args, **kwargs):
+            raise MemoryError("simulated: OOM opening zip")
+
+        monkeypatch.setattr(zipfile, "ZipFile", _raise_memory_error)
+
+        with pytest.raises(MemoryError):
+            _extract_odt_text(b"irrelevant, ZipFile is mocked", "doc.odt")
+
+
+class TestSubtitleFailurePaths:
+    """#206: `_extract_subtitle_text`'s single failure site (no cue has a
+    recognizable timestamp line) raised a bare `RuntimeError` -- deterministic
+    given fixed content bytes, same fix shape as the rest of this module.
+    Neither `_decode_text` nor `_parse_subtitle_cues` is wrapped in any
+    try/except in this function, so a MemoryError from either (e.g.
+    charset-detection scanning a huge mis-encoded file) already propagates
+    unconverted with no code change needed here -- pinned below so a future
+    refactor that adds a broad wrap cannot silently reintroduce the defect
+    this whole sweep exists to close."""
+
+    def test_no_cues_found_raises_non_retryable(self):
+        with pytest.raises(ApplicationError, match="Subtitle extraction failed") as exc_info:
+            _extract_subtitle_text(b"just some plain text, not a subtitle file at all", "notes.srt")
+        assert exc_info.value.non_retryable
+        assert "no subtitle cues" in str(exc_info.value).lower()
+
+    def test_memory_error_during_decode_propagates_not_wrapped(self, monkeypatch):
+        import src.temporal.activities.extract as extract_module
+
+        def _raise_memory_error(*args, **kwargs):
+            raise MemoryError("simulated: OOM decoding subtitle content")
+
+        monkeypatch.setattr(extract_module, "_decode_text", _raise_memory_error)
+
+        with pytest.raises(MemoryError):
+            _extract_subtitle_text(b"irrelevant, _decode_text is mocked", "sample.srt")
 
 
 def test_genuine_xlsx_fed_to_docx_extractor_fails_loudly_not_silently():
