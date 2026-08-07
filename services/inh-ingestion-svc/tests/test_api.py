@@ -372,6 +372,49 @@ class TestIngestTrigger:
         _, kwargs = client._mock_temporal_client.start_workflow.call_args
         assert kwargs["memo"] == {"source": "api-direct"}
 
+    def test_403_detail_states_both_accepted_storage_path_forms(self, client: TestClient):
+        """Attacker-persona review finding: naming the mismatch without
+        stating what a CORRECT value looks like leaves an operator on a
+        third layout with nothing to act on. The error itself is the only
+        place this will be read at the moment it matters -- it must spell
+        out both accepted conventions, not just point at the docs."""
+        payload = {
+            **_INGEST_PAYLOAD,
+            "workspace_id": "ws_attacker",
+            "storage_path": "workspaces/ws_victim/secret.pdf",
+        }
+        resp = client.post(
+            "/ingest",
+            json=payload,
+            headers={"X-API-Key": VALID_API_KEY},
+        )
+        assert resp.status_code == 403
+        detail = resp.json()["detail"]
+        # Both accepted forms, with the CALLER's own claimed workspace_id
+        # substituted in -- an operator can copy-paste a fix directly from
+        # the error, not just learn the general shape from docs.
+        assert "workspaces/ws_attacker/" in detail
+        assert "ws_attacker/" in detail
+
+    def test_documented_request_example_is_self_consistent(self, client: TestClient):
+        """Regression guard (attacker-persona finding): IngestRequest's
+        OpenAPI json_schema_extra example is what a reader gets prefilled on
+        the auto-generated /docs page's "Try it out" -- if its storage_path
+        doesn't actually belong to its own workspace_id, a reader's first
+        experience of this endpoint is the #210 403 it's supposed to be
+        demonstrating. Posts the LITERAL example object (read straight out
+        of the OpenAPI schema, not hand-copied) and asserts it is accepted."""
+        schema = client.get("/openapi.json").json()
+        example = schema["components"]["schemas"]["IngestRequest"]["example"]
+        resp = client.post(
+            "/ingest",
+            json=example,
+            headers={"X-API-Key": VALID_API_KEY},
+        )
+        assert resp.status_code == 202, (
+            f"IngestRequest's own documented example was rejected: {resp.json()}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Status Tests

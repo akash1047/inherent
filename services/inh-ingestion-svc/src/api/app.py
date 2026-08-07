@@ -94,7 +94,17 @@ class IngestRequest(BaseModel):
                 "content_type": "application/pdf",
                 "size_bytes": 102400,
                 "storage_backend": "local",
-                "storage_path": "workspaces/ws123/1234567890-document.pdf",
+                # Security (#210): storage_path MUST be prefixed by
+                # workspace_id above -- this example was previously
+                # "workspaces/ws123/..." next to workspace_id
+                # "507f1f77bcf86cd799439012", a mismatch that 403s under the
+                # #210 fix. Caught by attacker-persona acceptance testing:
+                # the auto-generated /docs "Try it out" prefill must itself
+                # pass the check it's demonstrating, or a reader's first
+                # experience of this endpoint is the new error.
+                "storage_path": (
+                    "workspaces/507f1f77bcf86cd799439012/1234567890-abc12345-document.pdf"
+                ),
             }
         }
     }

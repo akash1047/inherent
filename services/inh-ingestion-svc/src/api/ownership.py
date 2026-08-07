@@ -316,6 +316,16 @@ def require_storage_path_workspace_prefix(storage_path: str, workspace_id: str) 
         )
         raise HTTPException(
             status_code=403,
-            detail=f"storage_path does not belong to workspace {workspace_id}.",
+            # Attacker-persona review finding: naming the mismatch alone
+            # gives an operator on a third, unsupported layout nothing to
+            # act on -- this detail is the only place that gets read at the
+            # moment it matters (an auto-generated /docs error toast, a
+            # curl response body), not the docstring above. Spell out both
+            # accepted forms explicitly; there is no third one.
+            detail=(
+                f"storage_path does not belong to workspace {workspace_id!r}. "
+                f"storage_path must start with 'workspaces/{workspace_id}/...' "
+                f"or '{workspace_id}/...'."
+            ),
         )
     return workspace_id
