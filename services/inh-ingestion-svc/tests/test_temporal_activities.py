@@ -554,11 +554,18 @@ class TestExtractTextActivity:
             await extract_text(input_data)
         mock_staging.write_text.assert_not_called()
 
+    @patch("src.config.settings.get_settings")
     @patch("src.temporal.shared_services.get_storage_service")
     @pytest.mark.asyncio
-    async def test_extract_text_azure_without_url_raises(self, mock_get_storage):
-        """Azure backend without storage_url should raise."""
+    async def test_extract_text_azure_without_url_raises(self, mock_get_storage, mock_get_settings):
+        """Azure backend without storage_url should raise -- with the #214
+        url-based-ingestion gate explicitly enabled, so this test still
+        exercises the url-required validation it was written for instead of
+        being short-circuited by the (now default-off) gate. The gate's own
+        default-off behavior is covered separately in
+        tests/test_url_based_ingestion_gate.py."""
         mock_get_storage.return_value = MagicMock()
+        mock_get_settings.return_value = MagicMock(allow_url_based_ingestion=True)
 
         input_data = ExtractTextInput(
             workflow_run_id="wf_azure",

@@ -680,6 +680,22 @@ All notable changes to Inherent are documented here. The format follows
   check entirely — no workspace-prefixed invariant exists for an arbitrary
   URL to be checked against. Filed as #214 rather than silently expanding
   this fix's scope or leaving it unmentioned. (#210)
+- **`storage_backend="azure"` (the #214 bypass above) is now OFF by
+  default.** `fetch_document` and `extract_text` (`inh-ingestion-svc`) both
+  treat `storage_backend="azure"` as "fetch `storage_url` directly" — there
+  is no real Azure Blob client anywhere in this codebase, and no in-repo
+  caller ever sets `storage_backend="azure"` (`inh-public-api-svc`'s intake
+  path always emits `s3`). Both activities now reject this branch with a
+  clear error unless the new `ALLOW_URL_BASED_INGESTION` setting (default
+  `false`) is explicitly turned on, closing #214's `storage_path`-less
+  vector for every deployment that hasn't opted in. **This is not full
+  closure**: an operator who does turn it on is knowingly left with only
+  #34's SSRF guard (blocks metadata/loopback/RFC1918 targets, permits any
+  other reachable http/https URL) between a caller-supplied URL and their
+  tenant's Weaviate store — the gate controls whether the vector exists at
+  all, not what it can reach once enabled. Both activities carry their own
+  copy of the gate rather than trusting the workflow's earlier step, since
+  Temporal activities are independently retryable/replayable. (#214)
 - **`POST /ingest` started `DocumentIngestionWorkflow` with no `source`
   memo, the one of three start sites #141 didn't cover.** `trigger.py`'s two
   MQ-driven start sites have carried a `{"source": ..., "connection_id":
