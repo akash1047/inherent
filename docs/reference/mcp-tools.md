@@ -51,19 +51,35 @@ All tools require `api_key` (string). Additional parameters below.
 
 | Tool | Parameters | Purpose | REST twin |
 | --- | --- | --- | --- |
-| `upload_document` | `filename`, `content` (required); `content_type` (`text/markdown` default — `text/plain`, `text/csv`, `text/html`, `application/yaml`/`text/yaml`, `application/toml`, `application/xml`/`text/xml`, source-code MIME aliases (`text/x-python` and friends — see [file types](file-types.md)), `application/x-subrip` (SRT), `text/vtt` (WebVTT) accepted), `workspace_id` | **Text-only** ingestion sharing REST's validate/dedup/store/enqueue pipeline. Binary formats (PDF/DOCX/PNG) and JSON are REST-only — use `POST /v1/documents`. If the key owns several workspaces, `workspace_id` is required | `POST /v1/documents` |
+| `upload_document` | `filename`, `content` (required); `content_type` (`text/markdown` default — text/plain, text/csv accepted), `workspace_id` | **Text-only** ingestion sharing REST's validate/dedup/store/enqueue pipeline. Binary formats (PDF/DOCX/PNG) and JSON are REST-only — use `POST /v1/documents`. If the key owns several workspaces, `workspace_id` is required | `POST /v1/documents` |
 | `delete_document` | `document_id` (required) | Permanently delete document + vectors + chunks + stored bytes | `DELETE /v1/documents/{id}` |
 | `refresh_stale_source` | `document_id` (required) | Re-enqueue an uploaded document to clear staleness; on MQ failure a retried best-effort compensation marks it `failed`, matching REST (see the REST reference for exhaustion behavior) | `POST /v1/documents/{id}/refresh` |
 
-The `upload_document` accepted `content_type` set is the `surfaces` field of
-the [file-type registry](file-types.md) entries that include `mcp` — see that
-page for the full list of REST-only (binary) formats. Omitting
-`content_type` defaults to the type implied by `filename`'s extension when
-recognized, falling back to `text/markdown` otherwise (#117). For an
-extension whose registry entry covers several distinct languages (source
-code — `.py`, `.go`, `.java`, ...), the default resolves to that specific
-extension's own MIME type, not a fixed first entry (#197: a `.go` upload
-with `content_type` omitted now defaults to `text/x-go`, not `text/x-python`).
+**`content_type`: omit it.** The `upload_document` accepted `content_type`
+set is the `surfaces` field of the [file-type registry](file-types.md)
+entries that include `mcp` — see that page for the full list, and for which
+formats are REST-only (binary). When `content_type` is omitted, it is
+**derived from `filename`'s extension** when recognized (`.py` ->
+`text/x-python`, `.md` -> `text/markdown`, `.csv` -> `text/csv`, `.yaml` ->
+`application/yaml`, `.sql` -> `application/sql`, and more — see the registry
+link above for the full extension list), falling back to `text/markdown`
+only for an unrecognized or absent extension (#117). For an extension whose
+registry entry covers several distinct languages (source code — `.py`,
+`.go`, `.java`, ...), the derived type resolves to that specific extension's
+own MIME type, not a fixed first entry (#197: a `.go` upload with
+`content_type` omitted resolves to `text/x-go`, not `text/x-python`).
+
+If you DO declare `content_type` explicitly, it is always honored exactly as
+given and never re-derived from the filename — so an explicit
+`content_type` that disagrees with the extension (e.g. declaring
+`text/markdown` for a `.go` file) is accepted as declared, not silently
+corrected. This is why the tool schema carries no `default` for
+`content_type`: several real MCP clients pre-fill an omitted argument from
+its schema-advertised default before the server ever observes an omission,
+which would turn every upload into an explicit `text/markdown` declaration
+and defeat the extension-derivation above (#197's exact defect,
+reintroduced through the schema). Omit the field; do not pass
+`"text/markdown"` explicitly unless you actually mean it.
 
 ## Notes
 

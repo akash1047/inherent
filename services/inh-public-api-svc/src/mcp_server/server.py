@@ -109,14 +109,19 @@ ToolHandler = Callable[["APIKeyInfo", dict], Awaitable[list[TextContent]]]
 # Binary types (PDF/DOCX/PNG) stay REST-only by design.
 SUPPORTED_TEXT_MIME_TYPES = mcp_mime_types()
 
-# Human-readable rendering of the same list, shared by the tool description
-# and the `content_type` schema property below (#193) -- previously both were
-# a hand-typed "text/plain, text/markdown (default), text/csv, text/html"
+# Human-readable rendering of the same list, used ONCE below on the
+# `content_type` schema property's description (#193) -- previously a
+# hand-typed "text/plain, text/markdown (default), text/csv, text/html"
 # string that stopped matching SUPPORTED_TEXT_MIME_TYPES the moment #121/#122/
 # #127 added YAML/TOML/XML/code/SRT/VTT (30 types today, several of them not
 # text/*-prefixed at all -- e.g. application/typescript, application/x-sh).
 # `list_tools` is the surface an MCP agent actually reads before ever opening
 # docs/, so this string must be regenerated from the registry, not restated.
+# Deliberately NOT also inlined into the tool-level `description` (review
+# follow-up, coordinator adversarial pass): both descriptions ship on every
+# `list_tools` response, so a second full copy there was ~640 duplicated
+# characters of pure context cost with no reader who couldn't already see the
+# property description in the same payload.
 _SUPPORTED_TEXT_MIME_TYPES_TEXT = ", ".join(SUPPORTED_TEXT_MIME_TYPES)
 
 
@@ -1263,13 +1268,23 @@ _TOOLS: dict[str, ToolDef] = {
         handler=_handle_list_chunks,
     ),
     "upload_document": ToolDef(
+        # Deliberately does NOT repeat the full type list here (that copy
+        # lives once, below, on the `content_type` property) -- restating it
+        # in both places doubled ~640 chars of every `list_tools` response
+        # for no benefit, since a client reading this tool's schema sees the
+        # property description in the same payload. Recommends omission
+        # rather than an explicit declaration because that's the one path
+        # #197 guarantees gets the RIGHT type from the filename automatically
+        # (see the `content_type` property's description for why an explicit
+        # value must never be second-guessed against the filename).
         description="Upload TEXT content for ingestion (same pipeline as POST "
         "/v1/documents, minus binary files — PDF/DOCX/PNG uploads are REST-only by "
-        "design). Content is UTF-8 text; content_type must be one of the "
-        f"{len(SUPPORTED_TEXT_MIME_TYPES)} MCP-eligible types (not all are "
-        f"text/*-prefixed): {_SUPPORTED_TEXT_MIME_TYPES_TEXT}. If omitted, it is "
-        "derived from filename's extension when recognized, else defaults to "
-        "text/markdown. Requires 'write' permission.",
+        "design). Content is UTF-8 text. Omit content_type — the server derives it "
+        "from filename's extension (.py -> text/x-python, .md -> text/markdown, "
+        ".csv -> text/csv, .yaml -> application/yaml, .sql -> application/sql, and "
+        "more; full list: docs/reference/file-types.md). See the content_type "
+        "parameter below only if you need to declare a type explicitly. Requires "
+        "'write' permission.",
         input_schema={
             "type": "object",
             "properties": {
@@ -1285,11 +1300,19 @@ _TOOLS: dict[str, ToolDef] = {
                 "content_type": {
                     "type": "string",
                     "description": "MIME type of the content. Must be one of the "
-                    f"MCP-eligible types: {_SUPPORTED_TEXT_MIME_TYPES_TEXT}. Binary "
-                    "types are rejected — use POST /v1/documents for binary uploads. "
-                    "If omitted, derived from filename's extension when recognized, "
-                    "else falls back to the default below.",
-                    "default": "text/markdown",
+                    f"{len(SUPPORTED_TEXT_MIME_TYPES)} MCP-eligible types: "
+                    f"{_SUPPORTED_TEXT_MIME_TYPES_TEXT}. Binary types are rejected — "
+                    "use POST /v1/documents for binary uploads. RECOMMENDED: omit "
+                    "this field. When omitted, the type is derived from filename's "
+                    "extension when recognized (e.g. main.go -> text/x-go), falling "
+                    "back to text/markdown only for an unrecognized/absent "
+                    "extension. There is deliberately no schema `default` here: "
+                    "many MCP clients auto-fill an omitted argument from its "
+                    "advertised default BEFORE the server ever sees the call, which "
+                    "would turn every filename-based derivation into the same fixed "
+                    "value regardless of the real extension. A value YOU declare "
+                    "explicitly is always honored as-is and never re-derived from "
+                    "the filename.",
                 },
                 "workspace_id": {
                     "type": "string",

@@ -30,7 +30,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from inh_contracts.file_types import FILE_TYPE_REGISTRY, all_mime_types, render_markdown_table
+from inh_contracts.file_types import all_mime_types, render_markdown_table
 
 # tests/unit -> inh-public-api-svc -> services -> repo root (mirrors the
 # existing REPO_ROOT convention in inh-ingestion-svc's
@@ -133,15 +133,23 @@ def test_examples_readme_mentions_every_mime_type():
 # ---------------------------------------------------------------------------
 # #193: docs/reference/mcp-tools.md's upload_document `content_type` docs.
 #
-# This doc already uses a "canonical types spelled out, code-family
-# summarized as 'text/x-python and friends'" style rather than a full 30-item
-# enumeration, so a byte-exact/full-mention check (like the two above) would
-# force spelling out every code-language MIME alias in prose, which is not
-# the doc's own goal. Instead: every MCP-eligible registry SPEC must have AT
-# LEAST ONE of its identifying strings (a mime type or an extension) present
-# somewhere in the doc -- real drift protection (a whole new MCP-surfaced
-# format landing with zero mention here still fails this) without forcing an
-# exhaustive alias dump.
+# Coordinator adversarial-review finding (same #193 pass that flagged the
+# server.py schema `default`): this doc used to hand-restate the accepted
+# type list AND lead with "text/markdown default" -- a flat-default claim
+# that flatly contradicted its own paragraph below explaining the real,
+# extension-derived behavior (#197). That is the identical
+# restate-instead-of-derive defect the schema fix removes, just in prose.
+#
+# Fix applied: the doc no longer enumerates the type list at all (that
+# byte-exact enumeration lives in ONE place, file-types.md, already
+# generated and verified above) -- it links there instead, the same
+# non-exhaustive "representative + link" style used in README.md/
+# docs/index.md (a claim that never asserts completeness cannot drift).
+# What CAN still silently regress is the prose CLAIM about default
+# behavior, so that -- not an exhaustive type list -- is what gets a real,
+# code-derived assertion below: this doc's characterization of the default
+# must keep matching `_default_upload_content_type`'s actual, documented
+# fallback value.
 # ---------------------------------------------------------------------------
 
 
@@ -149,14 +157,52 @@ def test_mcp_tools_doc_exists():
     assert MCP_TOOLS_DOC_PATH.is_file(), f"expected {MCP_TOOLS_DOC_PATH} to exist"
 
 
-def test_mcp_tools_doc_mentions_every_mcp_eligible_format():
+def test_mcp_tools_doc_does_not_claim_a_flat_default():
+    """Regression pin for the coordinator's #193 blocker finding: the doc
+    must never again lead with a flat 'content_type defaults to
+    text/markdown' claim. The real behavior is extension-derived
+    (`_default_upload_content_type` in server.py) -- text/markdown is only
+    the fallback for an unrecognized/absent extension, not "the" default.
+    The specific misleading phrasing this pins against is the literal old
+    table-cell text this doc carried before the fix."""
     text = MCP_TOOLS_DOC_PATH.read_text()
-    for spec in FILE_TYPE_REGISTRY:
-        if "mcp" not in spec.surfaces:
-            continue
-        identifiers = (*spec.mime_types, *spec.extensions)
-        assert any(identifier in text for identifier in identifiers), (
-            f"MCP-eligible format '{spec.key}' ({identifiers}) is not mentioned "
-            f"anywhere in {MCP_TOOLS_DOC_PATH} -- the upload_document content_type "
-            "docs need updating for this format."
-        )
+    assert "`text/markdown` default" not in text, (
+        f"{MCP_TOOLS_DOC_PATH} must not claim content_type has a flat "
+        "'text/markdown default' -- the real default is derived from the "
+        "filename's extension (#197); state that instead."
+    )
+
+
+def test_mcp_tools_doc_explains_extension_derived_default():
+    """Positive counterpart to the pin above: the doc must still correctly
+    explain that an omitted content_type is DERIVED from the filename's
+    extension, falling back to text/markdown only when the extension is
+    unrecognized or absent -- and must link to file-types.md (the single,
+    generated, test-verified source of truth for the exhaustive type list)
+    rather than re-enumerating it by hand."""
+    text = MCP_TOOLS_DOC_PATH.read_text()
+    assert "derived from" in text and "extension" in text, (
+        f"{MCP_TOOLS_DOC_PATH} must explain that an omitted content_type is "
+        "derived from the filename's extension (#197)"
+    )
+    assert "text/markdown" in text, (
+        f"{MCP_TOOLS_DOC_PATH} must still document text/markdown as the "
+        "fallback for an unrecognized/absent extension"
+    )
+    assert "(file-types.md)" in text, (
+        f"{MCP_TOOLS_DOC_PATH} must link to file-types.md as the exhaustive, "
+        "generated type list instead of hand-enumerating types"
+    )
+
+
+def test_mcp_tools_doc_explains_explicit_value_is_never_overridden():
+    """The doc must state the flip side of removing the schema `default`
+    (coordinator review): a caller-supplied content_type is always honored
+    as-is, never silently re-derived from the filename. Without this
+    documented, a reader has no way to know whether an explicit value they
+    pass is trustworthy or subject to a hidden override."""
+    text = MCP_TOOLS_DOC_PATH.read_text()
+    assert "never re-derived from the filename" in text or "never re-derived" in text, (
+        f"{MCP_TOOLS_DOC_PATH} must state that an explicitly-declared "
+        "content_type is honored as-is and never re-derived from the filename"
+    )
