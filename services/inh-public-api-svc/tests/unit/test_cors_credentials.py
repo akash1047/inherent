@@ -10,10 +10,10 @@ from __future__ import annotations
 from src.config.settings import Settings
 
 _DEV_DEFAULT_ORIGINS = [
-    "https://app.inherent.systems",
-    "https://inherent.systems",
-    "https://dev-api.inherent.systems",
-    "https://api.inherent.systems",
+    "https://app.inherent.sh",
+    "https://inherent.sh",
+    "https://dev-api.inherent.sh",
+    "https://api.inherent.sh",
 ]
 
 
@@ -30,7 +30,7 @@ def test_wildcard_origin_forces_credentials_off():
 def test_explicit_origins_keep_credentials():
     s = Settings.model_construct(
         environment="production",
-        cors_origins=["https://app.inherent.systems"],
+        cors_origins=["https://app.inherent.sh"],
         cors_allow_credentials=True,
     )
     assert "*" not in s.cors_origins_list

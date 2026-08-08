@@ -9,7 +9,8 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from src.config.constants import ERROR_TITLES, ERROR_TYPES
+from src.config import settings
+from src.config.constants import ERROR_TITLES, ERROR_TYPE_SLUGS
 
 
 class ProblemDetail(BaseModel):
@@ -29,7 +30,7 @@ class ProblemDetail(BaseModel):
     type: str = Field(
         ...,
         description="URI reference identifying the problem type",
-        json_schema_extra={"example": "https://api.inherent.systems/errors/rate-limit-exceeded"},
+        json_schema_extra={"example": f"{settings.error_base_url}/rate-limit-exceeded"},
     )
     title: str = Field(
         ...,
@@ -66,7 +67,7 @@ class ProblemDetail(BaseModel):
     model_config = {
         "json_schema_extra": {
             "example": {
-                "type": "https://api.inherent.systems/errors/rate-limit-exceeded",
+                "type": f"{settings.error_base_url}/rate-limit-exceeded",
                 "title": "Rate Limit Exceeded",
                 "status": 429,
                 "detail": "You have exceeded your rate limit of 100 requests per minute.",
@@ -89,6 +90,18 @@ class ProblemDetail(BaseModel):
         return result
 
 
+def _build_error_type(error_key: str) -> str:
+    """Build the RFC 7807 `type` URI for an error key from LIVE configuration (#222).
+
+    Reads settings.error_base_url at call time -- not a frozen module-level
+    dict -- so an ERROR_BASE_URL env var override (prod api.inherent.sh vs dev
+    dev-api.inherent.sh, or a future domain) reaches every served response
+    with a single setting, never a grep across constants.py.
+    """
+    slug = ERROR_TYPE_SLUGS.get(error_key, ERROR_TYPE_SLUGS["internal_error"])
+    return f"{settings.error_base_url}/{slug}"
+
+
 def create_problem_detail(
     error_key: str,
     status: int,
@@ -100,7 +113,7 @@ def create_problem_detail(
     """Create a Problem Details response dictionary.
 
     Args:
-        error_key: Key for ERROR_TYPES and ERROR_TITLES lookup.
+        error_key: Key for ERROR_TYPE_SLUGS and ERROR_TITLES lookup.
         status: HTTP status code.
         detail: Human-readable error description.
         instance: Request path or URI.
@@ -111,7 +124,7 @@ def create_problem_detail(
         Dictionary suitable for JSON response.
     """
     problem = ProblemDetail(
-        type=ERROR_TYPES.get(error_key, ERROR_TYPES["internal_error"]),
+        type=_build_error_type(error_key),
         title=ERROR_TITLES.get(error_key, ERROR_TITLES["internal_error"]),
         status=status,
         detail=detail,
@@ -149,7 +162,12 @@ def from_exception(
         )
 
     problem = ProblemDetail(
-        type=exc.error_type,
+        # Built from exc.error_key + the LIVE configured base (_build_error_type),
+        # not exc.error_type -- the latter is a static snapshot from
+        # src/config/constants.py (see its docstring) that can't see a
+        # settings.error_base_url override. Every served response must reflect
+        # the live config; only the exception class's own property is static.
+        type=_build_error_type(exc.error_key),
         title=exc.title,
         status=exc.status_code,
         detail=exc.detail,

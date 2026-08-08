@@ -7,7 +7,7 @@ from inh_contracts.defaults import DEFAULT_MONGODB_URI, DEFAULT_S3_BUCKET, DEFAU
 from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from src.config.constants import DEFAULT_DATABASE_NAME
+from src.config.constants import DEFAULT_DATABASE_NAME, ERROR_BASE_URL
 
 
 class Settings(BaseSettings):
@@ -164,12 +164,22 @@ class Settings(BaseSettings):
     trusted_proxies: list[str] = Field(default=[])
 
     # CORS Configuration
+    #
+    # Judgement call (#222): the `.systems` domain is retired, not just renamed --
+    # continuing to allow-list a domain we no longer control is a dangling-domain
+    # risk (if it's ever re-registered by someone else, that party inherits a
+    # standing credentialed-CORS grant). Unlike the RFC 7807 `type` URI (a
+    # documentation reference, harmless if briefly wrong), these origins are a
+    # live security boundary, so they were changed outright to `.sh` rather than
+    # kept for compatibility. If `.systems` frontends are still deployed during a
+    # migration window, add their `.sh`-equivalent origins here explicitly instead
+    # of reinstating the retired domain.
     cors_origins: list[str] = Field(
         default=[
-            "https://app.inherent.systems",
-            "https://inherent.systems",
-            "https://dev-api.inherent.systems",
-            "https://api.inherent.systems",
+            "https://app.inherent.sh",
+            "https://inherent.sh",
+            "https://dev-api.inherent.sh",
+            "https://api.inherent.sh",
         ],
         description="Allowed CORS origins. Use ['*'] for development only.",
     )
@@ -187,6 +197,25 @@ class Settings(BaseSettings):
         description="Enable HSTS header in production",
     )
     api_key_header_name: str = "X-API-Key"
+
+    # RFC 7807 error `type` base URL (#222). The retired `.systems` domain used
+    # to be hardcoded straight into src/config/constants.py, so a domain change
+    # was a repo-wide grep-and-replace and every served `type` pointed at a dead
+    # host. This is now the single knob: src/core/problem_details.py reads
+    # settings.error_base_url at call time (not a frozen constant) when building
+    # every served response's `type`, so pointing prod at api.inherent.sh and dev
+    # at dev-api.inherent.sh (or a future domain) is one env var, not a grep.
+    # Default matches constants.ERROR_BASE_URL so the two agree out of the box;
+    # they're independent knobs only because src/core/exceptions.py (static
+    # InherentAPIError.error_type, not on the served-response path -- see
+    # problem_details.from_exception) can't depend on Settings without a
+    # constants<->settings import cycle.
+    error_base_url: str = Field(
+        default=ERROR_BASE_URL,
+        alias="ERROR_BASE_URL",
+        description="Base URL for RFC 7807 problem `type` URIs, e.g. "
+        "https://api.inherent.sh/errors (prod) or https://dev-api.inherent.sh/errors (dev).",
+    )
 
     # Embedding service (TEI sidecar; same one ingestion-svc uses)
     embedding_service_url: str = Field(
@@ -373,10 +402,10 @@ class Settings(BaseSettings):
     def cors_origins_list(self) -> list[str]:
         """Get CORS origins, allowing all in development if not explicitly set."""
         if self.is_development and self.cors_origins == [
-            "https://app.inherent.systems",
-            "https://inherent.systems",
-            "https://dev-api.inherent.systems",
-            "https://api.inherent.systems",
+            "https://app.inherent.sh",
+            "https://inherent.sh",
+            "https://dev-api.inherent.sh",
+            "https://api.inherent.sh",
         ]:
             return ["*"]
         return self.cors_origins

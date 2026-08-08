@@ -1,13 +1,53 @@
 # MCP tools reference
 
-The public API service ships an MCP server (`inherent-knowledge-base`)
-exposing the same capabilities as the REST API with matching permission
-enforcement and failure behavior.
+The public API service ships an MCP server (`inherent-knowledge-base`) on
+**two transports** — stdio and Streamable HTTP — exposing the same
+capabilities as the REST API with matching permission enforcement and
+failure behavior. Both transports derive from the exact same `_TOOLS`
+registry (`src/mcp_server/server.py`), so the advertised surface cannot drift
+from the enforced one on either transport.
 
-## Running & transport
+## Transports
 
-- **Transport: stdio.** Start the service with `SERVICE_MODE=mcp`; the MCP
-  server runs as its own process (it is not mounted on the REST app).
+### Streamable HTTP (customer-facing, #220)
+
+`POST /mcp` is mounted on the SAME app/port as the REST API
+(`inh-public-api-svc`) — no separate process, no database credentials on
+the client side. This is the transport SaaS customers use:
+
+```bash
+claude mcp add --transport http inherent https://api.inherent.sh/mcp \
+  --header "X-API-Key: ink_..."
+```
+
+- **Auth: header, not schema.** The API key comes from the `X-API-Key` or
+  `Authorization: Bearer` request header — the SAME dependency REST routes
+  use (`get_api_key_info` in `src/services/auth.py`) — and **`api_key` is
+  removed from every tool's schema** on this transport. An agent that sees
+  `api_key` in a schema will hunt for the secret and may echo it into
+  context, logs, or transcripts; routing auth through the header instead of
+  a tool argument removes that surface entirely. Missing/invalid/expired
+  keys get the same 401 REST returns, before any JSON-RPC request is even
+  parsed.
+- **Tool surface: 10, not 13.** `verify_claim`, `search_memory`, and
+  `get_citations` are not advertised and cannot be called by name over HTTP
+  (see [Surface difference](#surface-difference-http-vs-stdio) below) —
+  unchanged on stdio.
+- Rides the REST app's existing middleware stack — CORS, security headers,
+  audit logging, and **rate limiting** all apply to `/mcp` the same way they
+  apply to `/v1/*`, by construction (no second copy to keep in sync).
+- Stateless: every call (`initialize`, `tools/list`, `tools/call`) is one
+  independent HTTP request; the key is re-validated on every call.
+- Tool errors set `isError: true` with a machine-branchable `error_class` in
+  `structuredContent` (e.g. `authorization_failed`, `not_found`,
+  `validation_error`, `unknown_tool`, `internal_error`) instead of the plain
+  prose stdio still returns.
+
+### stdio (self-hosters / internal development)
+
+- Start the service with `SERVICE_MODE=mcp`; the MCP server runs as its own
+  process (not mounted on the REST app), for self-hosters and internal dev
+  running the full stack with production-shaped credentials.
 - Every tool call carries the API key as a schema argument (`api_key`) —
   there are no transport headers on stdio (no `X-Workspace-Id`; use the
   `workspace_id` schema argument instead). The key is validated and the
@@ -18,42 +58,78 @@ enforcement and failure behavior.
   exactly its one workspace — a `workspace_id` naming any other workspace
   is rejected, even one the key's owner also owns. A user-scoped key
   (`workspace_id` unset on the key) may use any workspace its owner owns.
-- Tools, schemas, permissions, and dispatch all derive from a single
-  `_TOOLS` registry entry per tool, so the advertised surface cannot drift
-  from the enforced one.
+- **All 13 tools** are advertised and callable, including the 3 excluded
+  from HTTP (below) — unaffected by the HTTP transport's existence.
+
+## Surface difference: HTTP vs stdio
+
+| | stdio | Streamable HTTP |
+| --- | --- | --- |
+| Tool count | 13 | 10 |
+| API key | `api_key` schema argument | `X-API-Key` / `Authorization` header |
+| `verify_claim` | ✅ | ❌ excluded |
+| `search_memory` | ✅ | ❌ excluded |
+| `get_citations` | ✅ | ❌ excluded |
+| Tool error shape | prose `TextContent`, `isError: false` | `isError: true` + `error_class` |
+
+Three tools are excluded from HTTP (`ToolDef.http_exposed = False` in the
+registry — the exclusion is data on the tool's own entry, not a second
+name list maintained separately):
+
+- **`verify_claim`** — `src/services/verify.py` is an offline lexical
+  token-overlap counter with no LLM and no negation handling. Against the
+  source sentence *"Either party may cancel this Agreement at any time,"*
+  it scores the claim *"**Neither** party may cancel this Agreement at any
+  time"* as `strong, 0.833` support — the opposite of the truth. Sound as an
+  internal pre-filter; unsafe under a tool name an HTTP agent reads as
+  entailment. Still on stdio and REST; will return to HTTP once it is NLI-
+  or LLM-backed.
+- **`search_memory`** — identical behavior to `search_documents`; two tools
+  doing one job costs every HTTP agent permanent context overhead for no
+  added capability.
+- **`get_citations`** — same parameters and endpoint as `search_documents`,
+  whose results already carry a full `citation` object per result
+  (`chunk_id`, `document_name`, `content`, `start_char`, `end_char`).
 
 ## Tools
 
-All tools require `api_key` (string). Additional parameters below.
+The full, stdio-side catalogue (all 13 tools). The **HTTP** column marks
+whether a tool is also on the Streamable HTTP surface (see
+[Surface difference](#surface-difference-http-vs-stdio) above) —
+`report_feedback` is stdio/REST-only too (not part of the issue #220's
+10-tool HTTP list; a pending decision, not a permanent exclusion). On
+stdio every tool requires `api_key` (string) as a schema argument; on HTTP
+the key is a header and `api_key` never appears in the schema. Additional
+parameters below.
 
 ### Search (`search` permission)
 
-| Tool | Parameters | Purpose | REST twin |
-| --- | --- | --- | --- |
-| `search_documents` | `query` (required); `workspace_id`, `limit` (10), `min_score` (0.0), `document_ids[]`, `search_mode` (`semantic`/`hybrid`/`keyword`), `alpha` (0.7) | Search chunks; with no `workspace_id`, fans out across every workspace the key is authorized for (its one bound workspace if scoped, otherwise every workspace its owner owns) | `POST /v1/search` |
-| `search_memory` | same as `search_documents` | Memory-primitive alias — identical behavior | `POST /v1/search` |
-| `get_citations` | same as `search_documents` | Search returning claim-level citation objects (spans, score, provenance, freshness) | `POST /v1/search` |
-| `report_feedback` | `event_id`, `verdict` (`answered`/`partial`/`not_relevant`) required; `useful_chunk_ids[]`, `note` | Record a verdict on a captured search event; builds the workspace eval set | `POST /v1/evals/feedback` |
-| `get_retrieval_health` | `workspace_id` (required) | Workspace retrieval scorecard | `GET /v1/evals/scorecard` |
+| Tool | HTTP | Parameters | Purpose | REST twin |
+| --- | --- | --- | --- | --- |
+| `search_documents` | ✅ | `query` (required); `workspace_id`, `limit` (10), `min_score` (0.0), `document_ids[]`, `search_mode` (`semantic`/`hybrid`/`keyword`), `alpha` (0.7) | Search chunks; with no `workspace_id`, fans out across every workspace the key is authorized for (its one bound workspace if scoped, otherwise every workspace its owner owns) | `POST /v1/search` |
+| `search_memory` | ❌ | same as `search_documents` | Memory-primitive alias — identical behavior | `POST /v1/search` |
+| `get_citations` | ❌ | same as `search_documents` | Search returning claim-level citation objects (spans, score, provenance, freshness) | `POST /v1/search` |
+| `report_feedback` | ❌ | `event_id`, `verdict` (`answered`/`partial`/`not_relevant`) required; `useful_chunk_ids[]`, `note` | Record a verdict on a captured search event; builds the workspace eval set | `POST /v1/evals/feedback` |
+| `get_retrieval_health` | ✅ | `workspace_id` (required) | Workspace retrieval scorecard | `GET /v1/evals/scorecard` |
 
 ### Read (`read` permission)
 
-| Tool | Parameters | Purpose | REST twin |
-| --- | --- | --- | --- |
-| `list_documents` | `workspace_id`, `page` (1), `page_size` (20) | Paginated document listing | `GET /v1/documents` |
-| `get_document` | `document_id` (required) | Single document's metadata | `GET /v1/documents/{id}` |
-| `list_chunks` | `document_id` (required) | All chunks for a document | `GET /v1/chunks/{document_id}` |
-| `get_document_context` | `document_id` (required) | Full concatenated chunk text + metadata header | `GET /v1/chunks/{document_id}/context` |
-| `verify_claim` | `claim` (required); `evidence[]` | Offline lexical claim-vs-evidence support scoring | `POST /v1/verify-claim` |
-| `explain_lineage` | `document_id` (required); `chunk_id` | Provenance + freshness for a document or chunk | `GET /v1/documents/{id}/lineage` |
+| Tool | HTTP | Parameters | Purpose | REST twin |
+| --- | --- | --- | --- | --- |
+| `list_documents` | ✅ | `workspace_id`, `page` (1), `page_size` (20) | Paginated document listing | `GET /v1/documents` |
+| `get_document` | ✅ | `document_id` (required) | Single document's metadata | `GET /v1/documents/{id}` |
+| `list_chunks` | ✅ | `document_id` (required) | All chunks for a document | `GET /v1/chunks/{document_id}` |
+| `get_document_context` | ✅ | `document_id` (required); `max_chars` (default 20,000, capped at 100,000), `offset` (default 0) | Bounded window of chunk text + metadata header, capped at `max_chars` (#219: an uncapped call used to be able to exhaust an agent's own context window). Structured JSON block carries `truncated`, `total_chars`, `offset`, `next_offset` — if `truncated` is `true`, re-call with `offset=next_offset` for the rest | `GET /v1/chunks/{document_id}/context` |
+| `verify_claim` | ❌ | `claim` (required); `evidence[]` | Offline lexical claim-vs-evidence support scoring | `POST /v1/verify-claim` |
+| `explain_lineage` | ✅ | `document_id` (required); `chunk_id` | Provenance + freshness for a document or chunk | `GET /v1/documents/{id}/lineage` |
 
 ### Write (`write` permission)
 
-| Tool | Parameters | Purpose | REST twin |
-| --- | --- | --- | --- |
-| `upload_document` | `filename`, `content` (required); `content_type` (optional — omit it: derived from `filename`'s extension, see below), `workspace_id` | **Text-only** ingestion sharing REST's validate/dedup/store/enqueue pipeline. Binary formats (PDF/DOCX/PNG) and JSON are REST-only — use `POST /v1/documents`. If the key owns several workspaces, `workspace_id` is required | `POST /v1/documents` |
-| `delete_document` | `document_id` (required) | Permanently delete document + vectors + chunks + stored bytes | `DELETE /v1/documents/{id}` |
-| `refresh_stale_source` | `document_id` (required) | Re-enqueue an uploaded document to clear staleness; on MQ failure a retried best-effort compensation marks it `failed`, matching REST (see the REST reference for exhaustion behavior) | `POST /v1/documents/{id}/refresh` |
+| Tool | HTTP | Parameters | Purpose | REST twin |
+| --- | --- | --- | --- | --- |
+| `upload_document` | ✅ | `filename`, `content` (required); `content_type` (optional — omit it: derived from `filename`'s extension, see below), `workspace_id` | **Text-only** ingestion sharing REST's validate/dedup/store/enqueue pipeline. Binary formats (PDF/DOCX/PNG) and JSON are REST-only — use `POST /v1/documents`. If the key owns several workspaces, `workspace_id` is required | `POST /v1/documents` |
+| `delete_document` | ✅ | `document_id` (required) | Permanently delete document + vectors + chunks + stored bytes | `DELETE /v1/documents/{id}` |
+| `refresh_stale_source` | ✅ | `document_id` (required) | Re-enqueue an uploaded document to clear staleness; on MQ failure a retried best-effort compensation marks it `failed`, matching REST (see the REST reference for exhaustion behavior) | `POST /v1/documents/{id}/refresh` |
 
 **`content_type`: omit it.** The `upload_document` accepted `content_type`
 set is the `surfaces` field of the [file-type registry](file-types.md)

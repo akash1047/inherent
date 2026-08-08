@@ -10,7 +10,10 @@ and binds all datastore ports to `127.0.0.1`.
     per-service:
 
     - `SERVICE_MODE`: public-api accepts `api`/`mcp`/`both`; ingestion
-      accepts `worker`/`standalone`/`migrate`.
+      accepts `worker`/`standalone`/`migrate`. This selects the **stdio**
+      MCP process only — the Streamable HTTP MCP transport (`POST /mcp`,
+      #220) is mounted on the `api`/`both` REST app regardless of this
+      setting; see the [MCP tools reference](mcp-tools.md#transports).
     - `API_PORT`: ingestion's standalone port (8000) vs public-api's
       override of `PORT` (8080).
     - `REDIS_URL`: ingestion's MQ backend vs public-api's distributed
@@ -22,9 +25,9 @@ and binds all datastore ports to `127.0.0.1`.
 
 | Variable | Default | Effect |
 | --- | --- | --- |
-| `SERVICE_MODE` | `both` | `api`, `mcp`, or `both` (`both` starts REST; run MCP as a separate `mcp` process) |
-| `PORT` / `API_PORT` | `8080` / unset | HTTP port; `API_PORT` overrides `PORT` when set |
-| `MCP_PORT` | `8001` | Reserved — unused; MCP runs on stdio (see the MCP tools reference) |
+| `SERVICE_MODE` | `both` | `api`, `mcp`, or `both`. `both`/`api` start REST **and mount the Streamable HTTP MCP transport at `POST /mcp`** on the same app/port (#220); `mcp` runs the separate **stdio** MCP process instead (self-hosters/internal dev) |
+| `PORT` / `API_PORT` | `8080` / unset | HTTP port for REST **and** `/mcp` (they share one app/port) — `API_PORT` overrides `PORT` when set |
+| `MCP_PORT` | `8001` | Reserved — still unused. The HTTP MCP transport is mounted on `PORT`/`API_PORT`, not a separate port (see the MCP tools reference) |
 | `ENVIRONMENT` | `development` | `development`/`production`; gates HSTS and CORS behavior |
 | `LOG_LEVEL` | `INFO` | Logging verbosity |
 
@@ -84,7 +87,8 @@ and binds all datastore ports to `127.0.0.1`.
 | --- | --- | --- |
 | `API_KEY_HEADER_NAME` | `X-API-Key` | Header carrying the client API key |
 | `ENABLE_HSTS` | `true` | Emit HSTS header in production |
-| `CORS_ORIGINS` | inherent.systems origins | Allowed origins (wildcard in dev if unchanged) |
+| `ERROR_BASE_URL` | `https://api.inherent.sh/errors` | Base URL for every served RFC 7807 problem `type` URI (dev default should be `https://dev-api.inherent.sh/errors`). One setting, not a hardcoded domain (#222) |
+| `CORS_ORIGINS` | inherent.sh origins | Allowed origins (wildcard in dev if unchanged) |
 | `CORS_ALLOW_CREDENTIALS` / `CORS_ALLOW_METHODS` / `CORS_ALLOW_HEADERS` | `true` / all standard / `*` | CORS details (credentials forced off with wildcard origin) |
 | `METRICS_ENABLED` / `METRICS_PATH` | `true` / `/metrics` | Prometheus endpoint |
 | `DATABASE_HEALTH_CHECK_TIMEOUT_SECONDS` | `5.0` | Postgres health-check timeout, used by `GET /health/ready` (#203; replaces the dead `HEALTH_CHECK_TIMEOUT_SECONDS`) |

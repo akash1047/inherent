@@ -4,6 +4,12 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from src.config import settings
+
+# OpenAPI examples below are built from the live configured base (#222) so the
+# published spec's example `type` values match what the service actually serves
+# (settings.error_base_url), instead of a hardcoded domain that can drift from it.
+
 
 class ErrorResponse(BaseModel):
     """RFC 7807 Problem Details error response.
@@ -14,7 +20,7 @@ class ErrorResponse(BaseModel):
     type: str = Field(
         ...,
         description="URI reference identifying the problem type",
-        json_schema_extra={"example": "https://api.inherent.systems/errors/authentication-failed"},
+        json_schema_extra={"example": f"{settings.error_base_url}/authentication-failed"},
     )
     title: str = Field(
         ...,
@@ -50,7 +56,7 @@ class ErrorResponse(BaseModel):
     model_config = {
         "json_schema_extra": {
             "example": {
-                "type": "https://api.inherent.systems/errors/authentication-failed",
+                "type": f"{settings.error_base_url}/authentication-failed",
                 "title": "Authentication Failed",
                 "status": 401,
                 "detail": "Invalid or missing API key.",
@@ -93,7 +99,7 @@ class ValidationErrorResponse(ErrorResponse):
     model_config = {
         "json_schema_extra": {
             "example": {
-                "type": "https://api.inherent.systems/errors/validation-error",
+                "type": f"{settings.error_base_url}/validation-error",
                 "title": "Validation Error",
                 "status": 422,
                 "detail": "Request validation failed.",
@@ -134,7 +140,7 @@ class RateLimitErrorResponse(ErrorResponse):
     model_config = {
         "json_schema_extra": {
             "example": {
-                "type": "https://api.inherent.systems/errors/rate-limit-exceeded",
+                "type": f"{settings.error_base_url}/rate-limit-exceeded",
                 "title": "Rate Limit Exceeded",
                 "status": 429,
                 "detail": "You have exceeded your rate limit of 100 requests per minute.",

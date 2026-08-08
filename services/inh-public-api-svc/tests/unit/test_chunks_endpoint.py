@@ -228,6 +228,13 @@ class TestGetDocumentContext:
         )
         assert data["full_text"] == expected_text
 
+        # #219: a document well under the default max_chars comes back whole
+        # and reports itself as not truncated / nothing left to page.
+        assert data["truncated"] is False
+        assert data["total_chars"] == len(expected_text)
+        assert data["offset"] == 0
+        assert data["next_offset"] is None
+
     async def test_get_context_document_not_found(self, client, mock_db_service):
         """Should return 404 when document does not exist."""
         mock_db_service.get_document = AsyncMock(return_value=None)
@@ -309,3 +316,137 @@ class TestGetDocumentContext:
         data = response.json()
         assert data["full_text"] == "Only chunk content here."
         assert len(data["chunks"]) == 1
+        assert data["truncated"] is False
+
+
+class TestGetDocumentContextBounds:
+    """#219: max_chars / offset bounding for GET /v1/chunks/{document_id}/context.
+
+    The unbounded endpoint concatenated every chunk with no limit -- a
+    169-chunk PDF returned 298 KB / 117,086 chars in one response, about
+    29,300 tokens. These tests pin the default bound, the truncation
+    signalling, offset-based paging, and max_chars validation.
+    """
+
+    @pytest.fixture
+    def long_chunks(self):
+        """5 chunks of 6,000 chars each -> 30,008 chars joined (4 "\\n\\n"
+        separators), comfortably over the 20,000-char default bound."""
+        return [
+            DocumentChunk(
+                id=f"chunk-{i}",
+                document_id="doc-001",
+                content="x" * 6000,
+                chunk_index=i,
+                token_count=6000,
+                metadata=None,
+            )
+            for i in range(5)
+        ]
+
+    async def test_default_max_chars_truncates_full_text_and_chunks(
+        self, client, mock_db_service, sample_document, long_chunks
+    ):
+        """With no query params, a long document is capped at the default
+        bound -- and the `chunks` array is capped to the SAME window, not
+        returned in full (the actual #219 defect: truncating only full_text
+        would still ship every chunk object)."""
+        mock_db_service.get_document = AsyncMock(return_value=sample_document)
+        mock_db_service.get_document_chunks = AsyncMock(return_value=long_chunks)
+
+        response = await client.get(
+            "/v1/chunks/doc-001/context", headers={"X-API-Key": "ink_test_key"}
+        )
+        assert response.status_code == 200
+        data = response.json()
+
+        assert data["truncated"] is True
+        assert data["total_chars"] == 6000 * 5 + 2 * 4
+        assert data["next_offset"] == 20000
+        assert data["offset"] == 0
+        # full_text is bounded to ~max_chars (plus a small truncation marker).
+        assert len(data["full_text"]) < 20000 + 100
+        assert "truncated" in data["full_text"]
+        # chunk 4 starts at char 24,008 -- entirely past the 20,000-char
+        # window -- so it must be dropped from `chunks`, same as full_text.
+        assert len(data["chunks"]) == 4
+        assert {c["id"] for c in data["chunks"]} == {
+            "chunk-0",
+            "chunk-1",
+            "chunk-2",
+            "chunk-3",
+        }
+
+    async def test_offset_pages_through_the_remainder(
+        self, client, mock_db_service, sample_document, long_chunks
+    ):
+        """Following next_offset from a truncated page returns the rest of
+        the document, ending non-truncated."""
+        mock_db_service.get_document = AsyncMock(return_value=sample_document)
+        mock_db_service.get_document_chunks = AsyncMock(return_value=long_chunks)
+
+        first = await client.get(
+            "/v1/chunks/doc-001/context", headers={"X-API-Key": "ink_test_key"}
+        )
+        next_offset = first.json()["next_offset"]
+
+        second = await client.get(
+            f"/v1/chunks/doc-001/context?offset={next_offset}",
+            headers={"X-API-Key": "ink_test_key"},
+        )
+        assert second.status_code == 200
+        data = second.json()
+        assert data["truncated"] is False
+        assert data["next_offset"] is None
+        assert data["offset"] == next_offset
+        # chunk 4 (the one dropped from page 1) must show up on page 2.
+        assert "chunk-4" in {c["id"] for c in data["chunks"]}
+
+    async def test_custom_max_chars_is_honored(
+        self, client, mock_db_service, sample_document, long_chunks
+    ):
+        """An explicit max_chars overrides the default bound."""
+        mock_db_service.get_document = AsyncMock(return_value=sample_document)
+        mock_db_service.get_document_chunks = AsyncMock(return_value=long_chunks)
+
+        response = await client.get(
+            "/v1/chunks/doc-001/context?max_chars=100",
+            headers={"X-API-Key": "ink_test_key"},
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["truncated"] is True
+        assert data["next_offset"] == 100
+
+    @pytest.mark.parametrize("max_chars", [0, -1, -100])
+    async def test_non_positive_max_chars_is_rejected(
+        self, client, mock_db_service, sample_document, sample_chunks, max_chars
+    ):
+        """max_chars must be >= 1 -- 0 or negative is a validation error, not
+        silently interpreted as "no limit" or "empty"."""
+        response = await client.get(
+            f"/v1/chunks/doc-001/context?max_chars={max_chars}",
+            headers={"X-API-Key": "ink_test_key"},
+        )
+        assert response.status_code == 422
+
+    async def test_max_chars_above_cap_is_rejected(
+        self, client, mock_db_service, sample_document, sample_chunks
+    ):
+        """max_chars is capped at a sane maximum -- an oversized request is
+        rejected rather than silently returning the whole unbounded payload
+        the endpoint used to ship."""
+        response = await client.get(
+            "/v1/chunks/doc-001/context?max_chars=1000000",
+            headers={"X-API-Key": "ink_test_key"},
+        )
+        assert response.status_code == 422
+
+    async def test_negative_offset_is_rejected(
+        self, client, mock_db_service, sample_document, sample_chunks
+    ):
+        response = await client.get(
+            "/v1/chunks/doc-001/context?offset=-1",
+            headers={"X-API-Key": "ink_test_key"},
+        )
+        assert response.status_code == 422

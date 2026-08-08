@@ -2,7 +2,6 @@
 
 import asyncio
 import json
-import re
 import time
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -551,6 +550,28 @@ class SearchService:
             if score < request.min_score:
                 continue
 
+            # Exact document_id post-filter (#218 follow-up). The Weaviate
+            # `where: ContainsAny` clause built in `_build_graphql` is NOT an
+            # exact match: `document_id` is a `DataType.TEXT` property that
+            # takes Weaviate's default `word` tokenization (see
+            # services/inh-ingestion-svc/src/services/weaviate.py
+            # `_get_chunk_properties`), and `ContainsAny` matches on TOKENS of
+            # the property, not the whole string. A hyphenated UUID such as
+            # "d48ddf8d-7758-4af6-8319-d4c0d29518ac" tokenizes into five
+            # pieces (d48ddf8d, 7758, 4af6, 8319, d4c0d29518ac); ContainsAny
+            # matches if ANY supplied token matches ANY stored token, so a
+            # chunk belonging to a completely different document that merely
+            # shares one token (e.g. another id containing "7758") passes the
+            # server-side filter. Re-checking the full id string here closes
+            # that gap so a caller who asked for specific document_ids never
+            # silently receives a document they did not ask for. Do NOT
+            # remove this as "redundant" with the `where` clause -- the
+            # server-side filter is a superset, not an exact match, until the
+            # collection's tokenization is migrated to `FIELD` (schema
+            # migration + full reindex, tracked separately; see #218).
+            if request.document_ids and chunk.get("document_id") not in request.document_ids:
+                continue
+
             # Pass through any extra chunk fields (e.g. freshness metadata) so
             # downstream consumers keep them (#45). chunk_index is preserved for
             # backward compatibility; known core fields are not duplicated.
@@ -718,11 +739,18 @@ class SearchService:
         computed here for semantic/hybrid modes (#13).
         """
         escaped_query = request.query.replace("\\", "\\\\").replace('"', '\\"')
-        # Over-fetch when a min_score filter is active: Weaviate returns exactly
-        # `limit` rows, then min_score is applied client-side, so without this a
-        # page could come back short even when more above-threshold matches
-        # exist. Results are truncated back to request.limit after filtering (#31).
-        fetch_limit = min(100, request.limit * 3) if request.min_score > 0 else request.limit
+        # Over-fetch when a client-side filter is active: Weaviate returns
+        # exactly `limit` rows, then filtering is applied client-side, so
+        # without this a page could come back short even when more matches
+        # exist. Two independent client-side filters need this:
+        #   - min_score  (#31): rows below the threshold are dropped.
+        #   - document_ids (#218 follow-up): the server-side `where:
+        #     ContainsAny` clause is a token match, not exact (see the
+        #     document_id post-filter in _search_weaviate), so rows for a
+        #     token-colliding foreign document are dropped after the fact.
+        # Results are truncated back to request.limit after filtering.
+        needs_over_fetch = request.min_score > 0 or bool(request.document_ids)
+        fetch_limit = min(100, request.limit * 3) if needs_over_fetch else request.limit
         # Diversification (#146, on by default since 2026-08-06) needs a wider
         # candidate pool to diversify across -- fetching exactly `limit` rows
         # leaves nothing to round-robin against once the top document's
@@ -735,12 +763,9 @@ class SearchService:
             )
         where_clause = ""
         if request.document_ids:
-            where_filter: dict[str, Any] = {
-                "path": ["document_id"],
-                "operator": "ContainsAny",
-                "valueTextArray": request.document_ids,
-            }
-            where_clause = f"where: {self._format_where(where_filter)}"
+            where_clause = (
+                f"where: {self._format_where(['document_id'], 'ContainsAny', request.document_ids)}"
+            )
 
         if request.search_mode == "keyword":
             search_args = f'bm25: {{ query: "{escaped_query}" }}'
@@ -790,12 +815,42 @@ class SearchService:
         """
         return {"query": gql}
 
-    def _format_where(self, filter_dict: dict) -> str:
-        """Format a where filter dict as Weaviate GraphQL syntax."""
-        # Convert dict to JSON-like string but without quotes on keys
-        json_str = json.dumps(filter_dict)
-        # Remove quotes from keys (Weaviate GraphQL syntax)
-        return re.sub(r'"(\w+)":', r"\1:", json_str)
+    # GraphQL enum values Weaviate's `where.operator` argument accepts that
+    # this service actually emits. An explicit allowlist (not just a type
+    # hint) so a typo or a future new operator fails loudly at call time
+    # instead of being interpolated unchecked into a GraphQL query string
+    # (#218 pattern sweep).
+    _WHERE_OPERATORS = frozenset({"Equal", "ContainsAny", "ContainsAll"})
+
+    @staticmethod
+    def _format_where(path: list[str], operator: str, value: str | list[str]) -> str:
+        """Render a Weaviate GraphQL ``where`` filter from typed parts (#218).
+
+        Built from typed inputs rather than ``json.dumps``-ing a Python dict
+        and regex-stripping quotes off its keys. That approach (the pre-#218
+        code) only ever unquoted dict *keys*, so ``operator`` -- a GraphQL
+        **enum**, which Weaviate requires unquoted (``operator: Equal``) --
+        stayed wrapped in quotes (``operator: "Equal"``), a GraphQL syntax
+        error Weaviate reported as an opaque 500. It also carried over the
+        Python-client v3 field name ``valueTextArray``, which is not a valid
+        Weaviate GraphQL argument at all -- the GraphQL argument is always
+        ``valueText``, whether the literal is a scalar (``Equal``) or an
+        array (``ContainsAny`` / ``ContainsAll``).
+
+        ``operator`` is validated against :data:`_WHERE_OPERATORS` and
+        emitted unquoted; ``path`` and any string ``value`` are rendered
+        through :func:`json.dumps` so a value containing a quote or
+        backslash (e.g. a hostile ``document_id``) is escaped *inside* its
+        own string literal and can never break out into the surrounding
+        query (GraphQL and JSON string-escaping rules are compatible, and
+        ``json.dumps``'s default ``ensure_ascii`` routes any
+        newline-like Unicode separator through a ``\\uXXXX`` escape too).
+        """
+        if operator not in SearchService._WHERE_OPERATORS:
+            raise ValueError(f"Unsupported where-filter operator: {operator!r}")
+        path_literal = json.dumps(path)
+        value_literal = json.dumps(value)
+        return f"{{ path: {path_literal}, operator: {operator}, valueText: {value_literal} }}"
 
 
 # Singleton

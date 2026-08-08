@@ -290,7 +290,7 @@ curl -s -X POST "$API_BASE/v1/documents" \
 
 ```json
 {
-  "type": "https://api.inherent.systems/errors/bad-request",
+  "type": "https://api.inherent.sh/errors/bad-request",
   "title": "Bad Request",
   "status": 400,
   "detail": "Unsupported file type 'application/octet-stream'. Allowed types: text/plain, text/markdown, text/csv, text/html, application/pdf, application/json, application/vnd.openxmlformats-officedocument.wordprocessingml.document, application/vnd.openxmlformats-officedocument.spreadsheetml.sheet, application/vnd.openxmlformats-officedocument.presentationml.presentation, image/png, message/rfc822, application/epub+zip, application/rtf, text/rtf, application/vnd.oasis.opendocument.text, application/yaml, text/yaml, application/toml, application/xml, text/xml, text/x-python, application/javascript, text/javascript, application/typescript, text/x-go, text/x-java-source, text/x-rustsrc, text/x-csrc, text/x-chdr, text/x-c++src, text/x-csharp, text/x-ruby, text/x-php, text/x-swift, text/x-kotlin, text/x-scala, application/x-sh, text/x-sh, application/sql, text/x-sql, text/x-r-source, text/x-lua, application/x-subrip, text/vtt"
@@ -319,7 +319,7 @@ curl -s -X POST "$API_BASE/v1/documents" \
 
 ```json
 {
-  "type": "https://api.inherent.systems/errors/bad-request",
+  "type": "https://api.inherent.sh/errors/bad-request",
   "title": "Bad Request",
   "status": 400,
   "detail": "File content does not match the declared content type 'text/plain': the bytes match the 'png' file signature instead."

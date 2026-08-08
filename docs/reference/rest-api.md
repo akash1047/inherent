@@ -73,9 +73,21 @@ retrieval — see [Keeping content current](../keeping-content-current.md).
 
 | Method | Path | Permission | Purpose |
 | --- | --- | --- | --- |
-| GET | `/v1/chunks/{document_id}` | `read` | All chunks (`content`, `chunk_index`, `token_count`, `metadata`) |
-| GET | `/v1/chunks/{document_id}/context` | `read` | Document metadata + all chunks + combined `full_text` |
+| GET | `/v1/chunks/{document_id}` | `read` | All chunks (`content`, `chunk_index`, `token_count`, `metadata`) — unbounded, unlike `/context` below |
+| GET | `/v1/chunks/{document_id}/context` | `read` | Document metadata + a bounded window of chunks + combined `full_text`. Query: `max_chars` (1–100,000, default 20,000), `offset` (chars, default 0). Response adds `truncated`, `total_chars`, `offset`, `next_offset` — see below |
 | GET | `/v1/chunks/{document_id}/{chunk_id}` | `read` | Single chunk. Cross-tenant chunk reads as `404` |
+
+`GET /v1/chunks/{document_id}/context` bounds BOTH `full_text` and `chunks`
+to the same `[offset, offset + max_chars)` window over the document's
+combined text (#219) — a document that used to return every chunk plus a
+fully concatenated `full_text` in one call (measured at 298 KB / 117,086
+chars / ~29,300 tokens for a 169-chunk PDF) is now capped by default. `chunks`
+is therefore "the chunks contributing to this page", not "every chunk in the
+document"; a chunk straddling a page boundary can legitimately appear on two
+consecutive pages. **Behavior change**: callers that relied on one call
+returning the entire document must now check `truncated` and page with
+`offset=next_offset` until it is `false`. `max_chars=0` or negative, or above
+100,000, is a `422`.
 
 ### Evals (traffic-mined retrieval quality)
 

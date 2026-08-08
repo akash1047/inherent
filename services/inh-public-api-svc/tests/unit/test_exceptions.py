@@ -33,9 +33,9 @@ class TestInherentAPIError:
         assert error.extensions == {"key": "value"}
 
     def test_error_type_url(self):
-        """Should have valid error type URL."""
+        """Should have valid error type URL (canonical `.sh` domain, not the retired `.systems` one, #222)."""
         error = InherentAPIError()
-        assert error.error_type.startswith("https://api.inherent.systems/errors/")
+        assert error.error_type.startswith("https://api.inherent.sh/errors/")
 
     def test_title(self):
         """Should have human-readable title."""

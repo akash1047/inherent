@@ -7,6 +7,45 @@ All notable changes to Inherent are documented here. The format follows
 
 ### Added
 
+- **Streamable HTTP transport for the MCP server (#220).** The same
+  `_TOOLS` registry stdio serves is now mounted at `POST /mcp` inside
+  `inh-public-api-svc` — same process, same port, same middleware stack as
+  REST — so a customer connects with `claude mcp add --transport http
+  inherent https://api.inherent.sh/mcp --header "X-API-Key: ink_..."` and
+  needs no database credentials, Node, Docker, or config file. Previously
+  the server was reachable only over stdio, which requires production
+  Postgres/Mongo/Weaviate/S3 credentials to start, so no SaaS customer
+  could reach it under any packaging. On HTTP the API key moves to the
+  `X-API-Key` / `Authorization: Bearer` header and `api_key` is stripped
+  from every advertised tool schema (computed from the registry schema, not
+  hand-duplicated) so an agent is never prompted to source a secret it
+  might echo into context or logs. The surface is 10 tools, not stdio's 13:
+  `verify_claim` (a lexical token-overlap counter that cannot detect
+  negation — it scores "Neither party may cancel this Agreement" as
+  `strong, 0.833` against source text saying the opposite), `search_memory`
+  and `get_citations` (documented duplicates of `search_documents`), and
+  `report_feedback` are excluded via `ToolDef.http_exposed`, a data field on
+  the registry rather than a second name list that could drift. Auth runs
+  through REST's own `get_api_key_info`, so workspace-scoped key binding
+  (#138), expiry enforcement (#180) and rate limiting (#213) apply by
+  construction; tool errors on this transport set `isError=True` with a
+  branchable failure class in `structuredContent` (#216). stdio behavior is
+  unchanged.
+
+- **Postgres/Weaviate index-consistency detector and reindex path (#221).** `check_workspace_index_consistency` flags documents that report
+  `status=processed` with a non-zero `chunk_count` yet have no objects in
+  their workspace's vector collection — documents the dashboard shows as
+  ready that no search can ever return. `scripts/check_index_consistency.py`
+  (`make check-index-consistency`) reports them and groups them by the
+  null-`content_hash` + identical-`ingested_at` backfill signature;
+  `scripts/reindex_orphaned_document.py` (`make reindex-orphaned-document`)
+  repairs one by embedding its existing Postgres chunks through the same
+  primitive the ingestion pipeline uses. `refresh_stale_source` is
+  deliberately not that path: it re-fetches the original source, and nothing
+  guarantees `storage_path` still holds bytes reproducing chunks already
+  verified good. Operator runbook at
+  `docs/maintainers/index-consistency-runbook.md`.
+
 - **`workspace_ownership_lookup_degraded_total` metric for
   inh-public-api-svc's workspace-ownership lookups (#184).**
   `DatabaseService.get_user_workspace_ids`'s Mongo and Postgres-fallback
@@ -223,6 +262,29 @@ All notable changes to Inherent are documented here. The format follows
 
 ### Changed
 
+- **⚠️ `GET /v1/chunks/{document_id}/context` is now bounded and pageable
+  (#219).** The endpoint concatenated every chunk with no limit: one
+  169-chunk contract returned 298 KB / 117,086 chars (~29,300 tokens) in a
+  single response, and the same handler backs the MCP
+  `get_document_context` tool, where an agent could exhaust its own context
+  in one call with no way to ask for less. New `max_chars` (default 20,000,
+  max 100,000) and `offset` query parameters, plus `truncated`,
+  `total_chars`, `offset` and `next_offset` response fields. Both
+  `full_text` and `chunks` are windowed to the same character range —
+  truncating only `full_text` would not have bounded the payload, since the
+  chunk objects carried most of those 298 KB. REST and MCP share one
+  windowing function so the default bound cannot drift between surfaces.
+  **Breaking for any caller that relied on one call returning the whole
+  document**: check `truncated` and page with `offset=next_offset`.
+
+- **Retired `inherent.systems` origins dropped from the default
+  `cors_origins` (#222).** The default allow-list is now the canonical `.sh`
+  origins only, rather than carrying both. A retired domain left in a
+  credentialed-CORS allow-list is a dangling-domain risk: whoever
+  re-registers it inherits a standing grant. Deployments still serving
+  `.systems` frontends mid-migration must add those origins explicitly via
+  `CORS_ORIGINS`.
+
 - **Config defaults single-sourced to stop silent drift (#202).** The
   Postgres database name is now `DEFAULT_DATABASE_NAME` in
   `inh-public-api-svc`'s `config/constants.py`, feeding both the
@@ -367,6 +429,45 @@ All notable changes to Inherent are documented here. The format follows
   and its amendment.
 
 ### Fixed
+
+- **`POST /v1/search` returned HTTP 500 whenever `document_ids` was supplied
+  (#218).** The Weaviate GraphQL `where` clause was built by `json.dumps`-ing
+  a dict and regex-stripping quotes off its keys only, which left `operator`
+  — a GraphQL enum Weaviate requires unquoted — wrapped in quotes, and
+  emitted `valueTextArray`, the Python-client v3 field name that is not a
+  GraphQL argument at all. Every filtered search was a syntax error Weaviate
+  surfaced as an opaque 500, on REST and on the MCP `search_documents` tool
+  alike. The clause is now built from typed parts with the operator
+  validated against an explicit allow-list. Fixing the syntax alone would
+  have traded a crash for silent wrong answers: `document_id` is a
+  `DataType.TEXT` property on Weaviate's default `word` tokenization, so
+  `ContainsAny` matches tokens rather than whole strings and a hyphenated
+  UUID splits into five — a chunk from an unrelated document sharing one
+  token passed the filter. An exact client-side post-filter closes that, and
+  the over-fetch that previously triggered on `min_score` alone now also
+  triggers on `document_ids` so discarded rows cannot starve the page. The
+  underlying tokenization migration is tracked in #223.
+
+- **`trace_id` was always null on unhandled-exception 500s (#222).** The
+  catch-all was registered via `@app.exception_handler(Exception)`, and
+  Starlette's `build_middleware_stack` special-cases `Exception`/500: it
+  moves that handler out of the innermost `ExceptionMiddleware` and installs
+  it on `ServerErrorMiddleware`, the outermost layer, which wraps
+  `RequestContextMiddleware` entirely — so the handler ran with no request
+  context to read `request_id` from. `InherentAPIError`,
+  `RequestValidationError` and `HTTPException` stay on `ExceptionMiddleware`
+  and were never affected, which is why the gap only showed on the
+  unexpected-error path a production reporter actually hits. The previously
+  dead `ErrorHandlerMiddleware` is now wired into the stack directly inside
+  `RequestContextMiddleware`.
+
+- **RFC-7807 error `type` URIs pointed at the retired `inherent.systems`
+  domain (#222).** Served error payloads and the published OpenAPI examples
+  disagreed with the documented `.sh` form, and `type` is meant to be a
+  dereferenceable identifier — a developer pasting one into a browser landed
+  nowhere. The base is now a configurable `error_base_url` setting
+  (`ERROR_BASE_URL`, default `https://api.inherent.sh/errors`) read at call
+  time, so changing domains is one setting rather than a grep.
 
 - **MCP `upload_document` tool schema described a stale, false
   `content_type` contract (#193).** The `_TOOLS["upload_document"]`

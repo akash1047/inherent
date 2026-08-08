@@ -1,5 +1,6 @@
 """Unit tests for RFC 7807 Problem Details."""
 
+from src.config import settings
 from src.core.exceptions import AuthenticationError, RateLimitError
 from src.core.problem_details import ProblemDetail, create_problem_detail, from_exception
 
@@ -10,12 +11,12 @@ class TestProblemDetail:
     def test_required_fields(self):
         """Should require type, title, status, detail."""
         problem = ProblemDetail(
-            type="https://api.inherent.systems/errors/test",
+            type="https://api.inherent.sh/errors/test",
             title="Test Error",
             status=400,
             detail="Test detail message",
         )
-        assert problem.type == "https://api.inherent.systems/errors/test"
+        assert problem.type == "https://api.inherent.sh/errors/test"
         assert problem.title == "Test Error"
         assert problem.status == 400
         assert problem.detail == "Test detail message"
@@ -23,7 +24,7 @@ class TestProblemDetail:
     def test_optional_fields(self):
         """Should have optional fields with defaults."""
         problem = ProblemDetail(
-            type="https://api.inherent.systems/errors/test",
+            type="https://api.inherent.sh/errors/test",
             title="Test Error",
             status=400,
             detail="Test detail",
@@ -35,7 +36,7 @@ class TestProblemDetail:
     def test_to_dict_basic(self):
         """Should convert to dict without extensions."""
         problem = ProblemDetail(
-            type="https://api.inherent.systems/errors/test",
+            type="https://api.inherent.sh/errors/test",
             title="Test Error",
             status=400,
             detail="Test detail",
@@ -43,7 +44,7 @@ class TestProblemDetail:
             trace_id="abc-123",
         )
         result = problem.to_dict()
-        assert result["type"] == "https://api.inherent.systems/errors/test"
+        assert result["type"] == "https://api.inherent.sh/errors/test"
         assert result["title"] == "Test Error"
         assert result["status"] == 400
         assert result["detail"] == "Test detail"
@@ -54,7 +55,7 @@ class TestProblemDetail:
     def test_to_dict_with_extensions(self):
         """Should merge extensions at top level."""
         problem = ProblemDetail(
-            type="https://api.inherent.systems/errors/test",
+            type="https://api.inherent.sh/errors/test",
             title="Test Error",
             status=400,
             detail="Test detail",
@@ -76,7 +77,7 @@ class TestCreateProblemDetail:
             instance="/v1/search",
             trace_id="trace-123",
         )
-        assert result["type"] == "https://api.inherent.systems/errors/authentication-failed"
+        assert result["type"] == "https://api.inherent.sh/errors/authentication-failed"
         assert result["title"] == "Authentication Failed"
         assert result["status"] == 401
         assert result["detail"] == "Invalid API key"
@@ -111,7 +112,7 @@ class TestFromException:
         exc = AuthenticationError(detail="API key expired")
         result = from_exception(exc, instance="/v1/search", trace_id="trace-456")
 
-        assert result["type"] == "https://api.inherent.systems/errors/authentication-failed"
+        assert result["type"] == "https://api.inherent.sh/errors/authentication-failed"
         assert result["title"] == "Authentication Failed"
         assert result["status"] == 401
         assert result["detail"] == "API key expired"
@@ -141,3 +142,48 @@ class TestFromException:
         assert result["status"] == 500
         assert "internal" in result["type"]
         assert "Something went wrong" in result["detail"]
+
+
+class TestErrorTypeBaseIsConfigured:
+    """RFC 7807 `type` must be built from configuration, not a hardcoded domain (#222).
+
+    A previous version baked ``https://api.inherent.systems/errors`` directly into
+    a module-level constant, so a domain change was a grep-and-replace across the
+    codebase. Both ``create_problem_detail`` (used directly, e.g. by validation and
+    unexpected-error handling) and ``from_exception`` (used for every
+    ``InherentAPIError`` subclass) must instead read ``settings.error_base_url`` at
+    call time, so overriding the ``ERROR_BASE_URL`` env var changes every served
+    `type` with no code change.
+    """
+
+    def test_create_problem_detail_uses_configured_base(self, monkeypatch):
+        """Changing settings.error_base_url must change the served `type` URI."""
+        monkeypatch.setattr(settings, "error_base_url", "https://custom.example.test/errors")
+
+        result = create_problem_detail(
+            error_key="authentication_failed",
+            status=401,
+            detail="Invalid API key",
+        )
+
+        assert result["type"] == "https://custom.example.test/errors/authentication-failed"
+
+    def test_from_exception_uses_configured_base(self, monkeypatch):
+        """InherentAPIError-derived responses must also honor the configured base."""
+        monkeypatch.setattr(settings, "error_base_url", "https://custom.example.test/errors")
+
+        exc = AuthenticationError(detail="API key expired")
+        result = from_exception(exc)
+
+        assert result["type"] == "https://custom.example.test/errors/authentication-failed"
+
+    def test_default_base_is_the_canonical_sh_domain(self):
+        """Default (no override) must be the canonical `.sh` domain, not the retired `.systems` one."""
+        result = create_problem_detail(
+            error_key="internal_error",
+            status=500,
+            detail="boom",
+        )
+
+        assert result["type"] == "https://api.inherent.sh/errors/internal-error"
+        assert "inherent.systems" not in result["type"]

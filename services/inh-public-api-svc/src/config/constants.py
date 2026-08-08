@@ -18,18 +18,36 @@ DEFAULT_RATE_LIMIT: Final[int] = 100
 # Rate limit window in seconds
 RATE_LIMIT_WINDOW_SECONDS: Final[int] = 60
 
-# RFC 7807 Error type URLs
-ERROR_BASE_URL: Final[str] = "https://api.inherent.systems/errors"
+# RFC 7807 error-type URI slugs -- the path segment appended to the base
+# ("<base>/<slug>"). Single source of truth for both ERROR_TYPES below (a
+# frozen snapshot, see its docstring) and the live URLs
+# src/core/problem_details.py builds per-request from settings.error_base_url.
+ERROR_TYPE_SLUGS: Final[dict[str, str]] = {
+    "authentication_failed": "authentication-failed",
+    "authorization_failed": "authorization-failed",
+    "rate_limit_exceeded": "rate-limit-exceeded",
+    "resource_not_found": "resource-not-found",
+    "validation_error": "validation-error",
+    "service_unavailable": "service-unavailable",
+    "internal_error": "internal-error",
+    "bad_request": "bad-request",
+}
+
+# RFC 7807 error type URLs. Canonical domain is `.sh` (`.systems` retired, #222).
+#
+# This dict is a frozen, process-start snapshot -- it does NOT read
+# settings.error_base_url, because settings.py already imports ERROR_BASE_URL
+# from *this* module (for its own default), so the reverse import here would be
+# a constants<->settings cycle. src/core/exceptions.py (InherentAPIError.error_type)
+# uses this snapshot; it has no reason to depend on live Settings. Every actually
+# SERVED response instead goes through src/core/problem_details.py, which reads
+# settings.error_base_url (+ ERROR_TYPE_SLUGS above) at call time -- so an
+# ERROR_BASE_URL env var override reaches every served `type` even though this
+# particular dict stays fixed at the default for the life of the process.
+ERROR_BASE_URL: Final[str] = "https://api.inherent.sh/errors"
 
 ERROR_TYPES: Final[dict[str, str]] = {
-    "authentication_failed": f"{ERROR_BASE_URL}/authentication-failed",
-    "authorization_failed": f"{ERROR_BASE_URL}/authorization-failed",
-    "rate_limit_exceeded": f"{ERROR_BASE_URL}/rate-limit-exceeded",
-    "resource_not_found": f"{ERROR_BASE_URL}/resource-not-found",
-    "validation_error": f"{ERROR_BASE_URL}/validation-error",
-    "service_unavailable": f"{ERROR_BASE_URL}/service-unavailable",
-    "internal_error": f"{ERROR_BASE_URL}/internal-error",
-    "bad_request": f"{ERROR_BASE_URL}/bad-request",
+    key: f"{ERROR_BASE_URL}/{slug}" for key, slug in ERROR_TYPE_SLUGS.items()
 }
 
 # Error titles (human-readable)
