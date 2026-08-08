@@ -1,5 +1,6 @@
 """Tests for search service — BM25, workspace collections, tenant scoping."""
 
+import json
 import re
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -267,7 +268,15 @@ class TestSearchWeaviateBM25:
 
     @pytest.mark.asyncio
     async def test_document_ids_filter_included(self, search_service):
-        """When document_ids is set, a where filter should be in the query."""
+        """When document_ids is set, a where filter should be in the query.
+
+        #218: the where clause must emit ``operator`` as an UNQUOTED GraphQL
+        enum (``operator: ContainsAny``, not ``operator: "ContainsAny"`` --
+        the latter is a GraphQL syntax error Weaviate rejects with a 500) and
+        must use the GraphQL argument name ``valueText`` -- ``valueTextArray``
+        is a Python-client v3 field name, not a valid Weaviate GraphQL
+        argument, and Weaviate rejects it outright.
+        """
         workspace_id = "ws1"
         user_id = "u1"
         request = SearchRequest(query="test", limit=5, document_ids=["doc1", "doc2"])
@@ -288,6 +297,135 @@ class TestSearchWeaviateBM25:
         assert "where" in query_body
         assert "doc1" in query_body
         assert "doc2" in query_body
+        # Enum must be unquoted.
+        assert re.search(r"operator:\s*ContainsAny", query_body)
+        assert '"ContainsAny"' not in query_body
+        # Correct GraphQL argument name -- valueTextArray does not exist.
+        assert "valueTextArray" not in query_body
+        assert re.search(r'valueText:\s*\["doc1",\s*"doc2"\]', query_body)
+
+    @pytest.mark.asyncio
+    async def test_document_ids_filter_does_not_raise(self, search_service):
+        """#218 regression: a document_ids search must not raise building the query.
+
+        Before the fix, the malformed ``where`` clause was still valid enough
+        to reach Weaviate, which returned a GraphQL syntax error -- surfaced
+        here as an ``httpx.HTTPError`` from ``_search_weaviate`` (translated
+        to an HTTP 500 by the route). Simulate Weaviate accepting the query
+        (200, no errors) and assert the call completes without raising.
+        """
+        workspace_id = "ws1"
+        user_id = "u1"
+        request = SearchRequest(query="test", limit=5, document_ids=["doc-001"])
+
+        collection_name = _get_workspace_collection_name(workspace_id)
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.raise_for_status = MagicMock()
+        mock_response.json.return_value = {"data": {"Get": {collection_name: []}}}
+
+        mock_client = AsyncMock()
+        mock_client.post.return_value = mock_response
+        search_service._client = mock_client
+
+        results = await search_service._search_weaviate(workspace_id, user_id, request)
+        assert results == []
+
+    @pytest.mark.asyncio
+    async def test_document_ids_excludes_token_colliding_foreign_document(self, search_service):
+        """#218 follow-up: Weaviate's `where: ContainsAny` on `document_id` is a
+        TOKEN match, not an exact match -- `document_id` is `DataType.TEXT`
+        with Weaviate's default `word` tokenization (see
+        services/inh-ingestion-svc/src/services/weaviate.py
+        `_get_chunk_properties`). A hyphenated UUID such as
+        "d48ddf8d-7758-4af6-8319-d4c0d29518ac" tokenizes into five pieces
+        (d48ddf8d, 7758, 4af6, 8319, d4c0d29518ac); ContainsAny matches if
+        ANY token matches, so a chunk belonging to a DIFFERENT document that
+        merely shares one token (here "7758") can come back from Weaviate.
+        The public API must never silently return a document the caller did
+        not ask for -- this test fails without the exact client-side
+        document_id post-filter in _search_weaviate.
+        """
+        workspace_id = "ws1"
+        user_id = "u1"
+        requested_id = "d48ddf8d-7758-4af6-8319-d4c0d29518ac"
+        foreign_id = "aaaaaaaa-7758-bbbb-cccc-dddddddddddd"  # shares the "7758" token
+        request = SearchRequest(query="test", limit=5, document_ids=[requested_id])
+
+        collection_name = _get_workspace_collection_name(workspace_id)
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.raise_for_status = MagicMock()
+        # Simulate Weaviate's token-match behavior: both the requested
+        # document's chunk AND a token-colliding foreign document's chunk
+        # come back, because the server-side filter is not exact.
+        mock_response.json.return_value = {
+            "data": {
+                "Get": {
+                    collection_name: [
+                        {
+                            "document_id": requested_id,
+                            "original_filename": "mine.txt",
+                            "content": "requested document content",
+                            "chunk_index": 0,
+                            "_additional": {"id": "c1-uuid", "score": "0.9"},
+                        },
+                        {
+                            "document_id": foreign_id,
+                            "original_filename": "not-mine.txt",
+                            "content": "foreign document content",
+                            "chunk_index": 0,
+                            "_additional": {"id": "c2-uuid", "score": "0.8"},
+                        },
+                    ]
+                }
+            }
+        }
+
+        mock_client = AsyncMock()
+        mock_client.post.return_value = mock_response
+        search_service._client = mock_client
+
+        results = await search_service._search_weaviate(workspace_id, user_id, request)
+
+        assert len(results) == 1
+        assert results[0].document_id == requested_id
+        assert all(r.document_id != foreign_id for r in results)
+
+    def test_format_where_contains_any_shape(self, search_service):
+        """Direct pin of the ContainsAny (multi-id) where-clause shape (#218)."""
+        clause = search_service._format_where(["document_id"], "ContainsAny", ["doc1", "doc2"])
+        assert re.search(r"operator:\s*ContainsAny", clause)
+        assert '"ContainsAny"' not in clause
+        assert "valueTextArray" not in clause
+        assert re.search(r'valueText:\s*\["doc1",\s*"doc2"\]', clause)
+        assert clause.count('"operator"') == 0  # key itself must not be quoted either
+
+    def test_format_where_equal_shape(self, search_service):
+        """Direct pin of the Equal (single-value) where-clause shape (#218)."""
+        clause = search_service._format_where(["document_id"], "Equal", "doc-001")
+        assert re.search(r"operator:\s*Equal\b", clause)
+        assert '"Equal"' not in clause
+        assert re.search(r'valueText:\s*"doc-001"', clause)
+
+    def test_format_where_rejects_unknown_operator(self, search_service):
+        """An unsupported operator must fail loudly, not silently emit garbage."""
+        with pytest.raises(ValueError):
+            search_service._format_where(["document_id"], "NotAnOperator", "x")
+
+    def test_format_where_escapes_quotes_and_backslashes_in_values(self, search_service):
+        """#218 injection check: a value containing a quote/backslash must stay
+        inside its own GraphQL string literal, never break out into the
+        surrounding query. json.dumps-style escaping keeps the emitted literal
+        parseable as a single string token."""
+        malicious = 'doc" } mutation { evil'
+        clause = search_service._format_where(["document_id"], "ContainsAny", [malicious])
+        # The raw quote must be escaped -- an unescaped quote would close the
+        # string literal early and let the rest be parsed as GraphQL syntax.
+        assert '\\"' in clause
+        start = clause.index("[", clause.index("valueText"))
+        end = clause.index("]", start) + 1
+        assert json.loads(clause[start:end]) == [malicious]
 
     @pytest.mark.asyncio
     async def test_weaviate_http_error_propagates(self, search_service):

@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := help
 
-.PHONY: help setup quickstart env install validate up dev down restart ps logs health doctor bootstrap seed dev-seed check test test-fast test-integration release-check release-images release-up release-down lint format-check type-check security-check clean graphify-hooks graphify-refresh
+.PHONY: help setup quickstart env install validate up dev down restart ps logs health doctor bootstrap seed dev-seed check test test-fast test-integration release-check release-images release-up release-down lint format-check type-check security-check clean graphify-hooks graphify-refresh check-index-consistency reindex-orphaned-document
 
 COMPOSE              ?= docker compose
 PUBLIC_API_URL       ?= http://localhost:18000
@@ -228,3 +228,30 @@ security-check:
 ## clean: Stop the stack and remove local Compose volumes.
 clean:
 	@$(COMPOSE) down -v
+
+## check-index-consistency: Find processed documents with Postgres chunks but
+##                          no Weaviate vectors (#221). Usage:
+##                            make check-index-consistency WORKSPACE_ID=ws_abc123
+##                            make check-index-consistency ALL_WORKSPACES=1
+##                          See docs/maintainers/index-consistency-runbook.md.
+check-index-consistency:
+	@if [ -n "$(ALL_WORKSPACES)" ]; then \
+		uv --project $(PUBLIC_API_DIR) run python scripts/check_index_consistency.py --all-workspaces; \
+	elif [ -n "$(WORKSPACE_ID)" ]; then \
+		uv --project $(PUBLIC_API_DIR) run python scripts/check_index_consistency.py --workspace-id "$(WORKSPACE_ID)"; \
+	else \
+		echo "Usage: make check-index-consistency WORKSPACE_ID=<id>  (or ALL_WORKSPACES=1)"; \
+		exit 1; \
+	fi
+
+## reindex-orphaned-document: Reindex a document flagged by
+##                            check-index-consistency straight from its
+##                            stored Postgres chunks (#221) -- does NOT
+##                            re-fetch/re-extract/re-chunk the source. Usage:
+##                              make reindex-orphaned-document DOCUMENT_ID=doc_abc123
+reindex-orphaned-document:
+	@if [ -z "$(DOCUMENT_ID)" ]; then \
+		echo "Usage: make reindex-orphaned-document DOCUMENT_ID=<id>"; \
+		exit 1; \
+	fi
+	@uv --project $(INGESTION_DIR) run python scripts/reindex_orphaned_document.py --document-id "$(DOCUMENT_ID)"

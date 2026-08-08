@@ -10,6 +10,85 @@ this file — read the matching entry before touching the related area. Add an
 entry when a shipped defect teaches something a rule alone can't carry: one
 entry per root cause, newest first.
 
+## #220 — `app.mount(path, asgi_app)` never matches the bare `path` — it 307-redirects to `path/` (2026-08-08)
+
+**Defect (caught before shipping, while building the Streamable HTTP MCP
+transport).** The obvious way to hang a raw ASGI callable off a FastAPI app —
+`app.mount("/mcp", mcp_asgi_app)` — passed every local smoke test that used
+`follow_redirects=True` (httpx's and `TestClient`'s default), so `POST /mcp`
+*appeared* to work end to end. It does not, without redirect-following:
+Starlette's `Mount.path_regex` requires a `/` (or more) AFTER the mount path
+to match, so `Mount("/mcp", ...)` matches `/mcp/` and `/mcp/anything` but
+never the bare `/mcp`. With no exact-path route registered, Starlette's
+router's `redirect_slashes` (on by default) 307s `/mcp` to `/mcp/` to
+compensate — a real extra round trip most HTTP clients silently absorb by
+following the redirect, which is exactly why this is easy to ship unnoticed:
+every manual `curl`/Postman check that follows redirects reports success.
+
+**Why it matters here specifically.** The issue's own acceptance line is
+`claude mcp add --transport http inherent https://.../mcp` — the bare path,
+no trailing slash — so shipping the redirect would mean the very install
+command in the issue costs an extra hop on every single tool call, forever,
+for every customer, silently.
+
+**Fix.** Register the ASGI callable via `app.add_route("/mcp", <object>,
+methods=[...])` instead of `app.mount(...)`. `Route.__init__` decides how to
+treat `endpoint` by `inspect.isfunction`/`inspect.ismethod`: a plain function
+is always wrapped in `request_response()` (expects a `Response` return,
+useless for a transport that needs the raw `send` callable); anything else —
+a bare **class instance** — is used as the ASGI app directly, unwrapped, and
+matches the exact path with no trailing-slash requirement. See
+`src/mcp_server/http_transport.py`'s `_StreamableHTTPEndpoint` /
+`mount_mcp_http`.
+
+**Generalize.** Any raw-ASGI sub-app mounted at a path a client is expected
+to hit WITHOUT a trailing slash needs `add_route` + a class-wrapped endpoint,
+not `mount`. Pin any such route with a test that disables redirect-following
+(`follow_redirects=False`) and asserts the response is not a 3xx — a test
+that follows redirects by default cannot catch this class of regression.
+
+## #221 — A document can be `processed` in Postgres and invisible in Weaviate, and no in-process fix can prevent it (2026-08-08)
+
+**Defect.** Two production documents reported `status: processed` with a
+non-zero `chunk_count`, returned real text from `GET /v1/chunks/{id}`, and
+never appeared in ANY search mode. Their `document_chunks` rows had
+`content_hash`/`source_uri` NULL and a byte-identical `ingested_at` despite
+being created three months apart.
+
+**Root cause, and why it is NOT a pipeline bug.** Grepping both services for
+every writer of `processed_documents`/`document_chunks` turns up exactly one
+app-level writer of chunk rows: `store_processed_document`
+(`services/inh-ingestion-svc/src/services/database.py`), which ALWAYS
+computes `content_hash = sha256(...)` and stamps a fresh, per-run
+`ingested_at`. The Temporal workflow
+(`document_ingestion.py`) already fails the whole document (not just
+Weaviate) when the Weaviate write fails, specifically to avoid this exact
+"PG-only ghost document" outcome. So the divergence could not have come from
+the shipped pipeline — it came from a direct/backfill SQL write against
+production that inserted document + chunk metadata without running the
+embedding step. **A defect that originates outside the application has no
+application-code prevention fix** — hardening the ingestion pipeline further
+cannot stop an operator or migration script from writing raw SQL. The only
+durable defense is detection: a periodic consistency check comparing
+Postgres state (`status=processed`, `chunk_count>0`) against the vector
+store's actual contents. Built as
+`services/inh-public-api-svc/src/services/index_consistency.py` +
+`scripts/check_index_consistency.py`; see
+[the runbook](../maintainers/index-consistency-runbook.md).
+
+**Reindex-path lesson.** The obvious fix-it tool, `refresh_stale_source` /
+`POST /v1/documents/{id}/refresh`, re-publishes the original upload event and
+re-runs fetch→extract→chunk→store from scratch. That is the wrong tool for a
+document with this defect's signature: nothing confirms `storage_path` still
+points at bytes that exist, let alone bytes that reproduce the SAME chunks
+already verified good in Postgres. Before reaching for the "normal" re-ingest
+path, check whether the failure mode actually needs re-deriving content at
+all, or — as here — only needs the missing store step re-run against data
+that is already known-good. Built as
+`services/inh-ingestion-svc/src/services/reindex_from_postgres.py`
+(reuses `WeaviateService.store_chunks_with_tenant`, the same primitive the
+pipeline itself calls) + `scripts/reindex_orphaned_document.py`.
+
 ## #110 — A fixed workflow id turns a routine race into a ~10-minute stall, and terminating a workflow doesn't stop its work (2026-08-06)
 
 **Defect (round 1).** `DocumentIngestionWorkflow` is started with a

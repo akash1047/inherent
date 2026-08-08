@@ -11,9 +11,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from src.api import router
 from src.api.v1 import health as health_router
 from src.config import settings
+from src.mcp_server.http_transport import mount_mcp_http
 from src.middleware import (
     AuditLoggingMiddleware,
     AuthenticationMiddleware,
+    ErrorHandlerMiddleware,
     RateLimitingMiddleware,
     RequestContextMiddleware,
     SecurityHeadersMiddleware,
@@ -43,7 +45,16 @@ async def lifespan(app: FastAPI):
     # Initialize database
     await get_database()
 
-    yield
+    # Enter the Streamable HTTP MCP session manager's task-group context
+    # (#220) -- StreamableHTTPSessionManager.handle_request raises
+    # RuntimeError until .run() has been entered at least once, since that's
+    # what creates the anyio task group requests are dispatched onto (see
+    # mount_mcp_http in src/mcp_server/http_transport.py). Nested inside this
+    # existing lifespan rather than a second one so /mcp shares the exact
+    # same startup/shutdown ordering (DB ready first, MQ/storage/search
+    # closed last) as the rest of the app.
+    async with app.state.mcp_session_manager.run():
+        yield
 
     # Shutdown
     logger.info("Shutting down inh-public-api-svc")
@@ -74,8 +85,11 @@ def create_app() -> FastAPI:
     # request flow (#149 follow-up: a same-order-as-here-but-not-reversed stack
     # previously ran RateLimit/Audit before Auth ever set request.state, so every
     # request looked unauthenticated to both).
-    # Request flow: CORS -> Security -> Context -> Auth -> Audit -> Rate Limit -> Handler
-    # Response flow: Handler -> Rate Limit -> Audit -> Auth -> Context -> Security -> CORS
+    # Request flow: CORS -> Security -> Context -> ErrorHandler -> Auth -> Audit -> Rate Limit -> Handler
+    # Response flow: Handler -> Rate Limit -> Audit -> Auth -> ErrorHandler -> Context -> Security -> CORS
+    # ErrorHandler sits INSIDE Context (so get_request_context() still resolves
+    # a trace_id, #222) and OUTSIDE Auth/Audit/Rate Limit (so an exception any
+    # of those three raise is still rendered as problem+json, not a bare 500).
 
     # 6. Rate limiting (added first = innermost; reads api_key_info from state)
     app.add_middleware(RateLimitingMiddleware)
@@ -85,6 +99,21 @@ def create_app() -> FastAPI:
 
     # 4. Authentication (populates request.state.api_key_info for downstream middleware)
     app.add_middleware(AuthenticationMiddleware)
+
+    # 3.5. Error handler (#222): catches any exception RateLimiting/AuditLogging/
+    # Auth/the router raise that Starlette's ExceptionMiddleware has no specific
+    # handler for (i.e. not InherentAPIError/RequestValidationError/HTTPException --
+    # those are handled by setup_exception_handlers() above, inside
+    # ExceptionMiddleware, unaffected by this). MUST be added before
+    # RequestContextMiddleware (= positioned INSIDE it, wrapping everything below)
+    # so get_request_context() inside _handle_unexpected_error still sees the
+    # request_id/trace_id RequestContextMiddleware set. Registering the same
+    # catch-all via @app.exception_handler(Exception) instead (as this service
+    # used to) silently routes it to Starlette's ServerErrorMiddleware -- the
+    # true outermost layer, OUTSIDE RequestContextMiddleware -- which is exactly
+    # why trace_id was null on unhandled-exception 500s (see
+    # tests/integration/test_trace_id_on_5xx.py).
+    app.add_middleware(ErrorHandlerMiddleware)
 
     # 3. Request context (correlation IDs, timing)
     app.add_middleware(RequestContextMiddleware)
@@ -117,6 +146,14 @@ def create_app() -> FastAPI:
 
     # Include API router
     app.include_router(router)
+
+    # Mount the Streamable HTTP MCP transport at POST /mcp (#220): same
+    # process/port as REST, so CORS, security headers, request context,
+    # authentication, audit logging, and rate limiting above all apply to
+    # /mcp by construction. The returned session manager is entered in
+    # `lifespan()` above -- store it on app.state so that closure can reach
+    # it (lifespan is defined before `app` exists).
+    app.state.mcp_session_manager = mount_mcp_http(app)
 
     return app
 

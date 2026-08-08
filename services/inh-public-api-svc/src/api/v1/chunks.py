@@ -2,9 +2,16 @@
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 
-from src.models.document import DocumentChunk, DocumentContextResponse
+from src.models.document import (
+    DEFAULT_MAX_CHARS,
+    MAX_MAX_CHARS,
+    MIN_MAX_CHARS,
+    DocumentChunk,
+    DocumentContextResponse,
+    windowed_document_context,
+)
 from src.services.auth import ResolvedAuth, resolve_workspace_read
 from src.services.database import DatabaseService, get_database
 
@@ -59,9 +66,35 @@ async def get_document_context(
     document_id: str,
     auth: Annotated[ResolvedAuth, Depends(resolve_workspace_read)],
     database: Annotated[DatabaseService, Depends(get_database)],
+    max_chars: Annotated[
+        int,
+        Query(
+            ge=MIN_MAX_CHARS,
+            le=MAX_MAX_CHARS,
+            description="Max characters of full_text to return (also bounds the "
+            "chunks array to the same window). Default and cap chosen so one "
+            "call can't blow an LLM context window (#219).",
+        ),
+    ] = DEFAULT_MAX_CHARS,
+    offset: Annotated[
+        int,
+        Query(
+            ge=0,
+            description="Character offset into the combined document text to "
+            "resume from -- use the previous response's next_offset to page.",
+        ),
+    ] = 0,
 ) -> DocumentContextResponse:
     """
-    Get full document context (document metadata + all chunks combined).
+    Get full document context (document metadata + chunks + combined full_text),
+    bounded to ``max_chars`` characters starting at ``offset`` (#219).
+
+    ``full_text`` and ``chunks`` are BOTH windowed to the same range -- an
+    unbounded response used to concatenate every chunk with no limit (a
+    169-chunk PDF returned 298 KB / ~29,300 tokens in one call). ``truncated``
+    tells you whether more text remains; when it does, ``next_offset`` is the
+    offset to request next. See ``windowed_document_context`` for the exact
+    slicing rule.
 
     Useful for retrieving complete document content for AI context.
     Requires an API key with 'read' permission.
@@ -94,13 +127,16 @@ async def get_document_context(
         workspace_id=workspace_id,
     )
 
-    # Combine all chunk content into full text
-    full_text = "\n\n".join(chunk.content for chunk in chunks)
+    window = windowed_document_context(chunks, offset=offset, max_chars=max_chars)
 
     return DocumentContextResponse(
         document=document,
-        chunks=chunks,
-        full_text=full_text,
+        chunks=window.chunks,
+        full_text=window.full_text,
+        truncated=window.truncated,
+        total_chars=window.total_chars,
+        offset=window.offset,
+        next_offset=window.next_offset,
     )
 
 

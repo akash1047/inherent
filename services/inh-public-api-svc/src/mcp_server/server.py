@@ -53,6 +53,18 @@ owning user's full workspace set. Do NOT call
 the #138 defect (a scoped key could reach any workspace its owner owned via
 MCP, while REST correctly rejected the identical request with 403).
 
+HTTP transport parity (#220)
+-----------------------------
+This module is the ONLY place a tool is declared. ``src/mcp_server/http_transport.py``
+mounts a Streamable HTTP transport (``POST /mcp`` inside ``inh-public-api-svc``)
+that derives its advertised surface from ``_TOOLS`` programmatically — filtering
+on ``ToolDef.http_exposed`` and stripping ``api_key`` from every schema (the key
+comes from the ``X-API-Key`` / ``Authorization`` header on HTTP, never a tool
+argument) — rather than declaring a second copy of any tool. stdio (this
+module's ``run_mcp_server``) is completely unaffected by the HTTP transport:
+same registry, same handlers, same ``api_key``-in-schema contract. See
+``http_transport.py`` for the HTTP-specific auth/permission/error wiring.
+
 Upload parity (#87 Task 3)
 ---------------------------
 ``upload_document`` is the MCP counterpart of POST /v1/documents, but TEXT
@@ -93,6 +105,12 @@ from mcp.types import TextContent, Tool
 
 from src.config.constants import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE
 from src.models.api_key import APIKeyInfo
+from src.models.document import (
+    DEFAULT_MAX_CHARS,
+    MAX_MAX_CHARS,
+    MIN_MAX_CHARS,
+    windowed_document_context,
+)
 from src.models.evals import FeedbackRequest
 from src.services.auth import describe_workspace_denial, get_authorized_workspace_ids
 from src.services.compensation import mark_document_failed_with_retry
@@ -170,6 +188,13 @@ class ToolDef:
     input_schema: dict
     permission: str  # mirrors the REST per-route dependency (#14)
     handler: ToolHandler
+    # Whether this tool is advertised on the Streamable HTTP transport (#220).
+    # Default True: a tool is on HTTP unless explicitly opted out here, so
+    # exclusion is DATA on the registry entry itself (see http_transport.py's
+    # ``list_tools``), not a second hardcoded name list that could drift from
+    # this one. stdio (this module) ignores the flag entirely -- every tool
+    # stays reachable over stdio regardless of its HTTP exposure.
+    http_exposed: bool = True
 
 
 # Schema shared by the two search-shaped tools so they stay identical (#14/#40).
@@ -537,6 +562,14 @@ async def _handle_get_context(key_info: APIKeyInfo, arguments: dict) -> list[Tex
     which was a cross-workspace existence oracle REST doesn't have; routing
     through the shared helper means the undifferentiated-not-found rule is
     expressed in exactly one place and this handler cannot drift from it.
+
+    Bounded via ``windowed_document_context`` (#219) — the SAME function and
+    the SAME ``DEFAULT_MAX_CHARS`` default REST's ``GET
+    /v1/chunks/{document_id}/context`` uses, so this tool (the surface the
+    issue calls out as most at risk: an agent can blow its own context window
+    with a single call) cannot silently drift to a different bound. Optional
+    ``max_chars`` / ``offset`` arguments let an agent ask for less, or page
+    through the rest, exactly like REST's query params.
     """
     document_id = arguments.get("document_id", "")
 
@@ -547,19 +580,41 @@ async def _handle_get_context(key_info: APIKeyInfo, arguments: dict) -> list[Tex
     if error:
         return [TextContent(type="text", text=error)]
 
+    # Clamp malformed/out-of-range arguments to the nearest valid value
+    # instead of raising — same style as list_documents' page/page_size
+    # clamp above (an agent's tool-call arguments are free-form, unlike a
+    # typed REST query param that FastAPI validates for us).
+    try:
+        max_chars = min(
+            MAX_MAX_CHARS, max(MIN_MAX_CHARS, int(arguments.get("max_chars", DEFAULT_MAX_CHARS)))
+        )
+    except (TypeError, ValueError):
+        max_chars = DEFAULT_MAX_CHARS
+    try:
+        offset = max(0, int(arguments.get("offset", 0)))
+    except (TypeError, ValueError):
+        offset = 0
+
     database = await get_database()
     chunks = await database.get_document_chunks_by_doc_id(document_id)
-    full_text = "\n\n".join(chunk.content for chunk in chunks)
+    window = windowed_document_context(chunks, offset=offset, max_chars=max_chars)
 
     result_text = f"# {document.name}\n\n"
     result_text += f"**Source:** {document.source_type}\n"
     result_text += f"**Size:** {document.size_bytes:,} bytes\n"
-    result_text += f"**Chunks:** {len(chunks)}\n"
+    result_text += f"**Chunks in this page:** {len(window.chunks)} of {len(chunks)}\n"
     result_text += f"**Workspace:** {document.workspace_id}\n\n"
     result_text += "---\n\n"
-    result_text += full_text
+    result_text += window.full_text
 
-    return [TextContent(type="text", text=result_text)]
+    payload = {
+        "document_id": document.id,
+        "truncated": window.truncated,
+        "total_chars": window.total_chars,
+        "offset": window.offset,
+        "next_offset": window.next_offset,
+    }
+    return _structured(result_text, payload)
 
 
 async def _handle_list_documents(key_info: APIKeyInfo, arguments: dict) -> list[TextContent]:
@@ -1130,6 +1185,10 @@ _TOOLS: dict[str, ToolDef] = {
         input_schema=_SEARCH_INPUT_SCHEMA,
         permission="search",
         handler=_handle_search,
+        # Excluded from HTTP (#220): identical behavior to search_documents --
+        # two tools doing one job costs every HTTP agent permanent context
+        # overhead with no capability gained. Unchanged on stdio.
+        http_exposed=False,
     ),
     "get_citations": ToolDef(
         description="Run a search and return the claim-level Citation objects attached to "
@@ -1138,9 +1197,17 @@ _TOOLS: dict[str, ToolDef] = {
         input_schema=_SEARCH_INPUT_SCHEMA,
         permission="search",
         handler=_handle_get_citations,
+        # Excluded from HTTP (#220): same params/endpoint as search_documents,
+        # whose results already carry a full `citation` object per result
+        # (chunk_id, document_name, content, start_char, end_char). Unchanged
+        # on stdio.
+        http_exposed=False,
     ),
     "get_document_context": ToolDef(
-        description="Get the full content of a document for context. Requires 'read' permission.",
+        description="Get a bounded window of a document's content for context. Response is "
+        "capped by max_chars (default 20,000 chars, ~5,000 tokens) so one call can't exhaust "
+        "your context window; check the structured `truncated` flag and, if true, re-call with "
+        "offset=next_offset for the rest. Requires 'read' permission.",
         input_schema={
             "type": "object",
             "properties": {
@@ -1148,6 +1215,19 @@ _TOOLS: dict[str, ToolDef] = {
                 "document_id": {
                     "type": "string",
                     "description": "The document ID to retrieve",
+                },
+                "max_chars": {
+                    "type": "integer",
+                    "description": "Max characters of text to return in this call "
+                    "(default 20,000; capped at 100,000). Ask for less if you only need a "
+                    "preview.",
+                    "default": 20000,
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "Character offset to resume from. Use the previous call's "
+                    "structured `next_offset` to page through a truncated document.",
+                    "default": 0,
                 },
             },
             "required": ["api_key", "document_id"],
@@ -1207,6 +1287,16 @@ _TOOLS: dict[str, ToolDef] = {
         },
         permission="read",
         handler=_handle_verify_claim,
+        # Excluded from HTTP (#220): src/services/verify.py is an offline
+        # lexical token-overlap counter with no LLM and no negation handling
+        # -- it scores "Neither party may cancel this Agreement at any time"
+        # as strong support (0.833) for the claim "Either party may cancel
+        # this Agreement at any time" against that exact sentence as
+        # evidence. Sound as an internal pre-filter; unsafe under a tool name
+        # ("verify_claim") an HTTP agent reads as entailment. Kept on stdio
+        # (self-hosters/internal dev, who read this docstring) and REST;
+        # restore to HTTP once it is NLI- or LLM-backed.
+        http_exposed=False,
     ),
     "explain_lineage": ToolDef(
         description="Memory primitive: explain a document's (or chunk's) provenance and "
@@ -1256,6 +1346,16 @@ _TOOLS: dict[str, ToolDef] = {
         input_schema=_FEEDBACK_INPUT_SCHEMA,
         permission="search",
         handler=_handle_report_feedback,
+        # Excluded from HTTP (#220): the issue's "10, not 13" acceptance list
+        # enumerates exactly search_documents/list_documents/get_document/
+        # list_chunks/get_document_context/explain_lineage/upload_document/
+        # delete_document/refresh_stale_source/get_retrieval_health --
+        # report_feedback (added by evals v1, after #220 was filed) is not
+        # among them and not among the 3 tools the issue explicitly excludes
+        # either. Left off HTTP for now rather than silently growing the
+        # "10" to 11 on judgment call; file a follow-up issue if it should
+        # ship on HTTP. Unchanged on stdio.
+        http_exposed=False,
     ),
     "get_retrieval_health": ToolDef(
         description="Get the retrieval-quality scorecard for a workspace: answer rate, "

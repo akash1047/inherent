@@ -234,27 +234,24 @@ def setup_exception_handlers(app):
                 response.headers[k] = v
         return response
 
-    @app.exception_handler(Exception)
-    async def generic_error_handler(request: Request, exc: Exception) -> JSONResponse:
-        ctx = get_request_context()
-        trace_id = ctx.request_id if ctx else None
-
-        logger.exception("Unexpected error", path=request.url.path)
-
-        detail = (
-            "An unexpected error occurred."
-            if settings.is_production
-            else f"{type(exc).__name__}: {exc!s}"
-        )
-
-        return JSONResponse(
-            status_code=500,
-            content=create_problem_detail(
-                error_key="internal_error",
-                status=500,
-                detail=detail,
-                instance=request.url.path,
-                trace_id=trace_id,
-            ),
-            media_type="application/problem+json",
-        )
+    # No @app.exception_handler(Exception) here -- deliberately (#222). Starlette's
+    # Starlette.build_middleware_stack special-cases `key in (500, Exception)`:
+    # a handler registered under the bare `Exception` class is pulled OUT of
+    # ExceptionMiddleware (innermost, wraps only the router) and installed as the
+    # `handler=` for ServerErrorMiddleware instead -- which is ALWAYS the very
+    # OUTERMOST middleware, wrapping every custom middleware including
+    # RequestContextMiddleware. A handler registered that way runs with no
+    # request context to read, so get_request_context() returns None and
+    # `trace_id` is always null on exactly this path -- which is the unhandled/
+    # "unexpected error" 500 a production reporter actually hits. This was the
+    # real, reproducible cause of the trace_id gap (proven in
+    # tests/integration/test_trace_id_on_5xx.py).
+    #
+    # The catch-all for truly unregistered exception types is instead
+    # ErrorHandlerMiddleware (this module, added in src/main.py positioned
+    # INSIDE RequestContextMiddleware), whose `except Exception` branch
+    # (_handle_unexpected_error) runs with the request context still bound.
+    # InherentAPIError / RequestValidationError / StarletteHTTPException stay
+    # registered above: those keys are NOT special-cased by Starlette, so they
+    # remain on ExceptionMiddleware (also inside RequestContextMiddleware) and
+    # were never affected by this bug.
