@@ -47,7 +47,7 @@ from temporalio.exceptions import ApplicationError
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
-from src.temporal.models import ChunkEditInput
+from src.temporal.models import ChunkEditInput, ChunkEditWeaviateFailureInput
 from src.temporal.workflows.chunk_edit import ChunkEditWorkflow
 
 TASK_QUEUE = "chunk-edit-test-queue"
@@ -115,10 +115,17 @@ class _RecordsFailureCalls:
     the real activity's contract) but records what it was called with."""
 
     def __init__(self) -> None:
-        self.calls: list[Any] = []
+        self.calls: list[ChunkEditWeaviateFailureInput] = []
 
+    # The parameter MUST be annotated with the real input type, not `Any`.
+    # temporalio picks the deserialization target from this annotation: with
+    # `Any` it cannot know what to build and hands the activity a raw dict,
+    # so the assertions below fail with "'dict' object has no attribute
+    # document_id". Mirroring the real activity's signature
+    # (chunk_edit.py::record_chunk_edit_weaviate_failure) also means this
+    # mock is checking the contract the workflow actually depends on.
     @activity.defn(name="record_chunk_edit_weaviate_failure")
-    async def __call__(self, input: Any) -> bool:
+    async def __call__(self, input: ChunkEditWeaviateFailureInput) -> bool:
         self.calls.append(input)
         return True
 

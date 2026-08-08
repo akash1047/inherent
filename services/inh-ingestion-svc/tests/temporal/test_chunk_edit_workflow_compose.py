@@ -44,7 +44,7 @@ from temporalio import activity
 from temporalio.client import Client
 from temporalio.worker import Worker
 
-from src.temporal.models import ChunkEditInput
+from src.temporal.models import ChunkEditInput, ChunkEditWeaviateFailureInput
 from src.temporal.workflows.chunk_edit import ChunkEditWorkflow
 
 pytestmark = pytest.mark.compose
@@ -92,13 +92,17 @@ class _AlwaysFailsWeaviate:
 
 
 class _RecordsFailureCalls:
+    # Annotated with the real input type rather than `Any` -- temporalio
+    # picks its deserialization target from this annotation, and `Any`
+    # yields a raw dict, breaking the attribute assertions below. See the
+    # fuller note in test_chunk_edit_workflow.py.
     @activity.defn(name="record_chunk_edit_weaviate_failure")
-    async def __call__(self, input: Any) -> bool:
+    async def __call__(self, input: ChunkEditWeaviateFailureInput) -> bool:
         self.calls.append(input)
         return True
 
     def __init__(self) -> None:
-        self.calls: list[Any] = []
+        self.calls: list[ChunkEditWeaviateFailureInput] = []
 
 
 @pytest.fixture()
