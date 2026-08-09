@@ -10,11 +10,20 @@ name: Integration & Eval-Gate Ratchet
 #   2. eval-baseline-ratchet - MUTATES THE REPO: opens/updates a PR against
 #                               main that ratchets the retrieval-eval baseline
 #                               forward, and enables auto-merge on it (#146).
-#   3. eval-regression-alert - files or updates a GitHub issue when the
-#                               retrieval-eval gate regresses.
+#   3. eval-regression-alert - MUTATES THE ISSUE TRACKER: files or updates a
+#                               GitHub issue when the retrieval-eval gate
+#                               regresses.
 # Job 1 is slow (it builds and boots the full local stack), so this workflow
 # does NOT run on every PR and does NOT gate merge. It runs on pushes to
 # main, nightly, and on demand.
+#
+# Jobs 2 and 3 are BOTH guarded to `github.ref == 'refs/heads/main'`. They
+# record judgements about main's eval scores, so neither is meaningful on a
+# feature branch -- and because job 1 is the only pre-merge signal that a
+# compose-level change actually works, dispatching this workflow on a branch
+# has to be safe to do. It is: a feature-branch workflow_dispatch runs job 1
+# and skips both governance jobs. Pinned by
+# tests/test_integration_workflow_guards.py.
 on:
   push:
     branches:
@@ -437,11 +446,23 @@ jobs:
   eval-regression-alert:
     name: File/update retrieval-eval regression issue
     needs: compose-integration
-    # Fire only when the retrieval-eval gate specifically regressed -- not on any
-    # other compose failure (ingestion benchmark, latency SLO, flaky boot), which
-    # would file a mislabeled "retrieval-eval regression" issue and bury real
-    # ones. Keyed off the dedicated job output, not the coarse job result.
-    if: always() && needs.compose-integration.outputs.retrieval_failed == 'true'
+    # Two independent conditions, both required:
+    #
+    # 1. `main` only -- same guard the ratchet job above carries, for the same
+    #    reason: this job records a judgement about MAIN's eval scores. The
+    #    workflow is workflow_dispatch-able on any ref (that is how a feature
+    #    branch gets a real compose run before merge), and without this guard
+    #    such a dispatch would file or update a "retrieval-eval regression"
+    #    issue describing that BRANCH's scores as if they were main's --
+    #    reopening or re-alarming an issue on the strength of unmerged work.
+    #    A feature-branch dispatch now runs compose-integration and nothing
+    #    else.
+    # 2. Fire only when the retrieval-eval gate specifically regressed -- not on
+    #    any other compose failure (ingestion benchmark, latency SLO, flaky
+    #    boot), which would file a mislabeled "retrieval-eval regression" issue
+    #    and bury real ones. Keyed off the dedicated job output, not the coarse
+    #    job result.
+    if: always() && github.ref == 'refs/heads/main' && needs.compose-integration.outputs.retrieval_failed == 'true'
     runs-on: ubuntu-latest
     # actions/checkout needs contents:read; a job-level `permissions` block
     # REPLACES the workflow default, so issues:write alone would drop read and
