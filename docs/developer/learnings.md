@@ -10,6 +10,53 @@ this file — read the matching entry before touching the related area. Add an
 entry when a shipped defect teaches something a rule alone can't carry: one
 entry per root cause, newest first.
 
+## #225 — A green test suite says nothing about the image when the two resolve dependencies differently (2026-08-09)
+
+**What happened.** The integration workflow went red on `main` with no code
+change on our side. `inh-public-api-svc` crashed on startup with
+`AttributeError: 'Server' object has no attribute 'list_tools'`: `mcp` 2.0.0
+had shipped, removing the low-level `Server` decorators both MCP modules
+register their tools with.
+
+**Why it reached us.** CI installed the same service twice, by two different
+rules. The test venv ran `uv sync --frozen` and got the lockfile's
+`mcp==1.25.0`. The container image ran `uv pip install --system -e .`, which
+**ignores `uv.lock` entirely** and re-resolved every `>=` floor against PyPI at
+build time — `mcp==2.0.0`. The image's dependency set was a function of its
+build date, not of anything in the repo.
+
+The breakage was not the surprising part; the drift was. Diffing the locked
+export against a fresh resolution of the same `pyproject.toml` showed **58
+packages differing, 9 of them major-version jumps** (`starlette` 0.50→1.6,
+`redis` 7→8, `cryptography` 46→50, `rpds-py` 0.30→2026.6.3, …). `mcp` was
+merely the first to fail at import time. The rest had been shipping,
+untested, for as long as the images had been built that way. Both service
+Dockerfiles carried it.
+
+**Learnings.**
+
+- "Tests passed" is a claim about a dependency set, not about a service. If
+  the image resolves dependencies by a different rule than the tests do, the
+  claim does not transfer — and nothing in a green run will tell you.
+- A lockfile only protects the install paths that actually read it. `uv sync`
+  reads it; `uv pip install .` does not. Grep the build definitions, not just
+  the CI config.
+- This class is invisible to runtime tests *by construction*: the test venv is
+  the correct one, so every test of the code passes. Only a static check on the
+  build definition can catch it — which is why the guard lives in
+  `tests/test_docker_lockfile_pinning.py` and not in a service suite.
+- Unbounded floors (`>=` with no cap) are a bet that every dependency you have
+  will honour semver forever. Cap the ones whose API you actually reach into,
+  and say in a comment which API and what lifting the cap requires.
+- Measure the drift before assuming the fix is the version bump. Capping `mcp`
+  alone would have restored green while leaving 8 other major-version jumps in
+  the image, waiting.
+
+**Mandatory pattern.** Service images install the locked set:
+`uv export --frozen` → `uv pip install -r` → project install with `--no-deps`.
+Never a bare `uv pip install .` / `-e .` / `".[extra]"` in a Dockerfile. See
+[Dependency & Dev-Tooling Conventions](dependencies.md#runtime-dependencies-uvlock-is-authoritative-including-in-images).
+
 ## #220 — `app.mount(path, asgi_app)` never matches the bare `path` — it 307-redirects to `path/` (2026-08-08)
 
 **Defect (caught before shipping, while building the Streamable HTTP MCP

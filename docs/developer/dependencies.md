@@ -31,6 +31,48 @@ cd services/<svc> && uv sync --extra dev --group dev
 
 `make install` runs this for both Python services.
 
+## Runtime dependencies: `uv.lock` is authoritative, including in images
+
+Runtime dependencies keep floors (`>=`) in `pyproject.toml`; the exact version
+that ships is whatever `uv.lock` pins. **Every install path must read the
+lock** — the test venv and the container image alike.
+
+Service Dockerfiles therefore install in two steps:
+
+```dockerfile
+RUN uv export --frozen --no-dev --no-hashes --no-emit-project -o /tmp/requirements.txt \
+    && uv pip install --system -r /tmp/requirements.txt \
+    && uv pip install --system --no-deps -e .
+```
+
+- `uv export --frozen` renders `uv.lock` to pinned requirements. `--frozen`
+  forbids uv from updating the lock, so the output is the lock verbatim — the
+  same set `uv sync --frozen` gives CI's test venv.
+- `--no-deps` on the project install installs *only* that package. Without it
+  uv re-resolves the `dependencies` table and undoes the step above.
+
+Never install a service with a bare `uv pip install .` / `-e .` / `".[extra]"`.
+That ignores `uv.lock` and re-resolves every floor against PyPI at build time,
+making the image's dependencies a function of its **build date** rather than of
+anything in the repo. This shipped once (#225): the images had drifted 58
+packages and 9 major versions away from the tested set before `mcp` 2.0.0
+removed an API `src/mcp_server/` depends on and crashed the public API on
+startup — with CI's own tests still green, because they ran against the lock.
+
+`tests/test_docker_lockfile_pinning.py` enforces this on both Dockerfiles. No
+runtime test can: the test venv is correct by construction, so only the build
+definition can be checked.
+
+### Capping a runtime dependency
+
+Add an upper bound only for a **known** incompatibility, with a comment naming
+the API that breaks and what lifting the cap requires — e.g. `mcp>=1.1.2,<2`
+in `inh-public-api-svc`, because both MCP modules register tools with the
+low-level `Server`'s `@server.list_tools()` / `@server.call_tool()` decorators
+that mcp 2.x removed. A cap is a declared constraint, so `uv lock` can never
+resolve past it; without one, the lock only records what happened to be current
+when it was last regenerated.
+
 ## Where dev dependencies live
 
 Each service declares its dev tooling in **two** places that are kept in sync:

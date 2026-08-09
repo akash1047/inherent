@@ -16,8 +16,15 @@ dependencies = [
     "asyncpg>=0.30.0",
     # Cloud SQL connector (for production on Cloud Run)
     "cloud-sql-python-connector[asyncpg]>=1.0.0",
-    # MCP
-    "mcp>=1.1.2",
+    # MCP. Capped below 2.0: both `src/mcp_server/server.py` (stdio) and
+    # `src/mcp_server/http_transport.py` (Streamable HTTP) register their tool
+    # surface with the low-level `Server`'s `@server.list_tools()` /
+    # `@server.call_tool()` decorators, which mcp 2.0.0 removed from
+    # `mcp.server.lowlevel.Server` in favour of `add_request_handler` / the new
+    # `MCPServer`. Against 2.x, `create_app()` dies at import-time with
+    # `AttributeError: 'Server' object has no attribute 'list_tools'` (#225).
+    # Lifting this cap means porting both modules to the 2.x server API first.
+    "mcp>=1.1.2,<2",
     # HTTP client
     "httpx>=0.27.2",
     # Configuration

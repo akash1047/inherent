@@ -357,15 +357,3 @@ def mount_mcp_http(app: FastAPI) -> StreamableHTTPSessionManager:
     # endpoint must be wrapped in a class instance to get there unwrapped).
     app.add_route("/mcp", _StreamableHTTPEndpoint(mcp_asgi_app), methods=["GET", "POST", "DELETE"])
     return session_manager
-
-
-class _StreamableHTTPEndpoint:
-    """Adapts the raw ``mcp_asgi_app`` coroutine into an object Starlette's
-    ``Route`` recognizes as an ASGI app rather than a ``func(request) ->
-    Response`` endpoint (see the comment on ``add_route`` above)."""
-
-    def __init__(self, handler):
-        self._handler = handler
-
-    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        await self._handler(scope, receive, send)

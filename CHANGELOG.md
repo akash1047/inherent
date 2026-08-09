@@ -430,6 +430,27 @@ All notable changes to Inherent are documented here. The format follows
 
 ### Fixed
 
+- **Service images ignored `uv.lock` and shipped a different dependency set
+  than CI tested (#225).** Both service Dockerfiles installed with
+  `uv pip install --system [-e] .`, which ignores the lockfile and re-resolves
+  every `>=` constraint against PyPI at build time, while CI's test venv used
+  `uv sync --frozen`. The image's dependencies were therefore a function of
+  its build date rather than of anything in the repo — the tests vouched for
+  one set while the image shipped another. The two had drifted to 58 differing
+  packages and 9 major-version jumps (`starlette` 0.50→1.6, `redis` 7→8,
+  `cryptography` 46→50, …) before `mcp` 2.0.0 shipped a low-level `Server`
+  without the `@server.list_tools()` / `@server.call_tool()` decorators that
+  `src/mcp_server/` builds on, crashing `inh-public-api-svc` on startup with
+  `AttributeError: 'Server' object has no attribute 'list_tools'` and turning
+  the integration workflow red with no code change on our side. Both images
+  now install the locked set (`uv export --frozen` → `uv pip install -r` →
+  project install with `--no-deps`), so image deps, lockfile deps and test-venv
+  deps are the same by construction. `mcp` is additionally capped `<2` so the
+  incompatibility is a declared constraint rather than an accident of lock
+  timing. No runtime test can catch this class — the test venv is correct by
+  construction and only the image is wrong — so it is pinned statically in
+  `tests/test_docker_lockfile_pinning.py`.
+
 - **`POST /v1/search` returned HTTP 500 whenever `document_ids` was supplied
   (#218).** The Weaviate GraphQL `where` clause was built by `json.dumps`-ing
   a dict and regex-stripping quotes off its keys only, which left `operator`
