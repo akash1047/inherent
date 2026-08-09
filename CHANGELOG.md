@@ -431,7 +431,7 @@ All notable changes to Inherent are documented here. The format follows
 ### Fixed
 
 - **Service images ignored `uv.lock` and shipped a different dependency set
-  than CI tested (#225).** Both service Dockerfiles installed with
+  than CI tested (#226, #225).** Both service Dockerfiles installed with
   `uv pip install --system [-e] .`, which ignores the lockfile and re-resolves
   every `>=` constraint against PyPI at build time, while CI's test venv used
   `uv sync --frozen`. The image's dependencies were therefore a function of
