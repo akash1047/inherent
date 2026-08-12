@@ -21,14 +21,15 @@ Config:
     EMBEDDING_MAX_CONCURRENCY — max in-flight batch POSTs per embed_texts call
                             (default: 2). Serial dispatch made a 535-chunk PDF
                             17 round-trips end-to-end (#228 / #231 phase 1).
-                            Keep this low under bulk upload: product with
-                            TEMPORAL_MAX_CONCURRENT_ACTIVITIES is the TEI
-                            in-flight cap (default 2×10=20, not 4×10=40).
-    EMBEDDING_BATCH_MAX_RETRIES — retries per batch on transient failure
+                            Keep this low under bulk upload: the product of
+                            this and TEMPORAL_MAX_CONCURRENT_ACTIVITIES is the
+                            TEI in-flight cap (default 2×10=20, not 4×10=40).
+    EMBEDDING_BATCH_MAX_RETRIES — retries per batch on *transient* failure
                             (default: 3), with exponential backoff + jitter
                             so a single queue spike does not burn a whole
-                            Temporal activity attempt (#229). Worst-case
-                            batch wall clock is baked into weaviate_store_budget.
+                            Temporal activity attempt (#229). 4xx (except 429)
+                            fail fast. Worst-case batch wall clock is baked
+                            into weaviate_store_budget via embedding_defaults.
 """
 
 from __future__ import annotations
@@ -43,22 +44,24 @@ import httpx
 import structlog
 
 from src.config.settings import Settings
+from src.services.embedding_defaults import (
+    DEFAULT_BATCH_MAX_RETRIES,
+    DEFAULT_BATCH_SIZE,
+    DEFAULT_MAX_CONCURRENCY,
+    DEFAULT_TIMEOUT_S,
+)
 
 logger = structlog.get_logger(__name__)
 
 
-# Sourced from Settings' own field defaults (not re-hardcoded here) so the
-# embedder's fallback can't drift from src/config/settings.py.
+# Sourced from Settings / embedding_defaults so fallbacks cannot drift from
+# weaviate_store_budget or settings.py independently.
 _DEFAULT_URL = Settings.model_fields["embedding_service_url"].default
 _DEFAULT_DIM = Settings.model_fields["embedding_dim"].default
-_DEFAULT_TIMEOUT_S = 30.0
-_DEFAULT_BATCH_SIZE = 32
-# Default 2 (not 4): under bulk upload each store_in_weaviate activity can
-# open this many TEI POSTs; times TEMPORAL_MAX_CONCURRENT_ACTIVITIES (10)
-# that is already 20 in-flight batches. Higher values re-saturate TEI and
-# recreate the #229 congestion collapse the parallel path is meant to avoid.
-_DEFAULT_MAX_CONCURRENCY = 2
-_DEFAULT_BATCH_MAX_RETRIES = 3
+_DEFAULT_TIMEOUT_S = DEFAULT_TIMEOUT_S
+_DEFAULT_BATCH_SIZE = DEFAULT_BATCH_SIZE
+_DEFAULT_MAX_CONCURRENCY = DEFAULT_MAX_CONCURRENCY
+_DEFAULT_BATCH_MAX_RETRIES = DEFAULT_BATCH_MAX_RETRIES
 
 _CLIENT_LOCK = threading.Lock()
 _CLIENT: httpx.Client | None = None
@@ -118,12 +121,27 @@ def _post_embed(inputs: list[str]) -> list[list[float]]:
     return [[float(x) for x in vec] for vec in data]
 
 
+def _is_transient_embed_error(exc: BaseException) -> bool:
+    """True only for failures that may succeed on a short retry.
+
+    Deterministic client/config errors (4xx except 429) fail immediately so
+    we do not pad latency or mask bad input/auth under the batch retry loop.
+    """
+    if isinstance(exc, (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError)):
+        return True
+    if isinstance(exc, httpx.HTTPStatusError):
+        code = exc.response.status_code
+        return code == 429 or code >= 500
+    return False
+
+
 def _post_embed_with_retry(inputs: list[str]) -> list[list[float]]:
-    """POST one batch; retry transient failures with exponential backoff + jitter.
+    """POST one batch; retry *transient* failures with exponential backoff + jitter.
 
     Activity-level Temporal retries re-embed the *whole document* (#229). A
     cheap per-batch retry absorbs a single TEI queue spike so the activity
-    attempt can still finish inside its budget.
+    attempt can still finish inside its budget. Non-transient errors raise
+    on the first failure.
     """
     attempts = _batch_max_retries()
     last_exc: BaseException | None = None
@@ -132,7 +150,7 @@ def _post_embed_with_retry(inputs: list[str]) -> list[list[float]]:
             return _post_embed(inputs)
         except Exception as exc:
             last_exc = exc
-            if attempt >= attempts:
+            if not _is_transient_embed_error(exc) or attempt >= attempts:
                 break
             # Base 0.5s * 2^(attempt-1), plus 0–50% jitter; cap at 8s.
             base = min(8.0, 0.5 * (2 ** (attempt - 1)))

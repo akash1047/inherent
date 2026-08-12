@@ -269,11 +269,13 @@ class TestIngestTrigger:
         from temporalio.client import WorkflowFailureError
         from temporalio.exceptions import ApplicationError
 
+        from src.temporal.document_failure import DOCUMENT_INGESTION_FAILED_TYPE
+
         client._mock_handle.result = AsyncMock(
             side_effect=WorkflowFailureError(
                 cause=ApplicationError(
                     "Weaviate storage failed: activity StartToClose timeout",
-                    type="DocumentIngestionFailed",
+                    type=DOCUMENT_INGESTION_FAILED_TYPE,
                     non_retryable=True,
                 )
             )

@@ -412,9 +412,11 @@ def create_app(settings: Settings) -> FastAPI:
                 # still get a structured success=False body (not a 500).
                 from temporalio.exceptions import ApplicationError
 
+                from src.temporal.document_failure import DOCUMENT_INGESTION_FAILED_TYPE
+
                 if (
                     isinstance(e.cause, ApplicationError)
-                    and e.cause.type == "DocumentIngestionFailed"
+                    and e.cause.type == DOCUMENT_INGESTION_FAILED_TYPE
                 ):
                     err_msg = e.cause.message or str(e.cause)
                     return JSONResponse(

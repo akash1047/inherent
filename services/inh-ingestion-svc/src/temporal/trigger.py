@@ -365,11 +365,13 @@ class TemporalWorkflowTrigger:
                 from temporalio.client import WorkflowFailureError
                 from temporalio.exceptions import ApplicationError
 
+                from src.temporal.document_failure import DOCUMENT_INGESTION_FAILED_TYPE
+
                 cause = getattr(wait_err, "cause", None)
                 if (
                     isinstance(wait_err, WorkflowFailureError)
                     and isinstance(cause, ApplicationError)
-                    and cause.type == "DocumentIngestionFailed"
+                    and cause.type == DOCUMENT_INGESTION_FAILED_TYPE
                 ):
                     err_msg = cause.message or str(cause)
                     logger.info(

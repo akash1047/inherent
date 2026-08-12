@@ -32,6 +32,7 @@ with workflow.unsafe.imports_passed_through():
     from src.temporal.activities.status import create_pending_document, set_document_status
     from src.temporal.activities.store import store_in_postgresql, store_in_weaviate
     from src.temporal.activities.tenant import ensure_tenant_ready, update_workspace_stats
+    from src.temporal.document_failure import DOCUMENT_INGESTION_FAILED_TYPE
     from src.temporal.models import (
         ChunkTextInput,
         CleanupStagingInput,
@@ -49,17 +50,12 @@ with workflow.unsafe.imports_passed_through():
     )
     from src.temporal.weaviate_store_budget import weaviate_store_timeout
 
-# ApplicationError.type value for terminal document failure (#230).
-# Wait=true /ingest and sync trigger map this type to a structured
-# success=False response while still letting Temporal close status be Failed.
-_DOCUMENT_FAILURE_TYPE = "DocumentIngestionFailed"
-
 
 def _document_failure(message: str) -> ApplicationError:
     """Non-retryable error so Temporal close status is Failed after cleanup (#230)."""
     return ApplicationError(
         message,
-        type=_DOCUMENT_FAILURE_TYPE,
+        type=DOCUMENT_INGESTION_FAILED_TYPE,
         non_retryable=True,
     )
 

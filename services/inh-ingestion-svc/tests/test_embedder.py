@@ -214,6 +214,8 @@ def test_embed_texts_parallel_batches_preserve_order(monkeypatch):
 
 def test_embed_batch_retries_transient_failure(monkeypatch):
     """#229: per-batch retry absorbs a single TEI blip without failing the call."""
+    import httpx
+
     from src.services import embedder as emb
 
     monkeypatch.setenv("EMBEDDING_BATCH_MAX_RETRIES", "3")
@@ -223,7 +225,7 @@ def test_embed_batch_retries_transient_failure(monkeypatch):
     def flaky_post(inputs):
         calls["n"] += 1
         if calls["n"] < 2:
-            raise RuntimeError("queue saturated")
+            raise httpx.ReadTimeout("queue saturated", request=httpx.Request("POST", "/embed"))
         return [[1.0] * emb._embedding_dim() for _ in inputs]
 
     # Avoid real sleep in unit tests.
@@ -236,6 +238,8 @@ def test_embed_batch_retries_transient_failure(monkeypatch):
 
 
 def test_embed_batch_retries_exhausted_raise(monkeypatch):
+    import httpx
+
     from src.services import embedder as emb
 
     monkeypatch.setenv("EMBEDDING_BATCH_MAX_RETRIES", "2")
@@ -243,8 +247,55 @@ def test_embed_batch_retries_exhausted_raise(monkeypatch):
     monkeypatch.setattr(emb.time, "sleep", lambda _s: None)
 
     def always_fail(inputs):
-        raise RuntimeError("tei down")
+        raise httpx.ConnectError("tei down")
 
     monkeypatch.setattr(emb, "_post_embed", always_fail)
-    with pytest.raises(RuntimeError, match="tei down"):
+    with pytest.raises(httpx.ConnectError, match="tei down"):
         emb.embed_texts(["x"])
+
+
+def test_embed_batch_does_not_retry_client_4xx(monkeypatch):
+    """Deterministic 4xx must fail fast — not pad load under the retry loop."""
+    import httpx
+
+    from src.services import embedder as emb
+
+    monkeypatch.setenv("EMBEDDING_BATCH_MAX_RETRIES", "5")
+    monkeypatch.setenv("EMBEDDING_MAX_CONCURRENCY", "1")
+    monkeypatch.setattr(emb.time, "sleep", lambda _s: None)
+    calls = {"n": 0}
+
+    def bad_request(inputs):
+        calls["n"] += 1
+        req = httpx.Request("POST", "/embed")
+        resp = httpx.Response(400, request=req)
+        raise httpx.HTTPStatusError("bad request", request=req, response=resp)
+
+    monkeypatch.setattr(emb, "_post_embed", bad_request)
+    with pytest.raises(httpx.HTTPStatusError):
+        emb.embed_texts(["x"])
+    assert calls["n"] == 1
+
+
+def test_embed_batch_retries_http_503(monkeypatch):
+    import httpx
+
+    from src.services import embedder as emb
+
+    monkeypatch.setenv("EMBEDDING_BATCH_MAX_RETRIES", "3")
+    monkeypatch.setenv("EMBEDDING_MAX_CONCURRENCY", "1")
+    monkeypatch.setattr(emb.time, "sleep", lambda _s: None)
+    calls = {"n": 0}
+
+    def flaky_503(inputs):
+        calls["n"] += 1
+        if calls["n"] < 2:
+            req = httpx.Request("POST", "/embed")
+            resp = httpx.Response(503, request=req)
+            raise httpx.HTTPStatusError("unavailable", request=req, response=resp)
+        return [[0.5] * emb._embedding_dim() for _ in inputs]
+
+    monkeypatch.setattr(emb, "_post_embed", flaky_503)
+    out = emb.embed_texts(["x"])
+    assert out[0][0] == 0.5
+    assert calls["n"] == 2

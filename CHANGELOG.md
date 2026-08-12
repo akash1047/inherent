@@ -14,7 +14,7 @@ All notable changes to Inherent are documented here. The format follows
   could not cover multi-batch embedding under TEI queue load. Activity
   retry initial/max intervals lengthened (5–60s) to reduce lockstep retry
   herds. The embedder dispatches batches with bounded concurrency
-  (`EMBEDDING_MAX_CONCURRENCY`, default **2** — product with
+  (`EMBEDDING_MAX_CONCURRENCY`, default **2** — the product of this and
   `TEMPORAL_MAX_CONCURRENT_ACTIVITIES` is the TEI in-flight cap) and
   per-batch retry with exponential backoff + jitter so a single queue
   spike does not burn a whole Temporal attempt. Terminal document

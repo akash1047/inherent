@@ -459,13 +459,15 @@ class TestSyncTriggerWorkflowMemoIntegration:
         from temporalio.client import WorkflowFailureError
         from temporalio.exceptions import ApplicationError
 
+        from src.temporal.document_failure import DOCUMENT_INGESTION_FAILED_TYPE
+
         trigger = self._ready_trigger()
         handle = MagicMock()
         handle.result = AsyncMock(
             side_effect=WorkflowFailureError(
                 cause=ApplicationError(
                     "Weaviate storage failed: timed out",
-                    type="DocumentIngestionFailed",
+                    type=DOCUMENT_INGESTION_FAILED_TYPE,
                     non_retryable=True,
                 )
             )

@@ -235,7 +235,7 @@ class TestWeaviateStoreBudgetWiring:
         from src.temporal.workflows import document_ingestion
 
         outputs = dict(HAPPY_OUTPUTS)
-        # 44 chunks → 2 batches / concurrency 2 → 1 wave under the budget formula.
+        # 44 chunks → 2 serial batches under the budget formula (2*100+30=230).
         outputs["chunk_text"] = ChunkTextOutput(chunk_count=44)
         outputs["store_in_postgresql"] = StoreDocumentOutput(success=True, chunks_stored=44)
         outputs["store_in_weaviate"] = StoreDocumentOutput(success=True, chunks_stored=44)
@@ -248,8 +248,8 @@ class TestWeaviateStoreBudgetWiring:
         wv_kwargs = fake.kwargs_for("store_in_weaviate")
         assert len(wv_kwargs) == 1
         assert wv_kwargs[0]["start_to_close_timeout"] == weaviate_store_timeout(44)
-        # One wave worst-case (retries×timeout + sleep budget + overhead).
-        assert wv_kwargs[0]["start_to_close_timeout"] == timedelta(seconds=130)
+        # Serial worst-case (retries×timeout + sleep budget + overhead per batch).
+        assert wv_kwargs[0]["start_to_close_timeout"] == timedelta(seconds=230)
         # #229: longer initial retry interval than the old 2s lockstep default.
         assert wv_kwargs[0]["retry_policy"].initial_interval == timedelta(seconds=5)
 
@@ -294,7 +294,9 @@ class TestWorkflowPublishesCompletion:
             with pytest.raises(ApplicationError) as ei:
                 await wf.run(make_workflow_input())
 
-        assert ei.value.type == "DocumentIngestionFailed"
+        from src.temporal.document_failure import DOCUMENT_INGESTION_FAILED_TYPE
+
+        assert ei.value.type == DOCUMENT_INGESTION_FAILED_TYPE
         assert "pg down" in (ei.value.message or "")
         publishes = fake.calls_for("publish_completion")
         assert len(publishes) == 1
@@ -307,6 +309,7 @@ class TestWorkflowPublishesCompletion:
     async def test_weaviate_failure_publishes_failed_event_and_raises(self):
         from temporalio.exceptions import ApplicationError
 
+        from src.temporal.document_failure import DOCUMENT_INGESTION_FAILED_TYPE
         from src.temporal.workflows import document_ingestion
 
         outputs = dict(HAPPY_OUTPUTS)
@@ -319,7 +322,7 @@ class TestWorkflowPublishesCompletion:
             with pytest.raises(ApplicationError) as ei:
                 await wf.run(make_workflow_input())
 
-        assert ei.value.type == "DocumentIngestionFailed"
+        assert ei.value.type == DOCUMENT_INGESTION_FAILED_TYPE
         assert "weaviate down" in (ei.value.message or "")
         publishes = fake.calls_for("publish_completion")
         assert len(publishes) == 1
@@ -332,6 +335,7 @@ class TestWorkflowPublishesCompletion:
         into the outer except — same terminal raise as success=False (#230)."""
         from temporalio.exceptions import ApplicationError
 
+        from src.temporal.document_failure import DOCUMENT_INGESTION_FAILED_TYPE
         from src.temporal.workflows import document_ingestion
 
         fake = FakeWorkflowModule(
@@ -343,7 +347,7 @@ class TestWorkflowPublishesCompletion:
             with pytest.raises(ApplicationError) as ei:
                 await wf.run(make_workflow_input())
 
-        assert ei.value.type == "DocumentIngestionFailed"
+        assert ei.value.type == DOCUMENT_INGESTION_FAILED_TYPE
         assert "StartToClose timeout" in (ei.value.message or "")
         assert fake.calls_for("cleanup_staging")
         publishes = fake.calls_for("publish_completion")
@@ -354,6 +358,7 @@ class TestWorkflowPublishesCompletion:
     async def test_unexpected_activity_error_publishes_failed_event_and_raises(self):
         from temporalio.exceptions import ApplicationError
 
+        from src.temporal.document_failure import DOCUMENT_INGESTION_FAILED_TYPE
         from src.temporal.workflows import document_ingestion
 
         fake = FakeWorkflowModule(
@@ -364,7 +369,7 @@ class TestWorkflowPublishesCompletion:
             with pytest.raises(ApplicationError) as ei:
                 await wf.run(make_workflow_input())
 
-        assert ei.value.type == "DocumentIngestionFailed"
+        assert ei.value.type == DOCUMENT_INGESTION_FAILED_TYPE
         assert "boom" in (ei.value.message or "")
         publishes = fake.calls_for("publish_completion")
         assert len(publishes) == 1
@@ -431,8 +436,10 @@ class TestWorkflowPublishesCompletion:
             with pytest.raises(ApplicationError) as ei:
                 await wf.run(make_workflow_input())
 
+        from src.temporal.document_failure import DOCUMENT_INGESTION_FAILED_TYPE
+
         # Terminal ApplicationError (#230) carries the CAUSE, not the wrapper.
-        assert ei.value.type == "DocumentIngestionFailed"
+        assert ei.value.type == DOCUMENT_INGESTION_FAILED_TYPE
         assert "Activity task failed" not in (ei.value.message or "")
         assert "PDF extraction failed" in (ei.value.message or "")
         assert "PdfStreamError" in (ei.value.message or "")
