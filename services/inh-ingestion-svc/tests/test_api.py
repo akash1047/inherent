@@ -261,7 +261,9 @@ class TestIngestTrigger:
         assert resp.status_code == 500
         assert "Workflow cancelled" in resp.json()["detail"]
 
-    def test_wait_true_document_ingestion_failed_returns_200_success_false(self, client: TestClient):
+    def test_wait_true_document_ingestion_failed_returns_200_success_false(
+        self, client: TestClient
+    ):
         """#230: terminal document failure raises ApplicationError so Temporal
         status is Failed; wait=true still returns structured success=False."""
         from temporalio.client import WorkflowFailureError
