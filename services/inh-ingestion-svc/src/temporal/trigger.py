@@ -355,8 +355,35 @@ class TemporalWorkflowTrigger:
                 task_queue=self.settings.temporal_task_queue,
             )
 
-            # Wait for workflow completion
-            result: WorkflowResult = await handle.result()
+            # Wait for workflow completion. #230: terminal document failures
+            # raise ApplicationError(type=DocumentIngestionFailed) so Temporal
+            # close status is Failed; map that back to ProcessingResult rather
+            # than treating it as a trigger/start error.
+            try:
+                result: WorkflowResult = await handle.result()
+            except Exception as wait_err:
+                from temporalio.client import WorkflowFailureError
+                from temporalio.exceptions import ApplicationError
+
+                cause = getattr(wait_err, "cause", None)
+                if (
+                    isinstance(wait_err, WorkflowFailureError)
+                    and isinstance(cause, ApplicationError)
+                    and cause.type == "DocumentIngestionFailed"
+                ):
+                    err_msg = cause.message or str(cause)
+                    logger.info(
+                        "Temporal workflow failed document (expected terminal path)",
+                        workflow_id=workflow_id,
+                        document_id=upload_message.document_id,
+                        error=err_msg,
+                    )
+                    return ProcessingResult(
+                        document_id=upload_message.document_id,
+                        success=False,
+                        error=err_msg,
+                    )
+                raise
 
             logger.info(
                 "Temporal workflow completed",
