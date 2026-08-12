@@ -41,7 +41,7 @@ def test_capture_enabled_honors_optout():
 
 
 @pytest.mark.asyncio
-async def test_record_query_event_writes_and_purges():
+async def test_record_query_event_derives_fields_from_the_response():
     db = AsyncMock()
     with patch("src.services.eval_capture.get_database", new=AsyncMock(return_value=db)):
         await eval_capture.record_query_event(
@@ -55,7 +55,33 @@ async def test_record_query_event_writes_and_purges():
     assert kwargs["result_doc_ids"] == ["d0", "d1"]
     assert kwargs["result_chunk_ids"] == ["c0", "c1"]
     assert kwargs["top_score"] == pytest.approx(0.9)
-    db.purge_expired_eval_events.assert_awaited_once()
+    # The purge no longer rides along here (#240): record_query_event is awaited
+    # on the request path, so it does the INSERT and nothing else. The purge is
+    # queued separately by the search handler and stays write-behind — see
+    # test_eval_capture_durability.py.
+    db.purge_expired_eval_events.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_purge_expired_events_uses_the_configured_retention():
+    db = AsyncMock()
+    with (
+        patch("src.services.eval_capture.get_database", new=AsyncMock(return_value=db)),
+        patch.object(eval_capture, "settings") as s,
+    ):
+        s.eval_retention_days = 30
+        await eval_capture.purge_expired_events("ws-1")
+    db.purge_expired_eval_events.assert_awaited_once_with(workspace_id="ws-1", retention_days=30)
+
+
+@pytest.mark.asyncio
+async def test_purge_expired_events_never_raises():
+    """Best-effort like capture: a failed purge cannot surface anywhere."""
+    with patch(
+        "src.services.eval_capture.get_database",
+        new=AsyncMock(side_effect=RuntimeError("db down")),
+    ):
+        await eval_capture.purge_expired_events("ws-1")
 
 
 @pytest.mark.asyncio

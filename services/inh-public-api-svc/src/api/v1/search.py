@@ -21,7 +21,12 @@ from src.services.audit_publisher import (
 )
 from src.services.auth import ResolvedAuth, resolve_workspace_search
 from src.services.database import get_database
-from src.services.eval_capture import capture_enabled, new_event_id, record_query_event
+from src.services.eval_capture import (
+    capture_enabled,
+    new_event_id,
+    purge_expired_events,
+    record_query_event,
+)
 from src.services.quality_gate import evaluate as evaluate_quality
 from src.services.search import SearchService, get_search_service
 from src.utils import get_logger
@@ -354,22 +359,33 @@ async def search_documents(
             workspace_id=workspace_id,
         )
 
-        # Evals v1: mint the capture event id and schedule the write-behind.
-        # Fire-and-forget like audit; the response carries event_id so agents
-        # can report feedback (POST /v1/evals/feedback) on exactly this search.
-        # No awaits here: the task resolves the database itself, so capture can
-        # never fail or slow the serving path (not even on a cold DB init).
+        # Evals v1: capture this search so agents can label it later via
+        # POST /v1/evals/feedback.
+        #
+        # The INSERT is awaited here, NOT deferred (#240). Unlike audit
+        # publishing above — which this originally copied — capture hands the
+        # caller a handle: the response carries event_id. BackgroundTasks run
+        # after the response is sent, so deferring the write meant returning an
+        # id that did not exist yet, and a caller posting feedback on the next
+        # round trip raced the write and got a 404.
+        #
+        # advertise the id only if the row is durable: no id means "not
+        # captured", which a caller can act on, whereas a dangling id is
+        # indistinguishable from a good one until it 404s. record_query_event
+        # never raises, so capture still cannot fail a search.
         if capture_enabled(workspace_id):
             event_id = new_event_id()
-            response.event_id = event_id
-            background_tasks.add_task(
-                record_query_event,
+            if await record_query_event(
                 event_id=event_id,
                 workspace_id=workspace_id,
                 user_id=auth.key_info.user_id,
                 request=request,
                 response=response,
-            )
+            ):
+                response.event_id = event_id
+            # Retention purge is the slow half and nobody holds a handle to it,
+            # so it stays write-behind.
+            background_tasks.add_task(purge_expired_events, workspace_id)
         return response
 
     # Multi-workspace: search across all user workspaces, merge results
