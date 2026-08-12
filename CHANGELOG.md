@@ -431,7 +431,7 @@ All notable changes to Inherent are documented here. The format follows
 ### Fixed
 
 - **`POST /v1/search` returned an `event_id` before the capture row existed
-  (#241, #240).** The id was minted, attached to the response, and the INSERT
+  (#242, #240).** The id was minted, attached to the response, and the INSERT
   scheduled via `BackgroundTasks` — which Starlette runs *after* the response
   is sent. A caller that posted `/v1/evals/feedback` on the next round trip
   raced the write and got `404 Unknown event_id`. The insert usually won, so
@@ -445,7 +445,7 @@ All notable changes to Inherent are documented here. The format follows
   the retention window as the sole cause — it sent this investigation down the
   wrong path first.
 
-- **Any evals failure was reported as a ranking regression (#241, #240).** The
+- **Any evals failure was reported as a ranking regression (#242, #240).** The
   CI gate step selected `-m 'retrieval_eval and compose'`, which matched both
   the ranking-regression test and the flywheel test, so an unrelated failure
   surfaced as `##[error] retrieval-eval hard gate failed -- a per-mode metric
