@@ -28,7 +28,12 @@ import pytest
 from src.services.ranking_metrics import mrr, ndcg_at_k, recall_at_k
 from tests.evals.eval_gate import find_regressions, format_regressions, load_metrics
 
-pytestmark = [pytest.mark.retrieval_eval, pytest.mark.compose]
+# ``eval_gate`` is what CI's hard-gate step selects on, and this is the ONLY
+# module that carries it: a failure here means a ranking metric regressed vs
+# the committed baseline, which is what the gate's error message and the
+# auto-filed regression issue both assert. Sibling evals tests keep
+# ``retrieval_eval`` alone so their failures are reported as themselves (#240).
+pytestmark = [pytest.mark.retrieval_eval, pytest.mark.eval_gate, pytest.mark.compose]
 
 # Where per-mode metrics are written for downstream reporting (#37) and for the
 # CI ratchet step to read after this test passes. CI sets EVAL_REPORT; locally

@@ -131,13 +131,22 @@ jobs:
           # take well over the 180s default to reach 'processed'. Give the
           # status/search polls a generous budget (job timeout-minutes caps it).
           INTEGRATION_TIMEOUT: "600"
-        run: uv run pytest -m 'retrieval_eval and compose'
+        # 'eval_gate', NOT 'retrieval_eval' (#240). The wider marker also covers
+        # test_evals_flywheel.py, so any failure there was re-reported by the
+        # "Enforce" step below as "a per-mode metric regressed beyond tolerance"
+        # and filed as a ranking-regression issue -- a false cause that cost a
+        # full re-investigation. Only the ranking-regression module carries
+        # 'eval_gate', so this step's outcome now means what it says.
+        run: uv run pytest -m 'eval_gate and compose'
 
       - name: Run remaining public-api compose tests (integration + benchmarks)
         working-directory: services/inh-public-api-svc
         env:
           INTEGRATION_TIMEOUT: "600"
-        run: uv run pytest -m 'compose and not retrieval_eval'
+        # 'not eval_gate' rather than 'not retrieval_eval', so the sibling evals
+        # tests (flywheel) still run here instead of falling out of CI entirely
+        # when they stopped being the gate's business.
+        run: uv run pytest -m 'compose and not eval_gate'
 
       # Search latency/throughput benchmark summary (REQ-EVL-3, #36): p50/p95/
       # p99/QPS + git sha, written by test_search_latency_throughput.py's live

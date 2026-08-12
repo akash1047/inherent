@@ -430,6 +430,31 @@ All notable changes to Inherent are documented here. The format follows
 
 ### Fixed
 
+- **`POST /v1/search` returned an `event_id` before the capture row existed
+  (#242, #240).** The id was minted, attached to the response, and the INSERT
+  scheduled via `BackgroundTasks` — which Starlette runs *after* the response
+  is sent. A caller that posted `/v1/evals/feedback` on the next round trip
+  raced the write and got `404 Unknown event_id`. The insert usually won, so
+  this surfaced as an intermittent CI failure, but it was a live contract bug:
+  `report_feedback` is an MCP tool, ADR 0003 makes `event_id` the public join
+  key for external eval stacks, and the documented flywheel is search →
+  feedback back to back. Search now awaits the insert before returning, and
+  omits `event_id` entirely when capture fails rather than advertising an id
+  that resolves to nothing. Capture still cannot fail or raise into a search;
+  the retention purge stays write-behind. The `404` message no longer blames
+  the retention window as the sole cause — it sent this investigation down the
+  wrong path first.
+
+- **Any evals failure was reported as a ranking regression (#242, #240).** The
+  CI gate step selected `-m 'retrieval_eval and compose'`, which matched both
+  the ranking-regression test and the flywheel test, so an unrelated failure
+  surfaced as `##[error] retrieval-eval hard gate failed -- a per-mode metric
+  regressed beyond tolerance` and filed a ranking-regression issue. A narrower
+  `eval_gate` marker now carries the hard gate alone; the flywheel test moved
+  to the general compose step, where its failure is reported as itself. Test
+  coverage is unchanged — the two steps still partition the same 9 compose
+  tests, 1 + 8 instead of 2 + 7.
+
 - **Retrieval-eval baseline re-seeded to the shipped diversification default,
   unblocking `main` (#237, #146).** The compose retrieval-eval hard gate had
   failed every push and nightly on `main` since sha `edd9f0c`, on one metric:

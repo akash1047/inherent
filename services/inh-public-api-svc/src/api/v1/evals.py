@@ -59,11 +59,19 @@ async def report_feedback(
     try:
         return await submit_feedback(database, workspace_ids=[workspace_id], req=request)
     except EventNotFoundError:
+        # State the causes rather than assert one (#240). This message used to
+        # blame the retention window alone, which sent an investigation down
+        # the wrong path when the real cause was a capture write that had not
+        # landed yet. That race is fixed — search now awaits the INSERT before
+        # returning the id — so a miss here means the event genuinely is not
+        # this workspace's, or is old enough to have been purged.
         raise HTTPException(
             status_code=404,
             detail=(
-                f"Unknown event_id '{request.event_id}'. Capture events expire "
-                "after the retention window; report feedback promptly after searching."
+                f"Unknown event_id '{request.event_id}'. Either it belongs to a "
+                "different workspace, or it aged past the capture retention "
+                "window. A search that returns an event_id has already recorded "
+                "it, so a just-issued id is always valid."
             ),
         )
 

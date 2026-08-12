@@ -83,6 +83,13 @@ markers = [
     "compose: requires a running docker-compose stack (deselected by default)",
     "slow: slow-running tests",
     "retrieval_eval: retrieval quality and ranking regression benchmarks",
+    # Narrower than retrieval_eval, and deliberately so (#240): ONLY the test
+    # whose failure means "a ranking metric regressed vs the committed
+    # baseline". CI runs this marker as its own step so the eval-gate error and
+    # the auto-filed regression issue cannot be triggered by an unrelated evals
+    # failure -- which is exactly what happened when the flywheel test's 404
+    # was reported as "a per-mode metric regressed beyond tolerance".
+    "eval_gate: the retrieval baseline hard gate (ranking regression only)",
     "benchmark: latency/throughput benchmarks (loose SLO regression guards)",
     "security: auth/tenancy security regression tests (offline; #32)",
     "contract: REST/MCP contract regression (response shapes, permissions, error codes)",
