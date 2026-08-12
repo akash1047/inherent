@@ -91,11 +91,18 @@ sequenceDiagram
 
     EP->>BG: schedule publish_audit_event<br/>(snippets, chunk_ids, risk counts, verdict, fallback)
     opt single-workspace scope and eval capture enabled for workspace
-        EP->>BG: mint event_id → response.event_id,<br/>schedule record_query_event
+        EP->>PG: await record_query_event (INSERT eval_query_events)
+        alt row is durable
+            EP->>EP: response.event_id = event_id
+        else capture failed
+            Note over EP: no event_id — never a dangling one (#240)
+        end
+        EP->>BG: schedule purge_expired_events (retention, write-behind)
         Note over EP,BG: multi-workspace search never sets event_id
     end
     EP-->>C: 200 SearchResponse{query, results, total_results, processing_time_ms,<br/>search_mode, quality_verdict, performed_fallback, fallback_strategy,<br/>total_tokens, event_id}
     Note over BG: background tasks run AFTER the response is sent<br/>(fire-and-forget, can never slow or fail the search)
+    Note over EP,PG: capture is the exception: it is awaited, because the<br/>response hands the caller an event_id and an id that<br/>does not resolve is worse than no id (#240)
 ```
 
 ## 2. Micro level — inside `SearchService.search()`
