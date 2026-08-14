@@ -153,8 +153,13 @@ def _post_embed_with_retry(inputs: list[str]) -> list[list[float]]:
             if not _is_transient_embed_error(exc) or attempt >= attempts:
                 break
             # Base 0.5s * 2^(attempt-1), plus 0–50% jitter; cap at 8s.
+            # The only thing this randomness protects is retry *timing*: it
+            # de-synchronises concurrent batches so they do not re-hit TEI in
+            # lockstep. Nothing here is a secret, a token or a key, so a
+            # predictable sequence costs an attacker nothing and a CSPRNG buys
+            # nothing -- hence the B311 waiver on the delay line below.
             base = min(8.0, 0.5 * (2 ** (attempt - 1)))
-            delay = base * (0.5 + random.random() * 0.5)
+            delay = base * (0.5 + random.random() * 0.5)  # nosec B311 -- see above
             logger.warning(
                 "embed_batch_retry",
                 attempt=attempt,
