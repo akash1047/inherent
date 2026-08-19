@@ -33,7 +33,7 @@ from pathlib import Path
 
 import httpx
 import pytest
-from inh_contracts.file_types import get_spec_for_upload
+from inh_contracts.file_types import get_spec_for_upload, mime_type_for_extension
 
 from src.services.ranking_metrics import mrr, ndcg_at_k, recall_at_k
 from tests.evals.eval_gate import (
@@ -156,7 +156,13 @@ def _content_type(filename: str) -> str:
         f"no registered file type for fixture {filename!r} -- qrels.jsonl references a "
         f"format inh_contracts.file_types does not accept"
     )
-    return spec.mime_types[0]
+    # Not ``spec.mime_types[0]``: that is the canonical type only for a spec
+    # describing ONE format. The ``code`` spec pools 22 aliases across 21
+    # extensions, so index 0 labels a Go, SQL or Java fixture ``text/x-python``
+    # -- the exact bug ``mime_type_for_extension`` was added to close (#197).
+    # No code fixture is in the corpus today, but resolving per-extension is
+    # the whole point of sourcing the registry rather than a local table.
+    return mime_type_for_extension(spec, os.path.splitext(filename)[1])
 
 
 def _search(client: httpx.Client, query: str, mode: str, limit: int = 5) -> list[str]:

@@ -425,8 +425,10 @@ On a green gate on `main`, `.github/workflows/integration.yml`'s
 `eval-baseline-ratchet` job ratchets the baseline up to
 `max(current, baseline)` per mode/metric (never down), appends a line to
 `corpus/retrieval_history.jsonl` — a durable, checked-in trend log of every
-main-branch run's scores, each line `{sha, date, n, metrics}` — regenerates
-the baseline table published in
+main-branch run's scores, each line written as `{sha, date, n, metrics}`
+since #265 (lines appended before that carry no `n`; see
+[below](#n-on-a-history-line-and-why-two-lines-may-not-be-comparable-265)) —
+regenerates the baseline table published in
 `README.md` and `docs/_generated/retrieval-baseline.md` (see
 [below](#publishing-the-baseline)), and opens (or updates) a pull request
 carrying those changes, rather than pushing to `main` directly: branch
