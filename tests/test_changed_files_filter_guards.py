@@ -41,34 +41,61 @@ EMPTY_CHECK = "[ ! -s changed.txt ]"
 GREP = "grep -vqE"
 
 
-def _text(workflow: str) -> str:
-    return (REPO_ROOT / workflow).read_text()
+def _filter_condition(workflow: str) -> str:
+    """Return the single `if ...; then` line that classifies the diff.
+
+    Anchoring every assertion to this one line -- rather than to offsets into
+    the whole file -- keeps the checks about the filter itself: a `grep -vqE`
+    or a `changed.txt` mention elsewhere in the workflow cannot satisfy or
+    confuse them. Missing means the filter has been restructured beyond what
+    these guards understand, which is a failure worth reporting loudly.
+    """
+    text = (REPO_ROOT / workflow).read_text()
+    candidates = [
+        line.strip()
+        for line in text.splitlines()
+        if line.strip().startswith("if ") and "changed.txt" in line
+    ]
+    assert len(candidates) == 1, (
+        f"{workflow}: expected exactly one `if ... changed.txt ...; then` filter "
+        f"line, found {len(candidates)} -- the guards below cannot anchor (#303)"
+    )
+    return candidates[0]
 
 
 @pytest.mark.parametrize("workflow", WORKFLOWS)
 def test_empty_changed_files_counts_as_software_affecting(workflow: str) -> None:
-    text = _text(workflow)
-    assert EMPTY_CHECK in text, (
+    condition = _filter_condition(workflow)
+    assert EMPTY_CHECK in condition, (
         f"{workflow}: the path filter must test `{EMPTY_CHECK}` -- without it an "
         "empty changed.txt is indistinguishable from a docs-only PR and every "
-        "required check reports skipped-hence-passing (#303)"
+        f"required check reports skipped-hence-passing (#303). Found: {condition!r}"
     )
 
 
 @pytest.mark.parametrize("workflow", WORKFLOWS)
 def test_empty_check_short_circuits_before_the_grep(workflow: str) -> None:
-    """`[ ! -s ... ] || grep ...` -- order matters, and so does the `||`.
+    """`[ ! -s ... ] || grep ...` -- both the order and the `||` matter.
 
-    Behind the grep (or joined with `&&`) the check cannot rescue the empty
+    Behind the grep, or joined with `&&`, the check cannot rescue the empty
     case, which is the whole bug.
     """
-    text = _text(workflow)
-    empty_at = text.index(EMPTY_CHECK)
-    grep_at = text.index(GREP, empty_at - 200 if empty_at > 200 else 0)
-    assert empty_at < grep_at, (
-        f"{workflow}: `{EMPTY_CHECK}` must come before `{GREP}` in the filter (#303)"
+    condition = _filter_condition(workflow)
+    assert EMPTY_CHECK in condition, (
+        f"{workflow}: no `{EMPTY_CHECK}` in the filter condition (#303). "
+        f"Found: {condition!r}"
     )
-    between = text[empty_at + len(EMPTY_CHECK) : grep_at]
+    assert GREP in condition, (
+        f"{workflow}: no `{GREP}` in the filter condition (#303). Found: {condition!r}"
+    )
+
+    empty_at = condition.index(EMPTY_CHECK)
+    grep_at = condition.index(GREP)
+    assert empty_at < grep_at, (
+        f"{workflow}: `{EMPTY_CHECK}` must come before `{GREP}` (#303). "
+        f"Found: {condition!r}"
+    )
+    between = condition[empty_at + len(EMPTY_CHECK) : grep_at]
     assert "||" in between, (
         f"{workflow}: join the empty check to the grep with `||` so an empty "
         f"changed.txt short-circuits to software=true (#303); found {between!r}"
@@ -78,11 +105,16 @@ def test_empty_check_short_circuits_before_the_grep(workflow: str) -> None:
 @pytest.mark.parametrize("workflow", WORKFLOWS)
 def test_empty_diff_selects_the_software_true_branch(workflow: str) -> None:
     """The rescued branch must be the one that RUNS the suite, not the one that skips."""
-    text = _text(workflow)
-    branch = text[text.index(EMPTY_CHECK) :]
-    true_at = branch.index('echo "software=true"')
-    false_at = branch.index('echo "software=false"')
-    assert true_at < false_at, (
+    condition = _filter_condition(workflow)
+    text = (REPO_ROOT / workflow).read_text()
+    branch = text[text.index(condition) :]
+
+    for token in ('echo "software=true"', 'echo "software=false"'):
+        assert token in branch, (
+            f"{workflow}: no `{token}` after the filter condition -- the filter "
+            f"no longer sets the output these guards describe (#303)"
+        )
+    assert branch.index('echo "software=true"') < branch.index('echo "software=false"'), (
         f"{workflow}: the empty-diff check must fall through to software=true "
         "(fail open into running the suite), not software=false (#303)"
     )
