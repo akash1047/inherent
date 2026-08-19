@@ -361,6 +361,46 @@ doubling `n` to 26 halves every metric's derived tolerance. This is a
 standing incentive to keep expanding `corpus/qrels.jsonl`, not a one-time
 trade to forget about.
 
+### Blind-spot size after the 2026-08-19 corpus growth (#265)
+
+The corpus grew from **13 to 50 gated queries** — the prior 13 (q1–q12,
+q14) plus 37 new gated ones among `qrels.jsonl` q15–q53 (that range spans 39
+ids, of which q25/q26 are `abstention` and so do not count toward `n`) —
+which closes the window described above:
+
+| | `n = 13` (2026-08-12) | `n = 50` (2026-08-19) |
+|---|---|---|
+| `recall@5` tolerance | `1/13 ≈ 0.0769` | **`0.0200`** (floor) |
+| `mrr` tolerance | `0.5/13 ≈ 0.0385` | **`0.0200`** (floor) |
+| `ndcg@5` tolerance | `(1-1/log2(3))/13 ≈ 0.0284` | **`0.0200`** (floor) |
+| binding term | `1/n` on all three | `EVAL_GATE_TOLERANCE` on all three |
+| silent-pass window | ~7.7 percentage points | **~2 percentage points** |
+
+**`n = 50` is where growth stops paying.** At 50 gated queries every metric's
+derived `min_detectable_delta` has dropped to or below the `0.02`
+`EVAL_GATE_TOLERANCE` floor, so the floor — not corpus resolution — is what
+sets the tolerance. Adding a 51st query still costs labeling effort but buys
+**zero** additional gate sensitivity; the next lever is lowering
+`EVAL_GATE_TOLERANCE` itself, which is only safe once the corpus is large
+enough to resolve the finer value (`recall@5` needs `n > 1/tolerance`, so a
+`0.01` floor would require `n > 100`).
+
+Because pooled metrics are means over the query set, the `n = 50` baseline
+numbers are **not comparable** to the `n = 13` ones they replace — they
+average a different, larger set of queries. The re-seed is documented in
+`corpus/retrieval_baseline.json`'s `_comment`; two of nine metrics moved
+down on composition alone (`keyword.recall@5` `0.8846 → 0.8600` and
+`semantic.recall@5` `0.8846 → 0.8800` — the other seven rose), which the
+automated ratchet cannot do by construction, so it landed as a reviewed
+baseline edit.
+
+Corpus composition at `n = 50` (abstention excluded from `n`): `general` 30,
+`exact_id` 8, `paraphrase` 6, `stale_version` 3, `multi_doc_crowding` 3,
+`abstention` 3 (ungated). The growth also widened the document set the corpus
+exercises from 9 to 20 fixtures, pulling in the tabular (`.xlsx`, `.csv`),
+binary-document (`.pdf`, `.docx`), subtitle (`.srt`, `.vtt`) and config
+(`.yaml`, `.toml`) extraction paths that the 13-query corpus never touched.
+
 `min_detectable_delta` and `effective_tolerance` live in `tests/evals/eval_gate.py`
 and are unit-tested (hand-computed values) in `tests/evals/test_eval_gate.py`.
 The compose test derives `n` from the same in-memory query/category mapping it
@@ -385,7 +425,8 @@ On a green gate on `main`, `.github/workflows/integration.yml`'s
 `eval-baseline-ratchet` job ratchets the baseline up to
 `max(current, baseline)` per mode/metric (never down), appends a line to
 `corpus/retrieval_history.jsonl` — a durable, checked-in trend log of every
-main-branch run's scores — regenerates the baseline table published in
+main-branch run's scores, each line `{sha, date, n, metrics}` — regenerates
+the baseline table published in
 `README.md` and `docs/_generated/retrieval-baseline.md` (see
 [below](#publishing-the-baseline)), and opens (or updates) a pull request
 carrying those changes, rather than pushing to `main` directly: branch
@@ -460,6 +501,28 @@ README stale. Output is a pure function of the baseline, so re-running against
 an unchanged baseline is a no-op — the `eval-baseline-ratchet` job relies on
 that to keep `README.md` and the docs snippet out of its commit unless the
 numbers actually moved.
+
+### `n` on a history line, and why two lines may not be comparable (#265)
+
+Every history line carries `n`, the gated golden-query count that produced
+it, read from `qrels.jsonl` by the same `load_qrels_query_count` helper the
+gate derives its tolerance from — so the recorded `n` can never disagree with
+the one the gate actually used.
+
+It is there because **a history line is a pooled mean over the corpus, so two
+lines are only comparable when `n` matches.** The 2026-08-19 growth from 13 to
+50 gated queries moved every metric for reasons that have nothing to do with
+retrieval quality — a larger, differently-composed question set, not better or
+worse search. Without `n` on the line, that discontinuity is invisible and the
+log reads as one continuous trend spanning two different corpora, which is how
+a composition change gets misread as a quality regression (or a quality
+regression gets excused as a composition change).
+
+Lines written before the field existed have **no** `n` key. They are not
+assumed to be any particular size: the corpus also grew during #139, so
+backfilling a single value across the pre-#265 log would have invented
+precision the log never had. Treat a missing `n` as unknown, and do not
+compare such a line against one that has it.
 
 It renders the **baseline**, not `retrieval_history.jsonl`, deliberately: a
 history line is appended on every main-branch run (each with a fresh

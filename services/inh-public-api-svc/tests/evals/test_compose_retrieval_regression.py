@@ -33,6 +33,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+from inh_contracts.file_types import get_spec_for_upload
 
 from src.services.ranking_metrics import mrr, ndcg_at_k, recall_at_k
 from tests.evals.eval_gate import (
@@ -139,15 +140,23 @@ def client() -> httpx.Client:
 
 
 def _content_type(filename: str) -> str:
-    return {
-        ".txt": "text/plain",
-        ".md": "text/markdown",
-        ".csv": "text/csv",
-        ".html": "text/html",
-        ".json": "application/json",
-        ".pdf": "application/pdf",
-        ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    }.get(os.path.splitext(filename)[1], "application/octet-stream")
+    """Resolve a fixture's upload MIME type from the shared file-type registry.
+
+    Sourced from the shared registry so the corpus stays free to reference any
+    format the product accepts, without this test drifting behind it.
+
+    Fails loudly on an unresolvable fixture rather than falling back to
+    ``application/octet-stream``: that fallback is precisely how an
+    unsupported extension used to reach the upload as a generic type and come
+    back a bare 4xx from the API, reporting a qrels authoring mistake as an
+    unrelated upload failure several steps downstream.
+    """
+    spec = get_spec_for_upload("application/octet-stream", filename)
+    assert spec is not None, (
+        f"no registered file type for fixture {filename!r} -- qrels.jsonl references a "
+        f"format inh_contracts.file_types does not accept"
+    )
+    return spec.mime_types[0]
 
 
 def _search(client: httpx.Client, query: str, mode: str, limit: int = 5) -> list[str]:

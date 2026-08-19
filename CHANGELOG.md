@@ -5,6 +5,45 @@ All notable changes to Inherent are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- **Retrieval-eval golden corpus grown from 13 to 50 gated queries, closing
+  the eval gate's ~7.7pp blind spot (#265).** #236 correctly derived the
+  gate's per-metric tolerance as `max(EVAL_GATE_TOLERANCE,
+  min_detectable_delta(metric, n))`, but at `n = 13` the `1/n` term dominated
+  every metric — a real `recall@5` regression up to ~7.7 percentage points
+  could pass the gate silently. `corpus/qrels.jsonl` now carries 50 gated
+  queries over 20 fixtures instead of 13 over 9 — the prior 13 plus 37 new
+  gated ones among q15–q53, a range spanning 39 ids of which q25/q26 are
+  `abstention` and so do not count toward `n` — which brings the
+  tabular (`.xlsx`, `.csv`), binary-document (`.pdf`, `.docx`), subtitle
+  (`.srt`, `.vtt`) and config (`.yaml`, `.toml`) extraction paths under the
+  gate for the first time. All three tolerances now sit at the `0.02` floor
+  (`recall@5` `0.0769 → 0.0200`, `mrr` `0.0385 → 0.0200`, `ndcg@5` `0.0284 →
+  0.0200`), so the silent-pass window is **~2 percentage points** and `1/n`
+  is no longer the binding term for any metric. `n = 50` is the deliberate
+  stopping point: it is exactly where `recall@5`'s `1/n` step meets the
+  floor, so further growth buys no gate sensitivity until the floor itself is
+  lowered (a `0.01` floor would need `n > 100`). q3's judgment was also
+  completed — it graded only `sample.txt`, marking a defensible top-1 result
+  wrong and pinning the query at 0.0 in every mode; `sample.html` now grades
+  `1` alongside, so `ndcg@5` (~0.13) still reports the real ranking weakness
+  the query found. `retrieval_baseline.json` is re-seeded accordingly: pooled
+  means over a larger query set are **not comparable** to the `n = 13`
+  numbers, and two of nine metrics moved down on composition alone
+  (`keyword.recall@5`, `semantic.recall@5`; the other seven rose), which the
+  ratchet cannot do by construction. `_content_type()` in the compose
+  eval now resolves MIME types from `inh_contracts.file_types` rather than a
+  local 7-extension table, so the corpus can reference any format the product
+  accepts without the test drifting behind the registry. Each
+  `retrieval_history.jsonl` line now also records `n`, the gated query count
+  that produced it: a history line is a pooled mean over the corpus, so two
+  lines are only comparable when `n` matches, and without it this growth would
+  read as a quality trend rather than the corpus change it is. Lines written
+  before the field have no `n` and are not assumed to be any particular size —
+  the corpus also grew during #139, so backfilling one value would invent
+  precision the log never had.
+
 ### Fixed
 
 - **Dead-letter rows left at `pending` for a document that later succeeded no
