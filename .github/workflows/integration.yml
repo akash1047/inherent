@@ -400,8 +400,25 @@ jobs:
             --report "$report" \
             --baseline "$baseline" \
             --out "$baseline"
+          # Record the gated golden-query count alongside the metrics (#265).
+          # A history line is a pooled MEAN over the corpus, so two lines are
+          # only comparable when they were measured over the same query set --
+          # the 2026-08-19 growth from 13 to 50 gated queries moved every
+          # metric for reasons that have nothing to do with retrieval quality.
+          # Without `n` on the line, that discontinuity is invisible and the
+          # log reads as a single trend spanning two different corpora. Read
+          # from qrels.jsonl via the same helper the gate derives its
+          # tolerance from, so the number can never disagree with the one the
+          # gate actually used. Lines with no `n` predate this field; they are
+          # NOT assumed to be any particular size.
+          #
+          # Run as `python -c` from inside $api for the same reason the
+          # renderer below uses `python -m`: only that puts the `tests`
+          # package on sys.path under `--no-project`.
+          n=$( cd "$api" && uv run --no-project python -c 'from pathlib import Path; from tests.evals.eval_gate import load_qrels_query_count; print(load_qrels_query_count(Path("tests/evals/corpus/qrels.jsonl")))' )
           jq -c --arg sha "$GITHUB_SHA" --arg date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            '{sha: $sha, date: $date, metrics: .}' "$report" >> "$history"
+            --argjson n "$n" \
+            '{sha: $sha, date: $date, n: $n, metrics: .}' "$report" >> "$history"
 
           # Republish the baseline table in README.md (#158) and the docs
           # snippet (#153) from the just-ratcheted baseline, so the advertised
