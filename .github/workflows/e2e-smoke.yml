@@ -65,7 +65,13 @@ jobs:
           # Kept in sync with the identical filter in ci.yml's `changes` job:
           # an allowlist of paths that cannot affect the running software
           # system, not a denylist of what to run.
-          if grep -vqE '^(docs/|graphify-out/|\.memory/|\.superpowers/|\.remember/)|\.md$|^(LICENSE|CODEOWNERS|mkdocs\.yml|requirements-docs\.txt)$' changed.txt; then
+          # An empty changed.txt is NOT docs-only: `grep -vq` exits 1 on a
+          # zero-line file, which is the same exit the docs-only case gives,
+          # so the two were indistinguishable and an empty diff reported every
+          # required check as skipped-hence-passing. Treat empty as
+          # software-affecting, matching the fail-open posture of the
+          # `!= 'false'` conditions below (#303).
+          if [ ! -s changed.txt ] || grep -vqE '^(docs/|graphify-out/|\.memory/|\.superpowers/|\.remember/)|\.md$|^(LICENSE|CODEOWNERS|mkdocs\.yml|requirements-docs\.txt)$' changed.txt; then
             echo "software=true" >> "$GITHUB_OUTPUT"
           else
             echo "software=false" >> "$GITHUB_OUTPUT"
