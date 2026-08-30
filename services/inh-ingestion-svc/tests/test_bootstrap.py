@@ -20,8 +20,9 @@ def cleanup_test_data():
 
 
 class FakeCursor:
-    def __init__(self, calls: list[tuple[str, tuple[object, ...]]]) -> None:
+    def __init__(self, calls: list[tuple[str, tuple[object, ...]]], rowcount: int = 1) -> None:
         self.calls = calls
+        self.rowcount = rowcount
 
     def __enter__(self):
         return self
@@ -34,8 +35,9 @@ class FakeCursor:
 
 
 class FakePostgres:
-    def __init__(self, calls: list[tuple[str, tuple[object, ...]]]) -> None:
+    def __init__(self, calls: list[tuple[str, tuple[object, ...]]], rowcount: int = 1) -> None:
         self.calls = calls
+        self.rowcount = rowcount
 
     def __enter__(self):
         return self
@@ -44,7 +46,7 @@ class FakePostgres:
         return None
 
     def cursor(self) -> FakeCursor:
-        return FakeCursor(self.calls)
+        return FakeCursor(self.calls, self.rowcount)
 
 
 class FakeCollection:
@@ -78,20 +80,22 @@ def _settings(api_key: str = "ink_secret_value") -> SimpleNamespace:
         bootstrap_user_id="local-user",
         bootstrap_key_name="Local CLI Key",
         bootstrap_workspace_name="Default Workspace",
+        bootstrap_action="seed",
+        bootstrap_key_prefix=None,
         database_url="postgresql://postgres:test@postgres/main",
         mongodb_uri="mongodb://mongodb:27017",
         mongodb_db_name="main",
     )
 
 
-def _patch_databases(monkeypatch):
+def _patch_databases(monkeypatch, rowcount: int = 1):
     postgres_calls: list[tuple[str, tuple[object, ...]]] = []
     mongo_calls: list[tuple[dict, dict, bool]] = []
     mongo = FakeMongo(mongo_calls)
     monkeypatch.setattr(
         bootstrap.psycopg2,
         "connect",
-        lambda _url: FakePostgres(postgres_calls),
+        lambda _url: FakePostgres(postgres_calls, rowcount),
     )
     monkeypatch.setattr(bootstrap, "AsyncIOMotorClient", lambda _uri: mongo)
     return postgres_calls, mongo_calls, mongo
@@ -213,3 +217,82 @@ async def test_bootstrap_is_idempotent_against_compose_datastores() -> None:
         postgres.close()
         await mongo["main"].workspaces.delete_one({"_id": workspace_id})
         mongo.close()
+
+
+# --- BOOTSTRAP_ACTION: `inherent keys create|revoke` reach this container ---
+
+
+@pytest.mark.asyncio
+async def test_revoke_marks_exactly_one_key_and_leaves_mongo_alone(monkeypatch) -> None:
+    postgres_calls, mongo_calls, _ = _patch_databases(monkeypatch, rowcount=1)
+    settings = _settings()
+    settings.bootstrap_action = "revoke"
+    settings.bootstrap_key_prefix = "ink_abc12345"
+
+    await bootstrap.run_bootstrap(settings)
+
+    assert len(postgres_calls) == 1
+    sql, params = postgres_calls[0]
+    assert "status = 'revoked'" in sql
+    assert params == ("ink_abc12345",)
+    assert mongo_calls == []
+
+
+@pytest.mark.asyncio
+async def test_revoke_of_an_unknown_prefix_fails(monkeypatch) -> None:
+    """Exit non-zero, or the CLI reports a revocation that never happened."""
+    _patch_databases(monkeypatch, rowcount=0)
+    settings = _settings()
+    settings.bootstrap_action = "revoke"
+    settings.bootstrap_key_prefix = "ink_missing00"
+
+    with pytest.raises(ValueError, match="No active API key"):
+        await bootstrap.run_bootstrap(settings)
+
+
+@pytest.mark.asyncio
+async def test_revoke_refuses_an_ambiguous_prefix(monkeypatch) -> None:
+    _patch_databases(monkeypatch, rowcount=2)
+    settings = _settings()
+    settings.bootstrap_action = "revoke"
+    settings.bootstrap_key_prefix = "ink_shared000"
+
+    with pytest.raises(ValueError, match="refusing to revoke"):
+        await bootstrap.run_bootstrap(settings)
+
+
+@pytest.mark.asyncio
+async def test_revoke_requires_an_ink_prefix_before_touching_postgres(monkeypatch) -> None:
+    postgres_calls, _, _ = _patch_databases(monkeypatch)
+    settings = _settings()
+    settings.bootstrap_action = "revoke"
+    settings.bootstrap_key_prefix = "abc"
+
+    with pytest.raises(ValueError, match="BOOTSTRAP_KEY_PREFIX"):
+        await bootstrap.run_bootstrap(settings)
+    assert postgres_calls == []
+
+
+@pytest.mark.asyncio
+async def test_create_adds_a_key_without_renaming_the_workspace(monkeypatch) -> None:
+    """`keys create` must not reset a workspace the operator renamed."""
+    postgres_calls, mongo_calls, _ = _patch_databases(monkeypatch)
+    settings = _settings(api_key="ink_second_key")
+    settings.bootstrap_action = "create"
+
+    await bootstrap.run_bootstrap(settings)
+
+    assert len(postgres_calls) == 1
+    assert "INSERT INTO api_keys" in postgres_calls[0][0]
+    assert mongo_calls == []
+
+
+@pytest.mark.asyncio
+async def test_unknown_action_fails_before_any_database_access(monkeypatch) -> None:
+    postgres_calls, mongo_calls, _ = _patch_databases(monkeypatch)
+    settings = _settings()
+    settings.bootstrap_action = "delete-everything"
+
+    with pytest.raises(ValueError, match="BOOTSTRAP_ACTION"):
+        await bootstrap.run_bootstrap(settings)
+    assert postgres_calls == [] and mongo_calls == []

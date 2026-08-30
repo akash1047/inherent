@@ -60,8 +60,14 @@ async def test_rest_and_mcp_whoami_use_identical_fields():
     from src.api.v1.whoami import build_whoami
 
     rest = await build_whoami(key_info, database, endpoint)
-    with patch.object(mcp_server, "get_database", AsyncMock(return_value=database)):
-        content = await mcp_server._TOOLS["whoami"].handler(key_info, {"_endpoint": endpoint})
+    # The HTTP transport publishes the caller's URL here; the tool takes no
+    # endpoint argument, so this ContextVar is the only way in.
+    token = mcp_server.current_mcp_endpoint.set(endpoint)
+    try:
+        with patch.object(mcp_server, "get_database", AsyncMock(return_value=database)):
+            content = await mcp_server._TOOLS["whoami"].handler(key_info, {})
+    finally:
+        mcp_server.current_mcp_endpoint.reset(token)
     mcp = json.loads(content[0].text.split("```json", 1)[1].rsplit("```", 1)[0])["structured"]
     assert mcp == rest.model_dump(mode="json")
 

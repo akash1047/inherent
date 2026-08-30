@@ -47,7 +47,7 @@ from mcp.types import CallToolResult, TextContent, Tool
 from starlette.requests import Request
 from starlette.types import Receive, Scope, Send
 
-from src.mcp_server.server import _TOOLS, ToolDef
+from src.mcp_server.server import _TOOLS, ToolDef, current_mcp_endpoint
 from src.models.api_key import APIKeyInfo
 from src.services.auth import get_api_key_info
 from src.utils import get_logger
@@ -66,7 +66,6 @@ logger = get_logger(__name__)
 # ``src/middleware/request_context.py`` already uses for request-scoped state
 # across this app's own middleware stack.
 _current_key_info: ContextVar[APIKeyInfo | None] = ContextVar("mcp_http_key_info", default=None)
-_current_endpoint: ContextVar[str | None] = ContextVar("mcp_http_endpoint", default=None)
 
 # Branchable failure classes surfaced in ``CallToolResult.structuredContent``
 # (#216: "errors must set isError=True with a branchable failure class").
@@ -232,11 +231,7 @@ def create_http_mcp_server() -> Server:
             )
 
         try:
-            handler_arguments = arguments
-            if name == "whoami" and (endpoint := _current_endpoint.get()):
-                handler_arguments = dict(arguments)
-                handler_arguments["_endpoint"] = endpoint
-            content = await tool.handler(key_info, handler_arguments)
+            content = await tool.handler(key_info, arguments)
         except Exception as exc:  # noqa: BLE001 - must not crash the transport
             logger.error("MCP HTTP tool error", tool=name, error=str(exc))
             return _error_result(f"Error: {exc}", FAILURE_CLASS_INTERNAL)
@@ -345,11 +340,11 @@ def mount_mcp_http(app: FastAPI) -> StreamableHTTPSessionManager:
         )
 
         token = _current_key_info.set(key_info)
-        endpoint_token = _current_endpoint.set(str(request.base_url).rstrip("/"))
+        endpoint_token = current_mcp_endpoint.set(str(request.base_url).rstrip("/"))
         try:
             await session_manager.handle_request(scope, receive, send)
         finally:
-            _current_endpoint.reset(endpoint_token)
+            current_mcp_endpoint.reset(endpoint_token)
             _current_key_info.reset(token)
 
     # `add_route`, NOT `app.mount("/mcp", mcp_asgi_app)` -- tried and

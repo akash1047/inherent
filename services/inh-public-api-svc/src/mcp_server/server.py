@@ -92,6 +92,7 @@ validate/dedup/store/enqueue pipeline via ``src.services.document_intake``.
 
 import json
 from collections.abc import Awaitable, Callable
+from contextvars import ContextVar
 from dataclasses import dataclass
 
 from inh_contracts.file_types import (
@@ -1169,10 +1170,17 @@ async def _handle_upload_document(key_info: APIKeyInfo, arguments: dict) -> list
     return [TextContent(type="text", text=result.model_dump_json())]
 
 
+# Set by the HTTP transport per request so `whoami` can echo the URL the caller
+# actually reached. A ContextVar, not a tool argument: an argument would have to
+# be smuggled past the tool's own input_schema and would put a tool NAME back
+# into the transport's dispatch, which this registry exists to prevent.
+current_mcp_endpoint: ContextVar[str | None] = ContextVar("mcp_endpoint", default=None)
+
+
 async def _handle_whoami(key_info: APIKeyInfo, arguments: dict) -> list[TextContent]:
     """Return the same safe identity shape as ``GET /v1/whoami``."""
     database = await get_database()
-    endpoint = arguments.get("_endpoint", f"http://localhost:{settings.effective_api_port}")
+    endpoint = current_mcp_endpoint.get() or f"http://localhost:{settings.effective_api_port}"
     identity = await build_whoami(key_info, database, endpoint)
     return _structured("Authenticated identity", identity.model_dump(mode="json"))
 

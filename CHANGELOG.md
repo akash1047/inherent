@@ -68,7 +68,11 @@ All notable changes to Inherent are documented here. The format follows
 - **Installable `inherent` CLI groundwork with shared config, HTTP, and
   agent-safe JSON output contracts (#276).**
 - **Checkout-free release bootstrap service that idempotently seeds one local
-  workspace and API key before the public API starts (#277).**
+  workspace and API key before the public API starts (#277).** `BOOTSTRAP_ACTION`
+  selects `seed` (start-up), `create` (mint an extra key without touching the
+  workspace), or `revoke` (by key prefix; refuses an ambiguous or unmatched
+  prefix rather than reporting a revocation that did not happen) — this is the
+  path `inherent keys create|revoke` uses so the CLI never opens a database.
 - **Authenticated `GET /v1/whoami` and MCP `whoami` identity surfaces using
   the shared workspace-authorization rule (#278).**
 - **Flag-gated, read-only local admin listings for workspaces and API keys,

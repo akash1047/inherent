@@ -204,6 +204,9 @@ class Settings(BaseSettings):
     bootstrap_user_id: str | None = Field(None, alias="BOOTSTRAP_USER_ID")
     bootstrap_key_name: str = Field("Local CLI Key", alias="BOOTSTRAP_KEY_NAME")
     bootstrap_workspace_name: str = Field("Default Workspace", alias="BOOTSTRAP_WORKSPACE_NAME")
+    # `seed` (compose start-up), `create` (mint one more key), `revoke`.
+    bootstrap_action: str = Field("seed", alias="BOOTSTRAP_ACTION")
+    bootstrap_key_prefix: str | None = Field(None, alias="BOOTSTRAP_KEY_PREFIX")
 
     # =========================================================================
     # Standalone API Configuration

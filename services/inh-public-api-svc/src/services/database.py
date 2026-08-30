@@ -331,7 +331,9 @@ class DatabaseService:
             {
                 "workspace_id": str(document["_id"]),
                 "name": document.get("name"),
-                "user_id": str(document["user_id"]),
+                # A doc written by an older seeder may lack user_id; an admin
+                # listing must degrade, not 500, on one malformed row.
+                "user_id": str(document.get("user_id") or ""),
                 "document_count": counts.get(str(document["_id"]), 0),
             }
             for document in documents

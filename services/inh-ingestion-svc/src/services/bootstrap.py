@@ -20,6 +20,11 @@ from src.config.settings import Settings
 logger = structlog.get_logger(__name__)
 
 _PERMISSIONS = ["read", "write", "search"]
+_ACTIONS = ("seed", "create", "revoke")
+_REVOKE_API_KEY = """
+UPDATE api_keys SET status = 'revoked'
+WHERE key_prefix = %s AND status = 'active';
+"""
 _UPSERT_API_KEY = """
 INSERT INTO api_keys
     (key_id, key_hash, key_prefix, user_id, workspace_id, name,
@@ -34,7 +39,35 @@ SET status = 'active',
 
 
 async def run_bootstrap(settings: Settings) -> None:
-    """Idempotently seed one API key and its owned workspace."""
+    """Dispatch one bootstrap action; every action is idempotent or refuses.
+
+    ``seed`` is what compose runs at start-up: one API key and its owned
+    workspace. ``create`` and ``revoke`` back `inherent keys create|revoke`,
+    which reach this container instead of opening a database of their own.
+    """
+    action = (settings.bootstrap_action or "seed").strip().lower()
+    if action not in _ACTIONS:
+        raise ValueError(f"BOOTSTRAP_ACTION must be one of {', '.join(_ACTIONS)}; got {action!r}")
+
+    if action == "revoke":
+        _revoke_key(settings)
+        return
+
+    key_prefix = _write_api_key(settings)
+    if action == "seed":
+        await _upsert_workspace(settings)
+
+    # This reaches CI and user logs: emit only the display-safe prefix.
+    logger.info(
+        "Bootstrap principal ready",
+        action=action,
+        key_prefix=key_prefix,
+        workspace_id=settings.bootstrap_workspace_id,
+    )
+
+
+def _write_api_key(settings: Settings) -> str:
+    """Upsert one api_keys row. Returns the display-safe prefix."""
     api_key = settings.bootstrap_api_key
     workspace_id = settings.bootstrap_workspace_id
     user_id = settings.bootstrap_user_id
@@ -66,16 +99,20 @@ async def run_bootstrap(settings: Settings) -> None:
                     1000,
                 ),
             )
+    return key_prefix
 
+
+async def _upsert_workspace(settings: Settings) -> None:
+    """Create or update the Mongo workspace this key owns."""
     client: AsyncIOMotorClient = AsyncIOMotorClient(settings.mongodb_uri)
     try:
         # Ownership lookup returns str(_id), so the document id is the workspace
         # id itself rather than a separate generated Mongo ObjectId.
         await client[settings.mongodb_db_name].workspaces.update_one(
-            {"_id": workspace_id},
+            {"_id": settings.bootstrap_workspace_id},
             {
                 "$set": {
-                    "user_id": user_id,
+                    "user_id": settings.bootstrap_user_id,
                     "name": settings.bootstrap_workspace_name,
                 }
             },
@@ -84,5 +121,27 @@ async def run_bootstrap(settings: Settings) -> None:
     finally:
         client.close()
 
-    # This reaches CI and user logs: emit only the display-safe prefix.
-    logger.info("Bootstrap principal ready", key_prefix=key_prefix, workspace_id=workspace_id)
+
+def _revoke_key(settings: Settings) -> None:
+    """Revoke exactly one active key by prefix, or fail without changing state.
+
+    A prefix is not unique by construction, so an ambiguous match must abort
+    rather than revoke several keys at once. Raising inside the connection
+    context rolls the UPDATE back.
+    """
+    prefix = (settings.bootstrap_key_prefix or "").strip()
+    if not prefix.startswith("ink_"):
+        raise ValueError("BOOTSTRAP_KEY_PREFIX must be an 'ink_' key prefix")
+
+    with psycopg2.connect(settings.database_url) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(_REVOKE_API_KEY, (prefix,))
+            matched = cursor.rowcount
+            if matched == 0:
+                raise ValueError(f"No active API key with prefix {prefix}")
+            if matched > 1:
+                raise ValueError(
+                    f"{matched} active keys share prefix {prefix}; refusing to revoke them all"
+                )
+
+    logger.info("API key revoked", key_prefix=prefix)
