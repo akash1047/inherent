@@ -75,6 +75,35 @@ services:
     networks:
       - inherent-oss
 
+  # One-shot seed of the default workspace + API key, so a pip-installed CLI
+  # never needs a database connection of its own (#275 decision 4). Same
+  # pattern as postgres-init above: release image, SERVICE_MODE, exit.
+  bootstrap:
+    image: ${INHERENT_REGISTRY:-ghcr.io/inherent-prime}/ingestion-svc:${INHERENT_VERSION:-latest}
+    container_name: inherent-oss-bootstrap
+    depends_on:
+      postgres-init:
+        condition: service_completed_successfully
+      mongodb:
+        condition: service_healthy
+    environment:
+      SERVICE_MODE: bootstrap
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-knowledge_base}
+      MONGODB_URI: mongodb://mongodb:27017
+      MONGODB_DB_NAME: main
+      # Required by shared Settings; bootstrap mode never connects to Weaviate.
+      WEAVIATE_URL: http://weaviate:8080
+      WEAVIATE_API_KEY: ${WEAVIATE_API_KEY:?WEAVIATE_API_KEY must be set}
+      BOOTSTRAP_API_KEY: ${INHERENT_API_KEY:?INHERENT_API_KEY must be set — `inherent up` generates it}
+      BOOTSTRAP_WORKSPACE_ID: ${INHERENT_WORKSPACE_ID:-ws_default}
+      BOOTSTRAP_USER_ID: ${INHERENT_USER_ID:-local-user}
+      BOOTSTRAP_KEY_NAME: ${INHERENT_KEY_NAME:-Local CLI Key}
+      BOOTSTRAP_WORKSPACE_NAME: ${INHERENT_WORKSPACE_NAME:-Default Workspace}
+      LOG_LEVEL: INFO
+    networks:
+      - inherent-oss
+    restart: "no"
+
   weaviate:
     image: semitechnologies/weaviate:1.27.0
     container_name: inherent-oss-weaviate
@@ -334,8 +363,12 @@ services:
       AWS_S3_REGION: ${AWS_REGION:-us-east-1}
       EMBEDDING_SERVICE_URL: http://text-embeddings-inference:80
       EMBEDDING_DIM: 384
+      # Whole-stack listings are safe only on this local single-operator stack.
+      ADMIN_API_ENABLED: "true"
       LOG_LEVEL: INFO
     depends_on:
+      bootstrap:
+        condition: service_completed_successfully
       postgres-init:
         condition: service_completed_successfully
       mongodb:

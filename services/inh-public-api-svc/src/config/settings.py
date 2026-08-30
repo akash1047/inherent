@@ -197,6 +197,11 @@ class Settings(BaseSettings):
         description="Enable HSTS header in production",
     )
     api_key_header_name: str = "X-API-Key"
+    admin_api_enabled: bool = Field(
+        default=False,
+        alias="ADMIN_API_ENABLED",
+        description="Expose read-only whole-stack admin listings for local operators only",
+    )
 
     # RFC 7807 error `type` base URL (#222). The retired `.systems` domain used
     # to be hardcoded straight into src/config/constants.py, so a domain change

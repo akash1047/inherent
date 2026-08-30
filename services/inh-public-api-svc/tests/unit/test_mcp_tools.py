@@ -27,6 +27,8 @@ from src.models.search import SearchResponse, SearchResult
 
 pytestmark = pytest.mark.asyncio
 
+FRESH_INGESTED_AT = _dt.datetime.now(_dt.UTC).isoformat()
+
 
 def _key(*, permissions: list[str], user_id: str = "user-1") -> APIKeyInfo:
     return APIKeyInfo(
@@ -317,7 +319,7 @@ class TestMemoryPrimitives:
             metadata={
                 "source_uri": "s3://bucket/report.pdf",
                 "content_hash": "abc123",
-                "ingested_at": "2026-06-01T00:00:00Z",
+                "ingested_at": FRESH_INGESTED_AT,
             },
         )
         mock_db = AsyncMock()
@@ -333,7 +335,7 @@ class TestMemoryPrimitives:
         assert payload["document_name"] == "report.pdf"
         assert payload["source_uri"] == "s3://bucket/report.pdf"
         assert payload["content_hash"] == "abc123"
-        assert payload["ingested_at"].startswith("2026-06-01")
+        assert payload["ingested_at"] == FRESH_INGESTED_AT
         assert payload["is_stale"] is False
 
     async def test_explain_lineage_blocks_foreign_document(self):

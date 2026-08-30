@@ -65,6 +65,15 @@ All notable changes to Inherent are documented here. The format follows
 
 ### Added
 
+- **Installable `inherent` CLI groundwork with shared config, HTTP, and
+  agent-safe JSON output contracts (#276).**
+- **Checkout-free release bootstrap service that idempotently seeds one local
+  workspace and API key before the public API starts (#277).**
+- **Authenticated `GET /v1/whoami` and MCP `whoami` identity surfaces using
+  the shared workspace-authorization rule (#278).**
+- **Flag-gated, read-only local admin listings for workspaces and API keys,
+  disabled by default for SaaS safety (#279).**
+
 - **Evals: `POST /v1/evals/runs` accepts optional replay scoping, and
   `DELETE /v1/evals/events` an opt-in case purge (#250).** Run-replay was
   unscoped — `start_run` and `execute_run` each independently selected *every*

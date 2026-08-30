@@ -350,6 +350,8 @@ services:
       # exercise the ingestion→search path unthrottled. Rate-limit behavior has
       # its own offline coverage (tests/integration/test_rate_limiting.py).
       RATE_LIMIT_ENABLED: ${RATE_LIMIT_ENABLED:-true}
+      # Whole-stack listings are safe only on this local single-operator stack.
+      ADMIN_API_ENABLED: "true"
       # On by default since 2026-08-06 (#146, see settings.py and
       # docs/advanced-indexes.md) -- this Compose default must track
       # settings.py's default or this env var silently overrides it and

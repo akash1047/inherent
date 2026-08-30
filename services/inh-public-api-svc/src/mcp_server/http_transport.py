@@ -19,7 +19,7 @@ this module declares a tool description, schema, or handler a second time:
   (``_http_tools`` below) -- excluding ``verify_claim`` / ``search_memory`` /
   ``get_citations`` (and, pending a follow-up decision, ``report_feedback``;
   see the comments on those ``ToolDef`` entries in ``server.py`` for why each
-  is excluded). "10, not 13" is therefore DATA on the registry, not a second
+  is excluded). The exposed subset is therefore DATA on the registry, not a second
   hardcoded name list that could drift from it.
 - Every exposed schema is the registry's OWN schema with ``api_key`` stripped
   (``_strip_api_key`` below) -- computed, not hand-duplicated. On HTTP the key
@@ -66,6 +66,7 @@ logger = get_logger(__name__)
 # ``src/middleware/request_context.py`` already uses for request-scoped state
 # across this app's own middleware stack.
 _current_key_info: ContextVar[APIKeyInfo | None] = ContextVar("mcp_http_key_info", default=None)
+_current_endpoint: ContextVar[str | None] = ContextVar("mcp_http_endpoint", default=None)
 
 # Branchable failure classes surfaced in ``CallToolResult.structuredContent``
 # (#216: "errors must set isError=True with a branchable failure class").
@@ -172,7 +173,7 @@ def create_http_mcp_server() -> Server:
 
     A SEPARATE ``mcp.server.Server`` instance from stdio's
     ``server.create_mcp_server`` -- different auth source (header vs. tool
-    argument), different advertised surface (10 vs. 13/14 tools), different
+    argument), different advertised surface, different
     error convention (``isError=True`` + failure class vs. stdio's unchanged
     plain-text errors) -- but built from the EXACT SAME ``_TOOLS`` registry
     via ``_http_tools`` / ``_strip_api_key``. There is no second tool
@@ -231,7 +232,11 @@ def create_http_mcp_server() -> Server:
             )
 
         try:
-            content = await tool.handler(key_info, arguments)
+            handler_arguments = arguments
+            if name == "whoami" and (endpoint := _current_endpoint.get()):
+                handler_arguments = dict(arguments)
+                handler_arguments["_endpoint"] = endpoint
+            content = await tool.handler(key_info, handler_arguments)
         except Exception as exc:  # noqa: BLE001 - must not crash the transport
             logger.error("MCP HTTP tool error", tool=name, error=str(exc))
             return _error_result(f"Error: {exc}", FAILURE_CLASS_INTERNAL)
@@ -340,9 +345,11 @@ def mount_mcp_http(app: FastAPI) -> StreamableHTTPSessionManager:
         )
 
         token = _current_key_info.set(key_info)
+        endpoint_token = _current_endpoint.set(str(request.base_url).rstrip("/"))
         try:
             await session_manager.handle_request(scope, receive, send)
         finally:
+            _current_endpoint.reset(endpoint_token)
             _current_key_info.reset(token)
 
     # `add_route`, NOT `app.mount("/mcp", mcp_asgi_app)` -- tried and

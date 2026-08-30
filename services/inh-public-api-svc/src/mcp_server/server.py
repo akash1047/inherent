@@ -105,7 +105,9 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
 
+from src.api.v1.whoami import build_whoami
 from src.config.constants import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE
+from src.config.settings import settings
 from src.models.api_key import APIKeyInfo
 from src.models.document import (
     DEFAULT_MAX_CHARS,
@@ -1167,6 +1169,14 @@ async def _handle_upload_document(key_info: APIKeyInfo, arguments: dict) -> list
     return [TextContent(type="text", text=result.model_dump_json())]
 
 
+async def _handle_whoami(key_info: APIKeyInfo, arguments: dict) -> list[TextContent]:
+    """Return the same safe identity shape as ``GET /v1/whoami``."""
+    database = await get_database()
+    endpoint = arguments.get("_endpoint", f"http://localhost:{settings.effective_api_port}")
+    identity = await build_whoami(key_info, database, endpoint)
+    return _structured("Authenticated identity", identity.model_dump(mode="json"))
+
+
 # =============================================================================
 # Tool registry — THE single place a tool exists (#100)
 # =============================================================================
@@ -1176,6 +1186,18 @@ async def _handle_upload_document(key_info: APIKeyInfo, arguments: dict) -> list
 # handlers so the entries can reference them directly.
 
 _TOOLS: dict[str, ToolDef] = {
+    "whoami": ToolDef(
+        description="Identify the authenticated key, its binding, and every workspace it is "
+        "authorized to access. Requires 'read' permission.",
+        input_schema={
+            "type": "object",
+            "properties": {"api_key": {"type": "string", "description": "Your Inherent API key"}},
+            "required": ["api_key"],
+        },
+        # ToolDef requires a permission; CLI-created keys always carry read.
+        permission="read",
+        handler=_handle_whoami,
+    ),
     "search_documents": ToolDef(
         description="Search for relevant documents and chunks using semantic, hybrid, or "
         "keyword search. Omit workspace_id to search every workspace your key is authorized "

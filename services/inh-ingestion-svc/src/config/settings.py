@@ -196,6 +196,15 @@ class Settings(BaseSettings):
     mongodb_uri: str = Field(DEFAULT_MONGODB_URI, alias="MONGODB_URI")
     mongodb_db_name: str = Field("main", alias="MONGODB_DB_NAME")
 
+    # One-shot release-stack bootstrap. Required identity values stay optional
+    # in the shared model because worker/migrate modes do not consume them;
+    # bootstrap mode validates them before opening either database.
+    bootstrap_api_key: str | None = Field(None, alias="BOOTSTRAP_API_KEY")
+    bootstrap_workspace_id: str | None = Field(None, alias="BOOTSTRAP_WORKSPACE_ID")
+    bootstrap_user_id: str | None = Field(None, alias="BOOTSTRAP_USER_ID")
+    bootstrap_key_name: str = Field("Local CLI Key", alias="BOOTSTRAP_KEY_NAME")
+    bootstrap_workspace_name: str = Field("Default Workspace", alias="BOOTSTRAP_WORKSPACE_NAME")
+
     # =========================================================================
     # Standalone API Configuration
     # =========================================================================
