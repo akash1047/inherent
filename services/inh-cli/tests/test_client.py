@@ -16,15 +16,43 @@ def test_client_sets_auth_and_workspace_headers() -> None:
     assert client.headers["X-Workspace-Id"] == "ws_test"
 
 
-@pytest.mark.parametrize("status", [401, 403])
-def test_auth_errors_are_actionable(status: int) -> None:
-    transport = httpx.MockTransport(lambda req: httpx.Response(status, request=req))
+def test_unauthenticated_error_is_actionable() -> None:
+    transport = httpx.MockTransport(lambda req: httpx.Response(401, request=req))
 
     with make_client(_resolved(), transport=transport) as client:
         with pytest.raises(ClientError, match="API key") as error:
             request(client, "GET", "/v1/whoami")
 
     assert error.value.exit_code == 1
+
+
+def test_forbidden_keeps_the_servers_reason_instead_of_blaming_the_key() -> None:
+    """A 403 means the key is valid but scoped elsewhere.
+
+    Reporting it as "API key rejected" sent users to rotate a working key when
+    the fix was `--workspace`.
+    """
+
+    def scoped(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            403,
+            json={
+                "title": "Authorization Failed",
+                "detail": (
+                    "API key is scoped to workspace 'ws_a' " "and cannot access workspace 'ws_b'"
+                ),
+            },
+            headers={"content-type": "application/problem+json"},
+            request=req,
+        )
+
+    with make_client(_resolved(), transport=httpx.MockTransport(scoped)) as client:
+        with pytest.raises(ClientError) as error:
+            request(client, "GET", "/v1/documents")
+
+    message = str(error.value)
+    assert "cannot access workspace 'ws_b'" in message
+    assert "API key rejected" not in message
 
 
 def test_connect_error_reports_no_stack() -> None:
@@ -75,3 +103,26 @@ def test_plain_http_error_stays_user_facing() -> None:
     with make_client(_resolved(), transport=transport) as client:
         with pytest.raises(ClientError, match="HTTP 500: Internal Server Error"):
             request(client, "GET", "/health")
+
+
+def test_allow_statuses_returns_404() -> None:
+    transport = httpx.MockTransport(lambda req: httpx.Response(404, request=req))
+
+    with make_client(_resolved(), transport=transport) as client:
+        response = request(client, "GET", "/v1/admin/keys", allow_statuses=(404,))
+
+    assert response.status_code == 404
+
+
+def test_multiple_workspaces_is_translated() -> None:
+    transport = httpx.MockTransport(
+        lambda req: httpx.Response(
+            400,
+            json={"detail": "Multiple workspaces found. Provide X-Workspace-Id header."},
+            request=req,
+        )
+    )
+
+    with make_client(_resolved(), transport=transport) as client:
+        with pytest.raises(ClientError, match="Pass --workspace"):
+            request(client, "GET", "/v1/documents")

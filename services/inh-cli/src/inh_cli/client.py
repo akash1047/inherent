@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Iterable
 
 import click
 import httpx
 
-from inh_cli.config import Resolved
+from inh_cli.config import Resolved, resolve
+
+# Tests assign a MockTransport here so command bodies never construct real clients.
+_transport: httpx.BaseTransport | None = None
 
 
 class ClientError(click.ClickException):
@@ -27,10 +30,40 @@ def make_client(
     headers = {"X-API-Key": resolved.api_key}
     if resolved.workspace_id:
         headers["X-Workspace-Id"] = resolved.workspace_id
-    return httpx.Client(base_url=resolved.url, headers=headers, transport=transport)
+    return httpx.Client(
+        base_url=resolved.url,
+        headers=headers,
+        transport=transport or _transport,
+    )
 
 
-def request(client: httpx.Client, method: str, path: str, **kwargs: Any) -> httpx.Response:
+def _body_text(response: httpx.Response) -> str:
+    content_type = response.headers.get("content-type", "").split(";", 1)[0]
+    if content_type in {"application/problem+json", "application/json"}:
+        try:
+            payload = response.json()
+        except ValueError:
+            return ""
+        if isinstance(payload, dict):
+            detail = payload.get("detail")
+            title = payload.get("title")
+            if isinstance(detail, str) and title:
+                return f"{title}: {detail}"
+            if isinstance(detail, str):
+                return detail
+            if title:
+                return str(title)
+    return ""
+
+
+def request(
+    client: httpx.Client,
+    method: str,
+    path: str,
+    *,
+    allow_statuses: Iterable[int] = (),
+    **kwargs: Any,
+) -> httpx.Response:
     """Make a request and translate transport and HTTP failures once."""
 
     try:
@@ -41,8 +74,19 @@ def request(client: httpx.Client, method: str, path: str, **kwargs: Any) -> http
             exit_code=2,
         ) from error
 
-    if response.status_code in (401, 403):
+    if response.status_code in tuple(allow_statuses):
+        return response
+    # 401 only. A 403 means the key is valid but not authorized for what was
+    # asked -- almost always the wrong workspace -- and the server says so in
+    # problem+json. Collapsing it here told users to rotate a working key.
+    if response.status_code == 401:
         raise ClientError("API key rejected. Check INHERENT_API_KEY or reconnect this CLI.")
+    if response.status_code == 400:
+        text = _body_text(response)
+        if "Multiple workspaces" in text:
+            raise ClientError(
+                "Multiple workspaces. Pass --workspace <id> or set it in ~/.inherent/config.toml."
+            )
     if response.is_error:
         content_type = response.headers.get("content-type", "").split(";", 1)[0]
         if content_type == "application/problem+json":
@@ -55,5 +99,23 @@ def request(client: httpx.Client, method: str, path: str, **kwargs: Any) -> http
             title = problem.get("title", f"HTTP {response.status_code}")
             detail = problem.get("detail")
             raise ClientError(f"{title}: {detail}" if detail else str(title))
+        text = _body_text(response)
+        if text:
+            raise ClientError(text)
         raise ClientError(f"HTTP {response.status_code}: {response.reason_phrase}")
     return response
+
+
+def call(
+    method: str,
+    path: str,
+    *,
+    workspace_id: str | None = None,
+    allow_statuses: Iterable[int] = (),
+    **kwargs: Any,
+) -> httpx.Response:
+    """Resolve config, open a client, and issue one request."""
+
+    resolved = resolve(workspace_id=workspace_id)
+    with make_client(resolved) as client:
+        return request(client, method, path, allow_statuses=allow_statuses, **kwargs)

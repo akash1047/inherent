@@ -25,6 +25,8 @@ from src.models.citation import Citation
 from src.models.document import Document, DocumentChunk
 from src.models.search import SearchResponse, SearchResult
 
+FRESH_INGESTED_AT = _dt.datetime.now(_dt.UTC).isoformat()
+
 pytestmark = pytest.mark.asyncio
 
 FRESH_INGESTED_AT = _dt.datetime.now(_dt.UTC).isoformat()

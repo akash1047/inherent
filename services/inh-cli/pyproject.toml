@@ -41,10 +41,15 @@ inh-contracts = { path = "../inh-contracts" }
 [tool.hatch.build.targets.wheel]
 packages = ["src/inh_cli"]
 
+# The release compose file ships inside the wheel so `pip install inherent`
+# has a topology to start. force-include wins over a stale copy in src/.
+[tool.hatch.build.targets.wheel.force-include]
+"../../docker-compose.release.yml" = "src/inh_cli/data/docker-compose.release.yml"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
-addopts = "-v --tb=short --cov=src --cov-report=term-missing"
+addopts = "-v --tb=short -m 'not compose' --cov=src --cov-report=term-missing"
 markers = [
     "unit: fast isolated unit tests",
     "compose: requires a running docker-compose stack",
@@ -78,7 +83,9 @@ ignore_errors = true
 
 [tool.bandit]
 exclude_dirs = ["tests", "build", "dist"]
-skips = ["B101"]
+# B404/B603/B607: the CLI's job is to invoke `docker compose` by PATH name
+# with a constructed argv (never shell=True).
+skips = ["B101", "B404", "B603", "B607"]
 
 [tool.bandit.assert_used]
 skips = ["*_test.py", "test_*.py"]

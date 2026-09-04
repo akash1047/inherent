@@ -66,6 +66,24 @@ All notable changes to Inherent are documented here. The format follows
   It previously skipped MongoDB entirely, so a key created against a new
   workspace id reported `workspace_ids: []` from `whoami` and failed every
   request with `403`. An existing workspace is never renamed.
+- **A `403` from the API is no longer reported as a rejected key (#281).**
+  The CLI collapsed `401` and `403` into "API key rejected", so a
+  workspace-scope error told users to rotate a working key instead of passing
+  `--workspace`. The server's problem+json detail is now shown as-is.
+- **Table output no longer parses document content as Rich markup (#281).**
+  A search snippet containing `[bold]` or `[/]` had those spans silently
+  deleted, and a malformed tag raised `MarkupError`.
+- **`inherent docs show` prints one field per row (#281).** Eleven columns on
+  a single row elided every value at normal terminal widths.
+- **`inherent status --json` reports a real `engine_version` (#280).** It read
+  `/health`, which carries only `status` and `service`; the version lives on
+  `/health/ready`.
+- **`inherent up` names the engine version when its images are missing
+  (#280).** The default tag is the CLI's own version, so an unpublished
+  engine failed with a raw registry manifest error.
+- **`inherent connect` leaves no backup when nothing changes (#283).** A
+  re-run against the same stack wrote a fresh timestamped backup every time,
+  each holding a plaintext API key.
 - **Dead-letter rows left at `pending` for a document that later succeeded no
   longer read as broken, and can no longer replay a stale payload (#287).**
   #249 made a successful ingestion resolve that document's dead-letter rows,
@@ -105,6 +123,17 @@ All notable changes to Inherent are documented here. The format follows
   the shared workspace-authorization rule (#278).**
 - **Flag-gated, read-only local admin listings for workspaces and API keys,
   disabled by default for SaaS safety (#279).**
+
+- **`inherent up/down/status/logs/doctor` — one-command local stack lifecycle
+  from a pip-installed CLI, with secrets persisted at 0600 and service
+  counts taken from compose rather than hardcoded (#280).**
+- **`inherent docs/chunks/search` REST client commands that work against
+  local and remote stacks via `INHERENT_URL` / `INHERENT_API_KEY` (#281).**
+- **`inherent whoami/workspaces/keys` identity commands, with admin 404
+  fallback only for workspaces list and key writes local-only (#282).**
+- **`inherent connect claude|cursor` MCP config writer that merges into
+  existing agent config, backs up, and verifies `POST /mcp` initialize
+  (#283).**
 
 - **Evals: `POST /v1/evals/runs` accepts optional replay scoping, and
   `DELETE /v1/evals/events` an opt-in case purge (#250).** Run-replay was

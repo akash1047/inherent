@@ -38,14 +38,19 @@ class StackNotConfigured(click.ClickException):  # noqa: N818 - frozen public co
     exit_code = 2
 
 
-def _home() -> Path:
+def home() -> Path:
+    """Directory that holds ``config.toml`` and ``compose.env``.
+
+    ``INHERENT_HOME`` relocates it for tests and non-default installs.
+    """
+
     return Path(os.environ.get("INHERENT_HOME", Path.home() / ".inherent"))
 
 
 def load_config() -> Config | None:
     """Load the user config, returning ``None`` when it does not exist."""
 
-    path = _home() / "config.toml"
+    path = home() / "config.toml"
     if not path.exists():
         return None
     with path.open("rb") as config_file:
@@ -61,7 +66,11 @@ def load_config() -> Config | None:
     )
 
 
-def resolve(url: str | None = None, api_key: str | None = None) -> Resolved:
+def resolve(
+    url: str | None = None,
+    api_key: str | None = None,
+    workspace_id: str | None = None,
+) -> Resolved:
     """Resolve environment values before explicit and persisted fallbacks."""
 
     config = load_config()
@@ -71,20 +80,20 @@ def resolve(url: str | None = None, api_key: str | None = None) -> Resolved:
     )
     if not resolved_url or not resolved_key:
         raise StackNotConfigured(
-            "No stack configured. Run `inherent up` or set INHERENT_URL and INHERENT_API_KEY."
+            "No local stack found. Run `inherent up`, or set INHERENT_URL / INHERENT_API_KEY."
         )
     return Resolved(
         url=resolved_url.rstrip("/"),
         api_key=resolved_key,
-        workspace_id=config.workspace_id if config else None,
+        workspace_id=workspace_id or (config.workspace_id if config else None),
     )
 
 
 def save_config(config: Config) -> None:
     """Atomically persist config with owner-only permissions."""
 
-    home = _home()
-    home.mkdir(mode=0o700, parents=True, exist_ok=True)
+    config_home = home()
+    config_home.mkdir(mode=0o700, parents=True, exist_ok=True)
     lines = [
         "[stack]",
         f"compose_project = {json.dumps(config.compose_project)}",
@@ -102,8 +111,8 @@ def save_config(config: Config) -> None:
     if config.workspace_id is not None:
         lines.append(f"workspace_id = {json.dumps(config.workspace_id)}")
 
-    path = home / "config.toml"
-    descriptor, temporary_name = tempfile.mkstemp(dir=home, text=True)
+    path = config_home / "config.toml"
+    descriptor, temporary_name = tempfile.mkstemp(dir=config_home, text=True)
     temporary = Path(temporary_name)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as config_file:
