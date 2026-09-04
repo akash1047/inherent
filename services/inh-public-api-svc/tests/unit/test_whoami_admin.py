@@ -145,3 +145,38 @@ async def test_admin_key_query_projects_no_secret_columns():
     assert rows == [safe]
     assert "key_hash" not in sql
     assert "OFFSET :offset LIMIT :limit" in sql
+
+
+def test_engine_version_tracks_the_installed_package_not_a_literal():
+    """`whoami` publishes this value, so a hardcoded literal silently drifts.
+
+    The previous default was pinned at "0.2.0" while pyproject.toml said
+    "0.3.0", and every whoami response reported the stale number.
+    """
+    from importlib.metadata import version as package_version
+
+    assert Settings().version == package_version("inh-public-api-svc")
+
+
+@pytest.mark.parametrize("environment", ["production", "staging"])
+def test_openapi_schema_is_not_served_outside_development(environment):
+    """An unauthenticated schema fetch must not list the gated admin routes."""
+    from fastapi.testclient import TestClient
+
+    from src.main import create_app
+
+    with patch("src.main.settings", Settings(environment=environment)):
+        app = create_app()
+
+    assert app.openapi_url is None
+    # No lifespan: this asserts on routing, not on a reachable backend.
+    assert TestClient(app).get("/openapi.json").status_code == 404
+
+
+def test_openapi_schema_is_still_served_in_development():
+    from src.main import create_app
+
+    with patch("src.main.settings", Settings(environment="development")):
+        app = create_app()
+
+    assert app.openapi_url == "/openapi.json"

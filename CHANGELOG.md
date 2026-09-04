@@ -46,6 +46,14 @@ All notable changes to Inherent are documented here. The format follows
 
 ### Fixed
 
+- **`inh-public-api-svc` reports its installed package version instead of a
+  hardcoded `0.2.0` (#278).** The literal had drifted from `pyproject.toml`, so
+  `/health/ready`, the OpenAPI document, and the new `whoami` surfaces all
+  published a stale number.
+- **`BOOTSTRAP_ACTION=create` now ensures the key's workspace exists (#277).**
+  It previously skipped MongoDB entirely, so a key created against a new
+  workspace id reported `workspace_ids: []` from `whoami` and failed every
+  request with `403`. An existing workspace is never renamed.
 - **Dead-letter rows left at `pending` for a document that later succeeded no
   longer read as broken, and can no longer replay a stale payload (#287).**
   #249 made a successful ingestion resolve that document's dead-letter rows,
@@ -63,14 +71,22 @@ All notable changes to Inherent are documented here. The format follows
   reads the same `DEAD_LETTER_UNRESOLVED_STATUSES` constant as the resolve, so
   the two cannot drift apart and silently reopen the replay hole.
 
+### Security
+
+- **The OpenAPI schema is no longer served outside development (#279).**
+  `docs_url` and `redoc_url` were already gated, but the unauthenticated
+  `/openapi.json` still listed every route — including the flag-gated
+  `/v1/admin/*` surface, whose 404-not-403 design exists precisely so its
+  existence is not confirmable.
+
 ### Added
 
 - **Installable `inherent` CLI groundwork with shared config, HTTP, and
   agent-safe JSON output contracts (#276).**
 - **Checkout-free release bootstrap service that idempotently seeds one local
   workspace and API key before the public API starts (#277).** `BOOTSTRAP_ACTION`
-  selects `seed` (start-up), `create` (mint an extra key without touching the
-  workspace), or `revoke` (by key prefix; refuses an ambiguous or unmatched
+  selects `seed` (start-up), `create` (mint an extra key, creating its
+  workspace only if absent and never renaming one), or `revoke` (by key prefix; refuses an ambiguous or unmatched
   prefix rather than reporting a revocation that did not happen) — this is the
   path `inherent keys create|revoke` uses so the CLI never opens a database.
 - **Authenticated `GET /v1/whoami` and MCP `whoami` identity surfaces using

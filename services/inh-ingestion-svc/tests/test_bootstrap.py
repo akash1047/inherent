@@ -284,7 +284,47 @@ async def test_create_adds_a_key_without_renaming_the_workspace(monkeypatch) -> 
 
     assert len(postgres_calls) == 1
     assert "INSERT INTO api_keys" in postgres_calls[0][0]
-    assert mongo_calls == []
+    # One upsert, and it writes only on insert: an existing workspace keeps
+    # whatever name the operator gave it.
+    assert len(mongo_calls) == 1
+    query, update, upsert = mongo_calls[0]
+    assert query == {"_id": "ws_default"}
+    assert upsert is True
+    assert "$set" not in update
+    assert update["$setOnInsert"] == {
+        "user_id": "local-user",
+        "name": "Default Workspace",
+    }
+
+
+@pytest.mark.asyncio
+async def test_create_binds_the_key_to_a_workspace_that_exists(monkeypatch) -> None:
+    """A key bound to a never-created workspace 403s on every request.
+
+    `create` used to skip Mongo entirely, so `inherent keys create --workspace
+    ws_new` returned a key whose `whoami` reported `workspace_id` set but
+    `workspace_ids` empty.
+    """
+    _, mongo_calls, _ = _patch_databases(monkeypatch)
+    settings = _settings(api_key="ink_new_workspace_key")
+    settings.bootstrap_action = "create"
+    settings.bootstrap_workspace_id = "ws_brand_new"
+
+    await bootstrap.run_bootstrap(settings)
+
+    assert [query for query, _, _ in mongo_calls] == [{"_id": "ws_brand_new"}]
+    assert all(upsert for _, _, upsert in mongo_calls)
+
+
+@pytest.mark.asyncio
+async def test_seed_still_keeps_the_workspace_name_current(monkeypatch) -> None:
+    """`seed` owns the workspace, so it writes the name on every run."""
+    _, mongo_calls, _ = _patch_databases(monkeypatch)
+
+    await bootstrap.run_bootstrap(_settings())
+
+    _, update, _ = mongo_calls[0]
+    assert update["$set"] == {"user_id": "local-user", "name": "Default Workspace"}
 
 
 @pytest.mark.asyncio

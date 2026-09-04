@@ -54,8 +54,10 @@ async def run_bootstrap(settings: Settings) -> None:
         return
 
     key_prefix = _write_api_key(settings)
-    if action == "seed":
-        await _upsert_workspace(settings)
+    # Both actions must leave the key's workspace existing in Mongo. `seed`
+    # owns the workspace and keeps its name current; `create` only guarantees
+    # existence, because it must not reset a workspace the operator renamed.
+    await _upsert_workspace(settings, rename=action == "seed")
 
     # This reaches CI and user logs: emit only the display-safe prefix.
     logger.info(
@@ -102,20 +104,28 @@ def _write_api_key(settings: Settings) -> str:
     return key_prefix
 
 
-async def _upsert_workspace(settings: Settings) -> None:
-    """Create or update the Mongo workspace this key owns."""
+async def _upsert_workspace(settings: Settings, *, rename: bool) -> None:
+    """Ensure the Mongo workspace this key is bound to exists.
+
+    Without this, `create` minted a key pointing at a workspace that was never
+    created: `whoami` then reported `workspace_id` set but `workspace_ids`
+    empty, and every request with that key failed authorization with 403.
+
+    ``rename=False`` writes the fields only when the document is inserted, so
+    re-running against an existing workspace cannot overwrite an operator's
+    chosen name.
+    """
+    fields = {
+        "user_id": settings.bootstrap_user_id,
+        "name": settings.bootstrap_workspace_name,
+    }
     client: AsyncIOMotorClient = AsyncIOMotorClient(settings.mongodb_uri)
     try:
         # Ownership lookup returns str(_id), so the document id is the workspace
         # id itself rather than a separate generated Mongo ObjectId.
         await client[settings.mongodb_db_name].workspaces.update_one(
             {"_id": settings.bootstrap_workspace_id},
-            {
-                "$set": {
-                    "user_id": settings.bootstrap_user_id,
-                    "name": settings.bootstrap_workspace_name,
-                }
-            },
+            {"$set": fields} if rename else {"$setOnInsert": fields},
             upsert=True,
         )
     finally:
