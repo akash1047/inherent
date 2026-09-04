@@ -46,6 +46,12 @@ All notable changes to Inherent are documented here. The format follows
 
 ### Fixed
 
+- **`s3rver` is version-pinned and given a start-up budget (#353).** It
+  installs itself from npm on every container start against a `10s x 5 = 50s`
+  healthcheck; a slow registry pushed it past that and `up --wait` tore the
+  whole stack down, failing the required `E2E smoke` gate on unrelated
+  branches. Now pinned to `s3rver@3.7.1` with the same `90s + 12 x 10s`
+  budget `text-embeddings-inference` uses.
 - **`inh-public-api-svc` reports its installed package version instead of a
   hardcoded `0.2.0` (#278).** The literal had drifted from `pyproject.toml`, so
   `/health/ready`, the OpenAPI document, and the new `whoami` surfaces all
