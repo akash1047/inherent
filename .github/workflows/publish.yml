@@ -112,7 +112,10 @@ jobs:
       - name: Install from wheels in a clean venv
         run: |
           python -m venv .wheel-venv
-          .wheel-venv/bin/pip install --find-links dist inherent
+          # Install the downloaded wheel files directly, not "inherent" by
+          # name -- `--find-links` still lets pip resolve the requirement
+          # from PyPI, which would validate the wrong artifact.
+          .wheel-venv/bin/pip install dist/*.whl
           .wheel-venv/bin/inherent --version
           .wheel-venv/bin/python -c "import importlib.resources; assert importlib.resources.files('inh_cli').joinpath('data/docker-compose.release.yml').is_file()"
 

@@ -173,7 +173,10 @@ jobs:
           uv build --directory services/inh-contracts
           uv build --wheel --directory services/inh-cli
           python -m venv .cli-e2e-venv
-          .cli-e2e-venv/bin/pip install --find-links services/inh-contracts/dist --find-links services/inh-cli/dist inherent
+          # Install the exact wheel files built above, not "inherent" by name --
+          # `--find-links` still lets pip resolve the requirement from PyPI (or
+          # a stale local build), which would validate the wrong artifact.
+          .cli-e2e-venv/bin/pip install services/inh-contracts/dist/*.whl services/inh-cli/dist/*.whl
 
       - name: Run the CLI adopter path
         env:
@@ -185,15 +188,21 @@ jobs:
           "$CLI" status --json | python -c 'import json, sys; assert all(item["state"] == "running" or item["state"] == "exited" for item in json.load(sys.stdin)["services"])'
           upload=$("$CLI" docs upload README.md)
           export DOC_ID=${upload##* → }
+          # Poll search, not docs show: "processed" can persist before the
+          # document is actually indexed (see test_ingestion_to_search_roundtrip
+          # in inh-public-api-svc's integration tests, issue #7). Search
+          # returning our document IS the signal the pipeline finished.
+          found=""
           for _ in $(seq 1 "$INTEGRATION_TIMEOUT"); do
-            document=$("$CLI" --json docs show "$DOC_ID")
-            if printf '%s' "$document" | python -c 'import json, sys; raise SystemExit(0 if json.load(sys.stdin).get("status") == "processed" else 1)'; then
+            results=$("$CLI" --json search "inherent")
+            if printf '%s' "$results" | python -c 'import json, os, sys; raise SystemExit(0 if any(row.get("document_id") == os.environ["DOC_ID"] for row in json.load(sys.stdin)["results"]) else 1)'; then
+              found=1
               break
             fi
             sleep 1
           done
+          test -n "$found" || { echo "::error::document $DOC_ID did not become searchable within ${INTEGRATION_TIMEOUT}s"; exit 1; }
           "$CLI" --json docs show "$DOC_ID" | python -c 'import json, sys; assert json.load(sys.stdin)["status"] == "processed"'
-          "$CLI" --json search "inherent" | python -c 'import json, os, sys; assert any(row.get("document_id") == os.environ["DOC_ID"] for row in json.load(sys.stdin)["results"])'
           "$CLI" whoami --json | python -c 'import json, sys; assert json.load(sys.stdin)["workspace_id"]'
           "$CLI" connect claude --print | python -c 'import json, sys; assert json.load(sys.stdin)["mcpServers"]["inherent"]["url"].endswith("/mcp")'
           "$CLI" down --volumes --yes
