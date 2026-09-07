@@ -49,9 +49,14 @@ jobs:
       - name: Verify the CLI tag version
         if: matrix.package == 'inherent'
         working-directory: services/inh-cli
+        # Compare with hyphens/underscores stripped: the release convention
+        # tags prereleases as vX.Y.Z-rcN (see releasing.md), but PEP 440
+        # canonicalizes a pyproject.toml prerelease version to X.Y.ZrcN (no
+        # separator) -- a literal string match would reject a valid RC tag.
         run: |
           version=$(grep -m1 '^version = ' pyproject.toml | cut -d '"' -f 2)
-          test "v$version" = "$GITHUB_REF_NAME"
+          tag="${GITHUB_REF_NAME#v}"
+          test "${version//[-_]/}" = "${tag//[-_]/}"
 
       - name: Build and validate wheel
         working-directory: ${{ matrix.directory }}
@@ -102,6 +107,11 @@ jobs:
     needs: build-cli
     runs-on: ubuntu-latest
     steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
       - name: Download wheels
         uses: actions/download-artifact@v4
         with:
