@@ -1,4 +1,4 @@
-name: Publish images
+name: Publish images and Python packages
 
 # Build and push the two custom Inherent service images to GitHub Container
 # Registry (ghcr.io/<owner>/<service>). The eight upstream OSS images in the
@@ -26,6 +26,96 @@ permissions:
   packages: write
 
 jobs:
+  # The CLI imports shared file-type contracts at runtime. Build both wheels so
+  # a pip-installed CLI never depends on a checkout-only path source.
+  build-cli:
+    name: build ${{ matrix.package }} wheel
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - package: inh-contracts
+            directory: services/inh-contracts
+          - package: inherent
+            directory: services/inh-cli
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Verify the CLI tag version
+        if: matrix.package == 'inherent'
+        working-directory: services/inh-cli
+        run: |
+          version=$(grep -m1 '^version = ' pyproject.toml | cut -d '"' -f 2)
+          test "v$version" = "$GITHUB_REF_NAME"
+
+      - name: Build and validate wheel
+        working-directory: ${{ matrix.directory }}
+        # inherent's force-include pulls docker-compose.release.yml from
+        # outside the package root, which an sdist round-trip can't see —
+        # build the wheel directly for both packages, sdist not needed.
+        run: |
+          uv build --wheel
+          uvx twine check dist/*
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.package }}-dist
+          path: ${{ matrix.directory }}/dist/*
+
+  # OIDC means PyPI verifies this repository and approved workflow identity;
+  # no long-lived upload credential is stored in repository secrets.
+  publish-cli:
+    name: publish ${{ matrix.package }} to PyPI
+    needs: build-cli
+    runs-on: ubuntu-latest
+    environment: pypi-publish
+    permissions:
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        package: [inh-contracts, inherent]
+    steps:
+      - name: Download wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.package }}-dist
+          path: dist
+
+      - name: Publish wheel
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+          repository-url: ${{ contains(github.ref_name, '-') && 'https://test.pypi.org/legacy/' || 'https://upload.pypi.org/legacy/' }}
+          skip-existing: true
+
+  # A release artifact is only useful if its installed console script and its
+  # bundled Compose file work with no checkout on sys.path.
+  wheel-install-check:
+    name: verify inherent wheel install
+    needs: build-cli
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download wheels
+        uses: actions/download-artifact@v4
+        with:
+          pattern: '*-dist'
+          merge-multiple: true
+          path: dist
+
+      - name: Install from wheels in a clean venv
+        run: |
+          python -m venv .wheel-venv
+          .wheel-venv/bin/pip install --find-links dist inherent
+          .wheel-venv/bin/inherent --version
+          .wheel-venv/bin/python -c "import importlib.resources; assert importlib.resources.files('inh_cli').joinpath('data/docker-compose.release.yml').is_file()"
+
   # Stage 1 — build both images (multi-arch) WITHOUT pushing, so reviewers are
   # only asked to approve a release that actually builds. The gha cache is
   # populated here and reused by the publish stage for a fast second build.

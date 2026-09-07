@@ -117,6 +117,8 @@ All notable changes to Inherent are documented here. The format follows
 
 ### Added
 
+- **Release-gated PyPI wheels and CLI adopter-path smoke proof (#284, #285).** `inherent` and its shared contract dependency publish through OIDC approval, while the PR smoke lane installs the wheel into a clean virtual environment and exercises locally built engine images end to end.
+
 - **Azure cloud-native production Terraform target: AKS, HA, DR, one-click
   deploy script, and docs (#338, #320).** `infra/azure/` provisions a full
   production stack on AKS (3 zones, autoscaling node pools), Postgres

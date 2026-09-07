@@ -62,6 +62,19 @@ mapping is in the
 
 ## Publishing Images
 
+## Publishing Python packages
+
+`publish.yml` also builds `inh-contracts` and `inherent`. The CLI wheel pins
+`inh-contracts>=2.2,<3`; publishing both keeps an installed CLI independent of
+the repository checkout.
+
+Configure **Settings → Environments → `pypi-publish` → Required reviewers**.
+Then configure PyPI and TestPyPI Trusted Publishing for this repository and
+workflow. A prerelease tag publishes to TestPyPI; a final tag publishes to
+PyPI. The workflow uses OIDC and stores no package-upload token. It builds a
+clean virtual environment from the two wheels, runs `inherent --version`, and
+checks that the bundled release Compose file is present before approval.
+
 The two custom services are published to the GitHub Container Registry so users
 can run the stack without building:
 

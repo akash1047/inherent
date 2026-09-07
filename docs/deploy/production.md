@@ -14,6 +14,18 @@ future or hosted-only.
 datastore on an internal network (the release stack already binds them to
 loopback).
 
+## CLI clients
+
+Point client-only commands at this deployment without writing local config:
+
+```bash
+export INHERENT_URL=https://memory.example.com
+export INHERENT_API_KEY=ink_<key>
+inherent --json whoami
+```
+
+`inherent up`, key creation, and key revocation manage a local stack only.
+
 ## Pre-flight Checklist
 
 - [ ] Strong secrets set: `POSTGRES_PASSWORD`, `WEAVIATE_API_KEY`, `INGESTION_API_KEY`

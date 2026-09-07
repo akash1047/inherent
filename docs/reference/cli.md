@@ -20,6 +20,10 @@ success, `1` error, `2` stack not running / not configured.
 Global `--workspace` sets `X-Workspace-Id`. `inherent --version` is the CLI
 version. Pin engine images with `inherent up --engine-version X.Y.Z`.
 
+After `up` and during `status`, the CLI compares the engine version to its own:
+major drift warns loudly, minor drift prints a note, patch drift is silent.
+Warnings use stderr, so `--json` remains parseable.
+
 `up` defaults the engine image tag to the CLI's own version, so a CLI
 published ahead of its engine images fails on the image pull. When that
 happens `up` names the version it tried and points at `--engine-version`.
@@ -50,7 +54,9 @@ docker compose -p inherent -f <bundled docker-compose.release.yml> \
 ```
 
 and checks `GET /v1/whoami`. Service counts come from
-`docker compose ps --format json`, not a hardcoded total.
+`docker compose ps --format json`, not a hardcoded total. Use
+`inherent up --registry localhost/inherent --engine-version X.Y.Z` when
+testing locally tagged service images.
 
 ## Documents, chunks, search
 
@@ -59,6 +65,7 @@ These commands work against a remote deployment with only env vars set.
 ```bash
 inherent docs upload ./README.md
 inherent docs list --page 1 --page-size 20
+inherent docs show <doc-id>
 inherent --json docs show <doc-id>
 inherent docs lineage <doc-id>
 inherent docs refresh <doc-id>

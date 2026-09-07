@@ -199,23 +199,24 @@ curl -X POST http://localhost:18002/ingest \
 
 ## Quickstart
 
-From a fresh checkout, one command gets you a working local stack:
+Install the CLI, start a local stack, then print an MCP configuration block:
+
+```bash
+pip install inherent
+inherent up
+inherent connect claude --print
+```
+
+`inherent up` pulls the version-matched engine images, waits for health, and
+stores local credentials in `~/.inherent/`.
+
+### Contributing / from source
+
+From a checkout, `make quickstart` installs development dependencies, builds
+the source Compose stack, and seeds the development fixtures:
 
 ```bash
 make quickstart
-```
-
-This creates `.env`, installs both services, starts the Compose stack and waits
-for it to be healthy, bootstraps a local dev workspace and API key, checks
-readiness, and prints the next steps.
-
-Prefer the individual steps? They are still available:
-
-```bash
-make setup      # create .env + install both services
-make validate   # validate local env settings
-make dev        # start the stack and bootstrap the dev workspace/key
-make health     # check API health endpoints
 ```
 
 `make bootstrap` (run by `quickstart` and `dev`) is **local/dev only**. It

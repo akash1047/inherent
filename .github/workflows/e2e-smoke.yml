@@ -158,6 +158,54 @@ jobs:
           fi
           exit "$status"
 
+      # Jobs cannot share a Docker daemon, so run the wheel path in this job
+      # after the service smoke selection. Stop that source-compose stack first
+      # so `inherent up` owns the fixed release ports it is meant to prove.
+      - name: Build local images for the CLI wheel
+        run: |
+          CLI_VERSION=$(awk -F'"' '/^version = / { print $2; exit }' services/inh-cli/pyproject.toml)
+          docker build -f services/inh-ingestion-svc/Dockerfile -t localhost/inherent/ingestion-svc:"$CLI_VERSION" .
+          docker build -f services/inh-public-api-svc/Dockerfile -t localhost/inherent/public-api-svc:"$CLI_VERSION" .
+          docker compose down -v
+
+      - name: Install the CLI wheel in a clean venv
+        run: |
+          uv build --directory services/inh-contracts
+          uv build --wheel --directory services/inh-cli
+          python -m venv .cli-e2e-venv
+          .cli-e2e-venv/bin/pip install --find-links services/inh-contracts/dist --find-links services/inh-cli/dist inherent
+
+      - name: Run the CLI adopter path
+        env:
+          INHERENT_HOME: ${{ runner.temp }}/inherent-cli
+        run: |
+          CLI=.cli-e2e-venv/bin/inherent
+          CLI_VERSION=$("$CLI" --version)
+          "$CLI" up --engine-version "$CLI_VERSION" --registry localhost/inherent
+          "$CLI" status --json | python -c 'import json, sys; assert all(item["state"] == "running" or item["state"] == "exited" for item in json.load(sys.stdin)["services"])'
+          upload=$("$CLI" docs upload README.md)
+          export DOC_ID=${upload##* → }
+          for _ in $(seq 1 "$INTEGRATION_TIMEOUT"); do
+            document=$("$CLI" --json docs show "$DOC_ID")
+            if printf '%s' "$document" | python -c 'import json, sys; raise SystemExit(0 if json.load(sys.stdin).get("status") == "processed" else 1)'; then
+              break
+            fi
+            sleep 1
+          done
+          "$CLI" --json docs show "$DOC_ID" | python -c 'import json, sys; assert json.load(sys.stdin)["status"] == "processed"'
+          "$CLI" --json search "inherent" | python -c 'import json, os, sys; assert any(row.get("document_id") == os.environ["DOC_ID"] for row in json.load(sys.stdin)["results"])'
+          "$CLI" whoami --json | python -c 'import json, sys; assert json.load(sys.stdin)["workspace_id"]'
+          "$CLI" connect claude --print | python -c 'import json, sys; assert json.load(sys.stdin)["mcpServers"]["inherent"]["url"].endswith("/mcp")'
+          "$CLI" down --volumes --yes
+
+      - name: Dump CLI configuration on failure
+        if: failure()
+        env:
+          INHERENT_HOME: ${{ runner.temp }}/inherent-cli
+        run: |
+          sed -E 's/(key = ).*/\1"<redacted>"/' "$INHERENT_HOME/config.toml" || true
+          cut -d= -f1 "$INHERENT_HOME/compose.env" || true
+
       - name: Dump document state on failure
         if: failure()
         # A smoke failure reads as "document <id> not processed within Ns"

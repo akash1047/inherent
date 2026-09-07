@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sys
 from typing import Annotated, Any
 from urllib.parse import urlparse
@@ -29,6 +30,32 @@ from inh_cli.secrets import load_or_create_compose_env
 LOCAL_API_URL = "http://localhost:18000"
 INGESTION_HEALTH_URL = "http://localhost:18002/health"
 DOCKER_INSTALL_URL = "https://docs.docker.com/get-docker/"
+_SEMVER = re.compile(r"^(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$")
+
+
+def version_drift_message(cli_version: str, engine_version: object) -> str | None:
+    """Return the compatible-version notice, or nothing for patch/unknown versions."""
+
+    match = _SEMVER.fullmatch(str(engine_version))
+    cli_match = _SEMVER.fullmatch(cli_version)
+    if not match or not cli_match:
+        return None
+    cli_major, cli_minor, _ = map(int, cli_match.groups())
+    engine_major, engine_minor, _ = map(int, match.groups())
+    if cli_major != engine_major:
+        return (
+            f"Warning: CLI {cli_version} and engine {engine_version} have different major versions. "
+            "Use `inherent up --engine-version <version>` to select an engine image."
+        )
+    if cli_minor != engine_minor:
+        return f"Note: CLI {cli_version} and engine {engine_version} differ."
+    return None
+
+
+def _warn_version_drift(engine_version: object) -> None:
+    message = version_drift_message(__version__, engine_version)
+    if message:
+        sys.stderr.write(message + "\n")
 
 
 def _json_mode(ctx: typer.Context, json_flag: bool) -> bool:
@@ -157,7 +184,8 @@ def up(
     workspace_id = values["INHERENT_WORKSPACE_ID"]
     resolved = Resolved(url=LOCAL_API_URL, api_key=api_key, workspace_id=workspace_id)
     with make_client(resolved) as client:
-        request(client, "GET", "/v1/whoami")
+        identity = request(client, "GET", "/v1/whoami").json()
+    _warn_version_drift(identity.get("engine_version"))
 
     first_run = load_config() is None
     save_config(
@@ -247,6 +275,8 @@ def status(
     # /health/ready is the one carrying `version` and per-component `checks`,
     # so reading `version` off /health left status --json permanently null.
     _, health = _health_payload("/health/ready")
+    if health:
+        _warn_version_drift(health.get("version"))
     merged = []
     for row in rows:
         service = row.get("Service") or row.get("Name") or ""
