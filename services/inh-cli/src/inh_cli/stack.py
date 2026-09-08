@@ -56,6 +56,13 @@ def _warn_version_drift(engine_version: object) -> None:
         sys.stderr.write(message + "\n")
 
 
+def _major_version_conflict(cli_version: str, engine_version: str) -> bool:
+    try:
+        return Version(cli_version).major != Version(engine_version).major
+    except InvalidVersion:
+        return False
+
+
 def _json_mode(ctx: typer.Context, json_flag: bool) -> bool:
     return json_flag or bool(ctx.obj and ctx.obj.get("json"))
 
@@ -159,12 +166,24 @@ def up(
         str | None,
         typer.Option("--registry", help="Override INHERENT_REGISTRY."),
     ] = None,
+    force: Annotated[
+        bool,
+        typer.Option(
+            "--force", help="Start anyway when --engine-version has a different major version."
+        ),
+    ] = False,
 ) -> None:
     """Pull images, start the stack, seed a workspace, and save config."""
 
     preflight_docker()
     env_path, values = load_or_create_compose_env()
     version = (engine_version or __version__).lstrip("v")
+    if engine_version is not None and not force and _major_version_conflict(__version__, version):
+        raise ClientError(
+            f"CLI {__version__} and engine {version} have different major versions. "
+            "Pass --force to start it anyway.",
+            exit_code=2,
+        )
     child_env = {"INHERENT_VERSION": version}
     if registry:
         child_env["INHERENT_REGISTRY"] = registry

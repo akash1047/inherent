@@ -20,9 +20,12 @@ success, `1` error, `2` stack not running / not configured.
 Global `--workspace` sets `X-Workspace-Id`. `inherent --version` is the CLI
 version. Pin engine images with `inherent up --engine-version X.Y.Z`.
 
-After `up` and during `status`, the CLI compares the engine version to its own:
-major drift warns loudly, minor drift prints a note, patch drift is silent.
-Warnings use stderr, so `--json` remains parseable.
+Passing `--engine-version` with a different major version than the CLI
+refuses to start; pass `--force` to start it anyway. After `up` and during
+`status`, the CLI compares the running engine version to its own: leftover
+major drift (e.g. an already-running stack) warns loudly, minor drift prints
+a note, patch drift is silent. Warnings use stderr, so `--json` remains
+parseable.
 
 `up` defaults the engine image tag to the CLI's own version, so a CLI
 published ahead of its engine images fails on the image pull. When that

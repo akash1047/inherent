@@ -44,7 +44,7 @@ VPC or run it locally with one command.
 
 ## Quickstart
 
-Prerequisites: Docker.
+Prerequisites: Docker, Python 3.11+.
 
 ```bash
 pip install inherent

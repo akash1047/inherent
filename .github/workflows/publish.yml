@@ -83,10 +83,15 @@ jobs:
         if: matrix.package != 'inherent' || needs.check-cli-version.outputs.matches == 'true'
         working-directory: ${{ matrix.directory }}
         # inherent's force-include pulls docker-compose.release.yml from
-        # outside the package root, which an sdist round-trip can't see —
-        # build the wheel directly for both packages, sdist not needed.
+        # outside the package root, which an sdist round-trip can't see, so
+        # only the CLI is built wheel-only; inh-contracts gets its normal
+        # sdist + wheel pair.
         run: |
-          uv build --wheel
+          if [ "${{ matrix.package }}" = "inherent" ]; then
+            uv build --wheel
+          else
+            uv build
+          fi
           uvx twine check dist/*
 
       - name: Upload wheel
