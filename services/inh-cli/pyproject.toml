@@ -10,6 +10,7 @@ dependencies = [
     "click>=8.1",
     "rich>=13.9",
     "httpx>=0.27.2",
+    "packaging>=24",
 ]
 
 [project.scripts]
