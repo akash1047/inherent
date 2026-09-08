@@ -162,8 +162,13 @@ jobs:
       # after the service smoke selection. Stop that source-compose stack first
       # so `inherent up` owns the fixed release ports it is meant to prove.
       - name: Build local images for the CLI wheel
+        # Computed once here and exported for the adopter-path step below --
+        # both need the *same* value to tag/request the same images, and
+        # computing it twice by different methods (awk here, `inherent
+        # --version` there) risks the two silently diverging.
         run: |
           CLI_VERSION=$(awk -F'"' '/^version = / { print $2; exit }' services/inh-cli/pyproject.toml)
+          echo "CLI_VERSION=$CLI_VERSION" >> "$GITHUB_ENV"
           docker build -f services/inh-ingestion-svc/Dockerfile -t localhost/inherent/ingestion-svc:"$CLI_VERSION" .
           docker build -f services/inh-public-api-svc/Dockerfile -t localhost/inherent/public-api-svc:"$CLI_VERSION" .
           docker compose down -v
@@ -183,7 +188,6 @@ jobs:
           INHERENT_HOME: ${{ runner.temp }}/inherent-cli
         run: |
           CLI=.cli-e2e-venv/bin/inherent
-          CLI_VERSION=$("$CLI" --version)
           "$CLI" up --engine-version "$CLI_VERSION" --registry localhost/inherent
           "$CLI" status --json | python -c 'import json, sys; assert all(item["state"] == "running" or item["state"] == "exited" for item in json.load(sys.stdin)["services"])'
           upload=$("$CLI" docs upload README.md)
@@ -194,7 +198,11 @@ jobs:
           # returning our document IS the signal the pipeline finished.
           found=""
           for _ in $(seq 1 "$INTEGRATION_TIMEOUT"); do
-            results=$("$CLI" --json search "inherent")
+            # `run:` steps use `bash -eo pipefail`; without the `|| true` a
+            # single transient non-zero exit here (search still indexing,
+            # a dropped connection) would abort the whole step instead of
+            # being retried by this loop.
+            results=$("$CLI" --json search "inherent") || true
             if printf '%s' "$results" | python -c 'import json, os, sys; raise SystemExit(0 if any(row.get("document_id") == os.environ["DOC_ID"] for row in json.load(sys.stdin)["results"]) else 1)'; then
               found=1
               break
