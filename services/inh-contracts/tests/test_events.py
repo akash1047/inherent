@@ -30,6 +30,10 @@ CANONICAL_UPLOAD_KEYS_V1 = {
     "source",
     "connection_id",
     "sync_id",
+    # Source link (inherent#391) — additive, optional, backward compatible.
+    "source_url",
+    # Uploader attribution (prime#331) — additive, optional, backward compatible.
+    "uploaded_by",
 }
 
 
@@ -52,6 +56,8 @@ def _canonical_upload_event() -> dict:
         "source": "connector:notion",
         "connection_id": "conn_123",
         "sync_id": "sync_456",
+        "source_url": "https://notion.so/workspace/doc-abc123",
+        "uploaded_by": "507f1f77bcf86cd799439099",
     }
 
 
@@ -143,6 +149,32 @@ def test_oversized_source_fields_are_rejected(field: str) -> None:
         DocumentUploadMessage(**event)
 
 
+def test_upload_event_without_source_url_defaults_to_none() -> None:
+    """Messages produced before inherent#391 (and manual uploads with no
+    connector-supplied link) have no source_url at all — must still validate."""
+    event = _canonical_upload_event()
+    del event["source_url"]
+    msg = DocumentUploadMessage(**event)
+    assert msg.source_url is None
+
+
+def test_upload_event_valid_source_url_kept() -> None:
+    event = _canonical_upload_event()
+    event["source_url"] = "https://drive.google.com/file/d/abc123/view"
+    msg = DocumentUploadMessage(**event)
+    assert msg.source_url == "https://drive.google.com/file/d/abc123/view"
+
+
+def test_upload_event_unsafe_source_url_degrades_to_none_not_a_rejection() -> None:
+    """Unlike source/connection_id/sync_id (oversized -> hard rejection above),
+    source_url is a citation/display field: a bad value degrades to None so it
+    can never fail an otherwise-valid upload (inherent#391 policy)."""
+    event = _canonical_upload_event()
+    event["source_url"] = "javascript:alert(1)"
+    msg = DocumentUploadMessage(**event)
+    assert msg.source_url is None
+
+
 def test_completion_message_round_trip() -> None:
     msg = DocumentCompletionMessage(
         event_type="document.processed",
@@ -177,6 +209,8 @@ CANONICAL_CONVERSATION_TURN_KEYS_V1 = {
     "client",
     "timestamp",
     "contract_version",
+    # Uploader attribution (prime#331) — additive, optional.
+    "uploaded_by",
 }
 
 
@@ -193,6 +227,7 @@ def _canonical_conversation_turn_event() -> dict:
         "client": "agent-cli",
         "timestamp": "2026-08-31T10:30:05Z",
         "contract_version": CONTRACT_VERSION,
+        "uploaded_by": "507f1f77bcf86cd799439099",
     }
 
 
@@ -260,3 +295,18 @@ def test_conversation_turn_requires_identity_fields(field: str) -> None:
 
     with pytest.raises(ValidationError, match=field):
         ConversationTurnMessage(**event)
+
+
+def test_upload_event_without_uploaded_by_defaults_to_none() -> None:
+    """Messages produced before workspace members existed have no uploaded_by."""
+    event = _canonical_upload_event()
+    del event["uploaded_by"]
+
+    assert DocumentUploadMessage(**event).uploaded_by is None
+
+
+def test_upload_event_unwraps_avro_union_for_uploaded_by() -> None:
+    event = _canonical_upload_event()
+    event["uploaded_by"] = {"string": "user_member"}
+
+    assert DocumentUploadMessage(**event).uploaded_by == "user_member"

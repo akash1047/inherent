@@ -75,6 +75,10 @@ and binds all datastore ports to `127.0.0.1`.
 | `ENABLE_RERANKER` / `ENABLE_GRAPHRAG_INDEX` / `ENABLE_HIERARCHY_INDEX` | `false` | EXPERIMENTAL retrieval scaffolding — off by default, not implemented |
 | `ENABLE_DIVERSIFICATION` | `true` | Round-robin search results across `document_id` before truncating to page size, so one document can't crowd out every other result (#146). Set `false` to restore pre-2026-08-06 ranking. |
 | `DIVERSIFICATION_OVER_FETCH_MULTIPLIER` | `5` | When `ENABLE_DIVERSIFICATION` is on, fetch up to `min(100, limit * this)` candidates to diversify across; ignored when off |
+| `VERTICAL_PACKS_DIR` | unset | Vertical packs (#390): directory of mounted packs. Unset = pack discovery off; `SearchRequest.filters` is always rejected. Also read by `inh-ingestion-svc`. See [Vertical packs](vertical-packs.md) |
+| `WORKSPACE_VERTICAL_PACKS` | unset | Vertical packs (#390 follow-up): hand-onboarded pilot workspace→pack binding, `ws_abc=support,ws_def=handbook`. Unset = no bindings. Malformed value fails the service to start. Also read by `inh-ingestion-svc`, identically parsed. See [Vertical packs](vertical-packs.md) |
+| `WORKSPACE_HYBRID_ALPHA` | unset | Per-workspace hybrid fusion weight (#391): `ws_a=0.3,ws_b=0.5` (each value in `[0.0, 1.0]`). Unset = every workspace keeps the global default (0.7). A request's own `alpha` always overrides this. Malformed value fails the service to start. See [Retrieval evals](retrieval-evals.md#per-workspace-hybrid-alpha) |
+| `WORKSPACE_REUSE_BOOST` | unset | Usage-based ranking boost weight (#394): `ws_a=0.1,ws_b=0.3` (each value in `[0.0, 1.0]`). After fusion, a result's score is multiplied by `min(1.5, 1 + weight * log1p(reuse_count))` — `reuse_count` is how many times `inh-ingestion-svc` has detected this chunk reused in a newer document (see `WORKSPACE_REUSE_DETECTION` below). Unset, or `reuse_count == 0`, leaves the score byte-for-byte unchanged. Malformed value fails the service to start. |
 
 ### Evals
 
@@ -100,6 +104,11 @@ and binds all datastore ports to `127.0.0.1`.
 | `DATABASE_HEALTH_CHECK_TIMEOUT_SECONDS` | `5.0` | Postgres health-check timeout, used by `GET /health/ready` (#203; replaces the dead `HEALTH_CHECK_TIMEOUT_SECONDS`) |
 | `WEAVIATE_HEALTH_CHECK_TIMEOUT_SECONDS` | `5.0` | Weaviate health-check timeout, used by `GET /health/ready` (#203; replaces the dead `HEALTH_CHECK_TIMEOUT_SECONDS`) |
 | `AUDIT_LOG_ENABLED` / `AUDIT_LOG_TOPIC` | `true` / `audit.log.write` | Audit logging + MQ topic |
+| `OAUTH_USER_ID_CLAIM` | unset | Token claim carrying the Inherent user id; resolves an OAuth caller directly (step 1 of the identity link, see `docs/reference/mcp-tools.md`) |
+| `OAUTH_SUBJECT_LOOKUP_COLLECTION` / `OAUTH_SUBJECT_LOOKUP_FIELD` | unset / unset | Mongo collection and field (e.g. `users` / `clerk_id`) matched against the token's `sub` (prime#329). Set together or not at all; simple identifiers only, validated at startup. Both unset = step skipped |
+| `OAUTH_SUBJECT_LOOKUP_ID_FIELD` | `_id` | Field of the matched document holding the Inherent user id (ObjectIds are stringified) |
+| `OAUTH_SUBJECT_LOOKUP_DELETED_FIELD` | `deleted_at` | Soft-delete marker: a non-null value means the user never resolves. Empty string disables the check |
+| `OAUTH_SUBJECT_USERS` | empty | Static `sub=user_id,...` fallback mapping, consulted last |
 
 ## inh-ingestion-svc
 
@@ -112,6 +121,7 @@ and binds all datastore ports to `127.0.0.1`.
 | `WEAVIATE_URL` | **required** | Weaviate URL. Boot fails if unset | no |
 | `WEAVIATE_API_KEY` | unset | Weaviate Bearer key | yes |
 | `MONGODB_URI` / `MONGODB_DB_NAME` | `mongodb://localhost:27017` / `main` | Mongo for audit-log writes | yes / no |
+| `WORKSPACE_OWNER_LOOKUP_ENABLED` | `true` | Store each document under the workspace owner's tenant, looked up from Mongo `workspaces.user_id` (prime#331). Set `false` only for a deployment that runs without Mongo; then the event's `user_id` is the tenant |
 | `LOG_LEVEL` | `INFO` | Logging verbosity | no |
 | `INGESTION_API_KEY` | unset | Auth secret for the standalone HTTP API (release stack requires it) | yes |
 | `API_HOST` / `API_PORT` | `0.0.0.0` / `8000` | Standalone HTTP API bind | no |
@@ -146,6 +156,11 @@ and binds all datastore ports to `127.0.0.1`.
 | --- | --- | --- |
 | `CHUNKING_STRATEGY` | `sentences` | `tokens` / `sentences` / `paragraphs`. **#129:** only consulted for a content type with no registry entry — every currently-registered format resolves a `chunking_hint` instead (see below), so this var no longer governs chunking in practice for any of them. **No per-document override reaches the upload surface yet** (`DocumentIngestionInput.chunking_strategy` exists at the workflow layer, but neither `POST /v1/documents` nor the MCP `upload_document` tool expose it — tracked in [#198](https://github.com/inherent-prime/inherent/issues/198)); there is currently no way to force one strategy uniformly across formats after this change. |
 | `MAX_CHUNK_SIZE` / `CHUNK_OVERLAP` | `1000` / `200` | Chunk sizing |
+| `VERTICAL_PACKS_DIR` | unset | Vertical packs (#390): directory of mounted packs. Unset = pack discovery off, every workspace unchanged. Also read by `inh-public-api-svc`. See [Vertical packs](vertical-packs.md) |
+| `WORKSPACE_VERTICAL_PACKS` | unset | Vertical packs (#390 follow-up): hand-onboarded pilot workspace→pack binding, `ws_abc=support,ws_def=handbook`. Unset = no bindings. Malformed value fails the service to start. Also read by `inh-public-api-svc`, identically parsed. See [Vertical packs](vertical-packs.md) |
+| `WORKSPACE_REUSE_DETECTION` | unset | Usage-based ranking boost (#394): comma-separated list of workspace ids that opt IN to chunk-reuse detection at ingest, `ws_a,ws_b`. Unset = no workspace runs detection (zero extra ingest cost, unchanged). For an opted-in workspace, every new chunk above `REUSE_MIN_CHUNK_CHARS` is compared against its `REUSE_TOP_K` nearest neighbours from OTHER documents in the same tenant; a match ≥ `REUSE_SIMILARITY_THRESHOLD` (confirmed by a text-similarity check ≥ `REUSE_TEXT_SIMILARITY_THRESHOLD`) bumps that older chunk's `reuse_count`. Best-effort — never fails ingestion. Feeds `inh-public-api-svc`'s `WORKSPACE_REUSE_BOOST`. Malformed value fails the service to start. |
+| `REUSE_SIMILARITY_THRESHOLD` / `REUSE_TEXT_SIMILARITY_THRESHOLD` | `0.92` / `0.7` | Reuse detection (#394): cosine similarity floor for a vector candidate / secondary text-similarity confirm ratio (`0.0` disables the text check) |
+| `REUSE_TOP_K` / `REUSE_MIN_CHUNK_CHARS` | `5` / `40` | Reuse detection (#394): nearest-neighbour candidates checked per chunk (cost bound) / minimum chunk length to be considered for reuse at all |
 | `EMBEDDING_ENABLED` | `true` | Toggle embedding generation |
 | `EMBEDDING_PROVIDER` | `tei` | `tei` (default, non-negotiable) or `openai_compatible` — see [Embedding provider](#embedding-provider-model-identity-guard) below |
 | `EMBEDDING_SERVICE_URL` / `EMBEDDING_DIM` | `http://text-embeddings-inference:80` / `384` | Embedding endpoint base URL / vector dimension |

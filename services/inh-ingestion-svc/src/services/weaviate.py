@@ -290,6 +290,11 @@ class WeaviateService:
             # Provenance (#41): auditable evidence trail for returned chunks.
             Property(name="content_hash", data_type=DataType.TEXT),
             Property(name="source_uri", data_type=DataType.TEXT),
+            # Source link (inherent#391): the connector's link back to the
+            # ORIGINAL file in its source system (e.g. a Drive webViewLink).
+            # Distinct from source_uri above, which is THIS engine's own
+            # stored copy. Already sanitized (http/https only) upstream.
+            Property(name="source_url", data_type=DataType.TEXT),
             # Freshness (#42): when the chunk was (re)ingested, so returned
             # evidence can be aged/flagged stale by the public API.
             Property(name="ingested_at", data_type=DataType.DATE),
@@ -315,6 +320,23 @@ class WeaviateService:
             # ("only rows-strategy chunks") is a legitimate, cheap use this
             # field should keep supporting once #196 wires it through.
             Property(name="chunking_strategy", data_type=DataType.TEXT, index_searchable=False),
+            # Pack tags (inherent#390 item 4): "field=value" strings, e.g.
+            # "section_type=pricing" -- lets the public API filter on ANY
+            # pack schema field without a per-pack Weaviate schema change.
+            # Empty list for every workspace with no bound pack (the vast
+            # majority, unchanged) or a chunk the rules tagger left untagged.
+            # `index_searchable=False`: these are exact-match filter tokens,
+            # not prose meant to be keyword/BM25-matched (same reasoning as
+            # chunking_strategy above).
+            Property(name="tags", data_type=DataType.TEXT_ARRAY, index_searchable=False),
+            # Section heading (inherent#390): the chunk's OWN heading line
+            # ("1.1 Access control") from a pack's numbered_sections chunker,
+            # so search results and pack MCP tools can show it. Persisted to
+            # Postgres chunk metadata all along, but search reads Weaviate --
+            # without this property no result could ever carry one. Display
+            # only (the heading text is already inside `content`), hence not
+            # BM25-indexed. Empty string for every chunk with no heading.
+            Property(name="section_heading", data_type=DataType.TEXT, index_searchable=False),
             # Conversation turn attribution (#306): promoted from
             # chunk.metadata by store_chunks_with_tenant below, same
             # promote-from-metadata pattern as content_risk/chunking_strategy
@@ -325,6 +347,18 @@ class WeaviateService:
             Property(name="role", data_type=DataType.TEXT, index_searchable=False),
             Property(name="turn_ts", data_type=DataType.TEXT, index_searchable=False),
             Property(name="client", data_type=DataType.TEXT, index_searchable=False),
+            # Usage-based ranking boost (inherent#394): how many times this
+            # chunk's content has been detected as reused (near-duplicated)
+            # in a NEWER document in this same workspace. Mirrors
+            # document_chunks.reuse_count in Postgres (the source of truth
+            # for the atomic increment, see database.py's
+            # record_chunk_reuse) so the public API's ranking boost
+            # (search.py) can read it without a DB join -- same
+            # store-both-keep-consistent pattern as #390's `tags`. 0 for
+            # every chunk until a later ingest's reuse-detection step
+            # (reuse_detection.py, opt-in per workspace) says otherwise.
+            Property(name="reuse_count", data_type=DataType.INT),
+            Property(name="last_reused_at", data_type=DataType.DATE),
         ]
 
     def _reconcile_collection_properties(self, collection_name: str) -> None:
@@ -611,9 +645,148 @@ class WeaviateService:
             )
             return False
 
+    def workspace_collection_object_count(self, workspace_id: str) -> int:
+        """Residue count for the purge verification report (inherent#395).
+
+        `delete_workspace_collection` removes the WHOLE collection, so the
+        only two states after a purge are "collection gone" (0) or
+        "collection still exists" (residue -- report every object still in
+        it, not just 1, so an operator can see the real remaining size).
+        """
+        if not self.client:
+            raise RuntimeError("Weaviate not connected")
+
+        collection_name = get_workspace_collection_name(workspace_id)
+        try:
+            if not self.client.collections.exists(collection_name):
+                return 0
+            collection = self.client.collections.get(collection_name)
+            agg = collection.aggregate.over_all(total_count=True)
+            return int(agg.total_count or 0)
+        except Exception as e:
+            logger.error(
+                "Failed to count workspace collection residue",
+                collection=collection_name,
+                error=str(e),
+            )
+            # Fail closed: an unknown count must never be reported as the
+            # all-zero "verified" state the receipt treats as proof of purge.
+            return -1
+
     # =========================================================================
     # Multi-Tenant Storage Methods
     # =========================================================================
+
+    @staticmethod
+    def chunk_object_uuid(
+        workspace_id: str, user_id: str, document_id: str, chunk_index: int
+    ) -> uuid.UUID:
+        """Deterministic Weaviate object UUID for one chunk.
+
+        SAME formula as the public API's ``chunk_vector_uuid``
+        (services/inh-public-api-svc/src/services/search.py) -- both MUST
+        agree since they name the same object from two different services.
+        Factored out here (inherent#394) so reuse detection can compute a
+        chunk's own UUID (to look up its near-duplicates via `near_object`)
+        without duplicating the f-string formula a second time in this file.
+        """
+        return uuid.uuid5(
+            uuid.NAMESPACE_DNS, f"{workspace_id}:{user_id}:{document_id}:{chunk_index}"
+        )
+
+    async def find_similar_chunks(
+        self,
+        *,
+        workspace_id: str,
+        user_id: str,
+        chunk_uuid: uuid.UUID,
+        exclude_document_id: str,
+        certainty_threshold: float,
+        top_k: int,
+    ) -> list[dict[str, Any]]:
+        """Near-duplicate lookup for reuse detection (inherent#394).
+
+        Uses Weaviate's ``near_object`` (search by an ALREADY-STORED object's
+        vector) rather than re-embedding the chunk's text -- reuse detection
+        runs right after that object was written, so its vector already
+        exists server-side. ``certainty_threshold`` is passed straight to
+        Weaviate so the similarity filter happens server-side too (never
+        fetch-then-filter). ``limit=top_k`` bounds the cost: each chunk is
+        compared against at most ``top_k`` neighbours, never the whole
+        workspace.
+
+        Scoped to THIS user's tenant within the workspace collection --
+        Weaviate multi-tenancy (#12) isolates tenants, so a single query can
+        only ever search within one. Cross-tenant (cross-user) reuse
+        detection would need to iterate every tenant in the workspace and
+        was judged out of proportion for this first cut; see #394's design
+        notes. ``exclude_document_id`` keeps a chunk from ever matching
+        itself or another chunk of the SAME document/version.
+
+        Best-effort by contract of the caller (``reuse_detection.py``): this
+        method itself lets a Weaviate error propagate so the caller's own
+        try/except can log it -- it does not swallow anything here.
+        """
+        if not self.client:
+            return []
+
+        collection_name = get_workspace_collection_name(workspace_id)
+        tenant_name = get_user_tenant_name(user_id)
+        collection = self.client.collections.get(collection_name)
+        tenant_collection = collection.with_tenant(tenant_name)
+
+        response = tenant_collection.query.near_object(
+            near_object=chunk_uuid,
+            certainty=certainty_threshold,
+            limit=top_k,
+            filters=Filter.by_property("document_id").not_equal(exclude_document_id),
+            return_metadata=MetadataQuery(certainty=True),
+            return_properties=["document_id", "chunk_index", "content"],
+        )
+
+        candidates: list[dict[str, Any]] = []
+        for obj in response.objects:
+            certainty = obj.metadata.certainty if obj.metadata is not None else None
+            candidates.append(
+                {
+                    "uuid": obj.uuid,
+                    "certainty": certainty,
+                    "document_id": obj.properties.get("document_id"),
+                    "chunk_index": obj.properties.get("chunk_index"),
+                    "content": obj.properties.get("content"),
+                }
+            )
+        return candidates
+
+    async def set_chunk_reuse_count(
+        self,
+        *,
+        workspace_id: str,
+        user_id: str,
+        chunk_uuid: uuid.UUID,
+        reuse_count: int,
+        last_reused_at: datetime,
+    ) -> None:
+        """Mirror a reuse-count increment onto the Weaviate object (inherent#394).
+
+        Postgres (``document_chunks.reuse_count``) is the source of truth for
+        the atomic increment (``DatabaseService.record_chunk_reuse``); this
+        just PATCHes the already-computed value onto the mirrored Weaviate
+        property (same store-both-keep-consistent pattern as #390's `tags`)
+        so the public API's ranking boost can read it without a DB join.
+        """
+        if not self.client:
+            return
+
+        collection_name = get_workspace_collection_name(workspace_id)
+        tenant_name = get_user_tenant_name(user_id)
+        collection = self.client.collections.get(collection_name)
+        tenant_collection = collection.with_tenant(tenant_name)
+
+        tenant_collection.data.update(
+            uuid=chunk_uuid,
+            properties={"reuse_count": reuse_count, "last_reused_at": last_reused_at},
+        )
 
     async def store_chunks_with_tenant(
         self,
@@ -624,6 +797,7 @@ class WeaviateService:
         original_filename: str,
         content_type: str,
         source_uri: str | None = None,
+        source_url: str | None = None,
     ) -> int:
         """Store document chunks in a workspace collection with user tenant.
 
@@ -636,6 +810,10 @@ class WeaviateService:
             content_type: MIME type
             source_uri: Provenance (#41) — where the source bytes live
                 (storage_path / storage_url). Optional/backward-compatible.
+            source_url: Source link (inherent#391) — the connector's link
+                back to the ORIGINAL file in its source system (e.g. a
+                Drive webViewLink). Distinct from source_uri above.
+                Optional/backward-compatible.
 
         Returns:
             Number of chunks stored
@@ -714,6 +892,9 @@ class WeaviateService:
                         # Provenance (#41): auditable evidence trail.
                         "content_hash": hashlib.sha256(chunk.content.encode("utf-8")).hexdigest(),
                         "source_uri": source_uri,
+                        # Source link (inherent#391): distinct from source_uri
+                        # above; None when the upload had no connector link.
+                        "source_url": source_url,
                         # Freshness (#42): stamp ingest time so the public API can
                         # age returned evidence. Matches the PG document_chunks
                         # ingested_at; a refresh re-stores chunks with a new value.
@@ -722,6 +903,27 @@ class WeaviateService:
                         "content_risk": content_risk,
                         "content_risk_reasons": content_risk_reasons,
                         "chunking_strategy": chunking_strategy,
+                        # Pack tags (inherent#390 item 4): same promote-from-
+                        # metadata pattern as content_risk above. Empty list
+                        # (not omitted) so the property always reads as a
+                        # real, filterable TEXT_ARRAY.
+                        "tags": list(chunk_meta.get("tags_weaviate") or []),
+                        # Section heading (inherent#390): promoted from the
+                        # chunk metadata store.py already persists; "" (not
+                        # omitted) when the chunker recorded none.
+                        "section_heading": chunk_meta.get("section_heading") or "",
+                        # Usage-based ranking boost (inherent#394): every
+                        # (re)write of this chunk starts unreused. This is
+                        # correct even on reprocessing -- the object was just
+                        # deleted (non-append path, above) or is brand new
+                        # (append path), so there is no PRIOR reuse_count on
+                        # THIS object to preserve; a document that had been
+                        # reused by others accumulates reuse_count again as
+                        # later ingests re-detect it. `last_reused_at` is
+                        # deliberately omitted (stays unset/null) rather than
+                        # explicitly nulled -- reuse_detection.py is the only
+                        # writer that ever sets it.
+                        "reuse_count": 0,
                     }
 
                     # Conversation turn attribution (#306): promote from
@@ -739,9 +941,8 @@ class WeaviateService:
                         properties["client"] = chunk_meta.get("client") or ""
 
                     # Generate deterministic UUID
-                    chunk_uuid = uuid.uuid5(
-                        uuid.NAMESPACE_DNS,
-                        f"{workspace_id}:{user_id}:{document_id}:{chunk.chunk_index}",
+                    chunk_uuid = self.chunk_object_uuid(
+                        workspace_id, user_id, document_id, chunk.chunk_index
                     )
 
                     batch.add_object(
@@ -1088,6 +1289,7 @@ class WeaviateService:
         original_filename: str,
         content_type: str,
         source_uri: str | None = None,
+        source_url: str | None = None,
     ) -> int:
         """Store document chunks - routes to multi-tenant storage.
 
@@ -1101,6 +1303,7 @@ class WeaviateService:
             original_filename=original_filename,
             content_type=content_type,
             source_uri=source_uri,
+            source_url=source_url,
         )
 
     async def delete_document_chunks(self, document_id: str) -> int:

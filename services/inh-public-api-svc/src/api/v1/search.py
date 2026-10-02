@@ -5,7 +5,7 @@ import time
 from collections.abc import Awaitable, Callable
 from typing import Annotated
 
-from fastapi import APIRouter, BackgroundTasks, Depends, Header
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException
 from inh_contracts.embedding.identity import EmbeddingIdentityMismatchError
 
 from src.config import settings
@@ -21,6 +21,7 @@ from src.services.audit_publisher import (
     publish_audit_event,
 )
 from src.services.auth import ResolvedAuth, resolve_workspace_search
+from src.services.data_plane import data_plane_user_id, data_plane_user_ids
 from src.services.database import get_database
 from src.services.eval_capture import (
     capture_enabled,
@@ -28,7 +29,7 @@ from src.services.eval_capture import (
     purge_expired_events,
 )
 from src.services.quality_gate import evaluate as evaluate_quality
-from src.services.search import SearchService, get_search_service
+from src.services.search import SearchService, TagFilterError, get_search_service
 from src.utils import get_logger
 
 router = APIRouter()
@@ -98,8 +99,15 @@ def _schedule_audit(
     response: SearchResponse,
     source: str,
     workspace_id: str,
+    workspace_ids: list[str] | None = None,
 ) -> None:
-    """Build and schedule an audit event for fire-and-forget publishing."""
+    """Build and schedule an audit event for fire-and-forget publishing.
+
+    ``workspace_ids`` (#393) is the full set of workspaces this call actually
+    queried (more than one for a multi-workspace fan-out); it defaults to
+    ``[workspace_id]`` so every existing single-workspace caller gets a
+    correct list with no extra argument.
+    """
     event = build_audit_event(
         workspace_id=workspace_id,
         user_id=auth.key_info.user_id,
@@ -120,6 +128,16 @@ def _schedule_audit(
         alpha=request.alpha,
         # RAG-poisoning visibility (#44): counts of returned chunks by risk level.
         risk_counts=count_results_by_risk(response.results),
+        # Attribution (#393): REST search is always an API-key caller today
+        # (POST /v1/search has no OAuth path -- that is MCP-HTTP-only, see
+        # src/mcp_server/http_transport.py), on the "rest" surface, through
+        # this exact route.
+        principal_type="api_key",
+        principal_id=auth.key_info.key_id,
+        surface="rest",
+        tool_name="search_documents",
+        workspace_ids=workspace_ids if workspace_ids is not None else [workspace_id],
+        outcome="ok",
     )
     # Adaptive retrieval quality gate (#43): record verdict + any fallback so the
     # audit trail shows when retrieval was weak / a fallback ran.
@@ -142,8 +160,10 @@ async def _expand_context_and_total_tokens(
     error is swallowed inside ContextWindowBuilder.expand(); total_tokens is
     still computed from whatever data is available.
 
-    Cross-tenant safety (#41): ``user_id`` is threaded into the context fetch so
-    neighbour chunks are scoped to the requesting user, not just the workspace.
+    Cross-tenant safety (#41): the tenant identity (the workspace owner,
+    resolved from the caller's ``user_id`` by ``data_plane_user_id``) is
+    threaded into the context fetch so neighbour chunks are scoped to the
+    workspace's tenant, not just the workspace.
     """
     if request.include_context and response.results and ctx_workspace_id:
         from src.services.context_window import ContextWindowBuilder
@@ -153,7 +173,7 @@ async def _expand_context_and_total_tokens(
         await builder.expand(
             matches=response.results,
             workspace_id=ctx_workspace_id,
-            user_id=user_id,
+            user_id=await data_plane_user_id(database, ctx_workspace_id, user_id),
             k=request.context_window,
         )
     response.total_tokens = _compute_total_tokens(response.results)
@@ -196,13 +216,16 @@ async def _search_workspaces_concurrently(
     query_vector = await asyncio.to_thread(search_service.embed_query_vector, request)
 
     semaphore = asyncio.Semaphore(settings.search_max_workspace_concurrency)
+    # Each workspace is searched in its OWNER's tenant (prime#331); `user_id`
+    # stays the caller and is only the fallback for legacy workspaces.
+    tenants = await data_plane_user_ids(await get_database(), workspace_ids, user_id)
 
     async def _search_one(ws_id: str) -> list[SearchResult]:
         async with semaphore:
             try:
                 resp = await search_service.search(
                     workspace_id=ws_id,
-                    user_id=user_id,
+                    user_id=tenants[ws_id],
                     request=request,
                     query_vector=query_vector,
                 )
@@ -350,10 +373,32 @@ async def search_documents(
 
     workspace_id = auth.workspace_id
 
+    # Vertical pack tag filters (inherent#390 item 5): validated up front, as
+    # a plain 400, before any workspace/Weaviate work. Multi-workspace search
+    # has no single pack's tag schema to validate against (each workspace may
+    # be bound to a different pack, or none) -- rather than guess which one,
+    # filters are simply not supported there yet.
+    if request.filters and not workspace_id:
+        raise HTTPException(
+            status_code=400,
+            detail="search filters are only supported for a single-workspace search "
+            "(set X-Workspace-Id)",
+        )
+    if request.filters and workspace_id:
+        try:
+            SearchService._validate_tag_filters(workspace_id, request.filters)
+        except TagFilterError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     if workspace_id:
+        # Search in the workspace OWNER's tenant so a member sees the whole
+        # workspace (prime#331). Audit/capture below keep the real caller.
+        tenant_user_id = await data_plane_user_id(
+            await get_database(), workspace_id, auth.key_info.user_id
+        )
         response = await search_service.search(
             workspace_id=workspace_id,
-            user_id=auth.key_info.user_id,
+            user_id=tenant_user_id,
             request=request,
         )
 
@@ -361,7 +406,7 @@ async def search_documents(
         async def _retrieve_single(req: SearchRequest) -> tuple[list[SearchResult], float]:
             resp = await search_service.search(
                 workspace_id=workspace_id,
-                user_id=auth.key_info.user_id,
+                user_id=tenant_user_id,
                 request=req,
             )
             return resp.results, resp.processing_time_ms
@@ -438,6 +483,7 @@ async def search_documents(
             response=response,
             source=source,
             workspace_id="multi",
+            workspace_ids=[],  # #393: no authorised workspace to attribute this to
         )
         return response
 
@@ -488,5 +534,8 @@ async def search_documents(
         response=response,
         source=source,
         workspace_id=user_workspaces[0] if len(user_workspaces) == 1 else "multi",
+        # #393: the FULL authorised set actually fanned out over, not just the
+        # single legacy `workspace_id` label above.
+        workspace_ids=user_workspaces,
     )
     return response

@@ -5,7 +5,9 @@ from typing import Literal
 
 from inh_contracts.defaults import DEFAULT_MONGODB_URI, DEFAULT_S3_BUCKET, DEFAULT_S3_REGION
 from inh_contracts.events import StorageBackend
-from pydantic import Field
+from inh_contracts.workspace_packs import parse_workspace_vertical_packs
+from inh_contracts.workspace_reuse_detection import parse_workspace_reuse_detection
+from pydantic import Field, PrivateAttr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -98,6 +100,99 @@ class Settings(BaseSettings):
     )
     max_chunk_size: int = Field(1000, alias="MAX_CHUNK_SIZE")
     chunk_overlap: int = Field(200, alias="CHUNK_OVERLAP")
+
+    # Vertical packs (inherent#390): directory of mounted packs, one
+    # subdirectory per pack, each with its own vertical.yaml at its root.
+    # Unset (None) by default -- pack discovery is OFF and every workspace
+    # behaves exactly as it did before this feature existed. Set this to opt
+    # a deployment INTO pack support; a given workspace still only uses a
+    # pack when it is explicitly bound to one (ChunkTextInput.vertical_pack).
+    vertical_packs_dir: str | None = Field(None, alias="VERTICAL_PACKS_DIR")
+
+    # Operator-configured workspace -> pack binding for a hand-onboarded
+    # pilot (inherent#390 follow-up): "ws_abc=support,ws_def=handbook". Empty
+    # by default -- no bindings, every workspace unaffected. Parsed once at
+    # startup (see parse_workspace_vertical_packs, below) into
+    # `workspace_vertical_packs`; a malformed value fails the service to
+    # start with a clear error rather than degrading quietly. Kept as a
+    # plain `str` field (not `dict`) so pydantic-settings never tries to
+    # JSON-decode the raw env value itself -- the parsing below is the only
+    # parser that ever runs on it.
+    #
+    # Only application code that starts a workflow (api/app.py, trigger.py)
+    # reads the parsed mapping -- workflow code never touches settings
+    # directly (Temporal determinism, #38); the resolved pack name is
+    # threaded through DocumentIngestionInput.vertical_pack as plain
+    # workflow input instead.
+    workspace_vertical_packs_raw: str = Field("", alias="WORKSPACE_VERTICAL_PACKS")
+    _workspace_vertical_packs: dict[str, str] = PrivateAttr(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _parse_workspace_vertical_packs(self) -> "Settings":
+        """Eagerly parse+validate at construction time (== service startup)
+        so a malformed WORKSPACE_VERTICAL_PACKS raises here, not later when
+        something first looks up a workspace."""
+        self._workspace_vertical_packs = parse_workspace_vertical_packs(
+            self.workspace_vertical_packs_raw
+        )
+        return self
+
+    @property
+    def workspace_vertical_packs(self) -> dict[str, str]:
+        """The parsed {workspace_id: pack_name} mapping (see field above)."""
+        return self._workspace_vertical_packs
+
+    # Chunk reuse detection (inherent#394): usage-based ranking boost feeds on
+    # a ``reuse_count`` this service bumps at ingest time -- see
+    # ``src/services/reuse_detection.py``. That extra work (a near-duplicate
+    # lookup per new chunk) runs ONLY for a workspace listed here; unset
+    # (the default) means no workspace runs detection, so ingestion behaves
+    # exactly as before this feature existed. Same "raise at startup, not
+    # later" contract as WORKSPACE_VERTICAL_PACKS above.
+    workspace_reuse_detection_raw: str = Field("", alias="WORKSPACE_REUSE_DETECTION")
+    _workspace_reuse_detection: set[str] = PrivateAttr(default_factory=set)
+
+    @model_validator(mode="after")
+    def _parse_workspace_reuse_detection(self) -> "Settings":
+        """Eagerly parse+validate at construction time (== service startup)
+        so a malformed WORKSPACE_REUSE_DETECTION raises here, not later when
+        a document is first ingested for that workspace."""
+        self._workspace_reuse_detection = parse_workspace_reuse_detection(
+            self.workspace_reuse_detection_raw
+        )
+        return self
+
+    @property
+    def workspace_reuse_detection(self) -> set[str]:
+        """The parsed {workspace_id, ...} opt-in set (see field above)."""
+        return self._workspace_reuse_detection
+
+    # Reuse-detection tuning (inherent#394): engine-wide knobs, unlike the
+    # per-workspace opt-in/weight above -- these bound the COST of detection
+    # (top-k neighbours per chunk, a similarity floor, skip tiny chunks), not
+    # a per-tenant ranking preference, so one sensible default suffices.
+    #
+    # reuse_similarity_threshold: cosine similarity (converted to Weaviate certainty = (1 + cos) / 2)
+    #   floor for a vector near-duplicate candidate. 0.92 -- chosen high
+    #   enough that two DIFFERENT chunks discussing the same topic (which
+    #   land close in embedding space but are not the same content) rarely
+    #   cross it, while an actual copy/paste or near-verbatim reuse reliably
+    #   does.
+    reuse_similarity_threshold: float = Field(0.92, alias="REUSE_SIMILARITY_THRESHOLD")
+    # reuse_text_similarity_threshold: a cheap secondary confirmation
+    #   (difflib.SequenceMatcher ratio on the raw text) applied only to the
+    #   handful of candidates that already passed the vector threshold --
+    #   guards against the rare vector near-duplicate that reads completely
+    #   differently. 0.0 disables this secondary check entirely.
+    reuse_text_similarity_threshold: float = Field(0.7, alias="REUSE_TEXT_SIMILARITY_THRESHOLD")
+    # reuse_top_k: bounds the cost of detection -- each new chunk is compared
+    #   against at most this many nearest neighbours, never the whole
+    #   workspace.
+    reuse_top_k: int = Field(5, alias="REUSE_TOP_K")
+    # reuse_min_chunk_chars: chunks shorter than this are skipped entirely --
+    #   a two-word chunk hits the similarity threshold against almost
+    #   anything and would flood reuse_count with noise.
+    reuse_min_chunk_chars: int = Field(40, alias="REUSE_MIN_CHUNK_CHARS")
 
     # Embedding Configuration
     # The model itself runs in a separate text-embeddings-inference (TEI) sidecar.
@@ -227,6 +322,11 @@ class Settings(BaseSettings):
     # so the path is not a second source of truth to keep in sync.
     mongodb_uri: str = Field(DEFAULT_MONGODB_URI, alias="MONGODB_URI")
     mongodb_db_name: str = Field("main", alias="MONGODB_DB_NAME")
+    # Team workspaces (prime#331): documents are stored under the workspace
+    # OWNER's tenant, looked up from Mongo `workspaces.user_id` on every
+    # ingest (see src/services/tenant_owner.py). Turn off only for a
+    # deployment that runs without Mongo, where the event's user_id is used.
+    workspace_owner_lookup_enabled: bool = Field(True, alias="WORKSPACE_OWNER_LOOKUP_ENABLED")
 
     # One-shot release-stack bootstrap. Required identity values stay optional
     # in the shared model because worker/migrate modes do not consume them;

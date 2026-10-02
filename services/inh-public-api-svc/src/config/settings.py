@@ -1,12 +1,16 @@
 """Application settings using Pydantic Settings for environment variable management."""
 
+import re
 from functools import lru_cache
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
 from typing import Literal
 
 from inh_contracts.defaults import DEFAULT_MONGODB_URI, DEFAULT_S3_BUCKET, DEFAULT_S3_REGION
-from pydantic import AliasChoices, Field
+from inh_contracts.workspace_hybrid_alpha import parse_workspace_hybrid_alpha
+from inh_contracts.workspace_packs import parse_workspace_vertical_packs
+from inh_contracts.workspace_reuse_boost import parse_workspace_reuse_boost
+from pydantic import AliasChoices, Field, PrivateAttr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from src.config.constants import DEFAULT_DATABASE_NAME, ERROR_BASE_URL
@@ -19,6 +23,65 @@ try:
     SERVICE_VERSION = _pkg_version("inh-public-api-svc")
 except PackageNotFoundError:  # pragma: no cover - only when running uninstalled
     SERVICE_VERSION = "0.0.0+local"
+
+
+# Collection/field names for the OAuth subject lookup are interpolated into a
+# Mongo query as NAMES (not values), so they are restricted to plain
+# identifiers -- no dots (nested paths), no leading "$" (operators).
+_SIMPLE_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+class KVMappingError(ValueError):
+    """A ``key=value,key2=value2`` setting is malformed; the message names
+    the offending entry and why."""
+
+
+def _parse_kv_mapping(raw: str, *, setting_name: str) -> dict[str, str]:
+    """Parse ``"k1=v1,k2=v2"`` into ``{k1: v1, k2: v2}`` (inherent#392
+    follow-up, for ``OAUTH_SUBJECT_USERS``).
+
+    Same rules as ``inh_contracts.workspace_packs.parse_workspace_vertical_packs``
+    (comma-separated, surrounding whitespace trimmed, a blank entry
+    skipped, exactly one ``=`` per entry, no empty key/value, no key bound
+    twice) -- deliberately NOT imported from there: that module is shared
+    with ``inh-ingestion-svc`` specifically because ``WORKSPACE_VERTICAL_PACKS``
+    must parse identically on both services, and its error messages are
+    hardcoded to that one setting's name. ``OAUTH_SUBJECT_USERS`` is a
+    ``inh-public-api-svc``-only setting with no cross-service sharing need,
+    so a tiny local, setting-name-parameterized parser here is simpler than
+    generalizing a shared one for a single caller. ``None``/empty/whitespace
+    -> ``{}`` (the deliberate "unset" case, not an error).
+    """
+    if not raw or not raw.strip():
+        return {}
+
+    mapping: dict[str, str] = {}
+    for raw_entry in raw.split(","):
+        entry = raw_entry.strip()
+        if not entry:
+            continue  # a stray/trailing comma, not a real entry
+
+        if "=" not in entry:
+            raise KVMappingError(
+                f"{setting_name} entry {entry!r} is missing '=' (expected key=value)"
+            )
+        key, _, value = entry.partition("=")
+        key = key.strip()
+        value = value.strip()
+
+        if not key or not value:
+            raise KVMappingError(f"{setting_name} entry {entry!r} has an empty key or value")
+        if "=" in value:
+            raise KVMappingError(
+                f"{setting_name} entry {entry!r} has more than one '=' (values cannot contain '=')"
+            )
+        if key in mapping:
+            raise KVMappingError(
+                f"{setting_name}: key {key!r} is bound twice ({mapping[key]!r} and {value!r})"
+            )
+        mapping[key] = value
+
+    return mapping
 
 
 class Settings(BaseSettings):
@@ -366,6 +429,89 @@ class Settings(BaseSettings):
         ),
     )
 
+    # Vertical packs (inherent#390): mirrors inh-ingestion-svc's own setting
+    # of the same name. A directory of mounted packs, one subdirectory per
+    # pack, each with its own vertical.yaml at its root. Unset (None) by
+    # default -- pack discovery is OFF and every workspace/search behaves
+    # exactly as it did before this feature existed.
+    vertical_packs_dir: str | None = Field(None, alias="VERTICAL_PACKS_DIR")
+
+    # Operator-configured workspace -> pack binding for a hand-onboarded
+    # pilot (inherent#390 follow-up): "ws_abc=support,ws_def=handbook". Empty
+    # by default -- no bindings, every workspace unaffected. Parsed once at
+    # startup (see parse_workspace_vertical_packs, below) into
+    # `workspace_vertical_packs`; a malformed value fails the service to
+    # start with a clear error rather than degrading quietly. Kept as a
+    # plain `str` field (not `dict`) so pydantic-settings never tries to
+    # JSON-decode the raw env value itself.
+    workspace_vertical_packs_raw: str = Field("", alias="WORKSPACE_VERTICAL_PACKS")
+    _workspace_vertical_packs: dict[str, str] = PrivateAttr(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _parse_workspace_vertical_packs(self) -> "Settings":
+        """Eagerly parse+validate at construction time (== service startup)
+        so a malformed WORKSPACE_VERTICAL_PACKS raises here, not later when
+        a search first looks up a workspace's bound pack."""
+        self._workspace_vertical_packs = parse_workspace_vertical_packs(
+            self.workspace_vertical_packs_raw
+        )
+        return self
+
+    @property
+    def workspace_vertical_packs(self) -> dict[str, str]:
+        """The parsed {workspace_id: pack_name} mapping (see field above)."""
+        return self._workspace_vertical_packs
+
+    # Per-workspace hybrid alpha (inherent#391): "ws_a=0.3,ws_b=0.5" -- a
+    # keyword-heavy workspace can favour BM25 without any per-request change.
+    # Same config-based shape as WORKSPACE_VERTICAL_PACKS above (see
+    # inh_contracts.workspace_hybrid_alpha's module docstring for why this,
+    # not a vertical.yaml field, is the simplest fix). Empty by default --
+    # every workspace keeps SearchService.search's global default (0.7)
+    # exactly as before this setting existed. A request's own explicit
+    # ``alpha`` always overrides this mapping.
+    workspace_hybrid_alpha_raw: str = Field("", alias="WORKSPACE_HYBRID_ALPHA")
+    _workspace_hybrid_alpha: dict[str, float] = PrivateAttr(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _parse_workspace_hybrid_alpha(self) -> "Settings":
+        """Eagerly parse+validate at construction time (== service startup)
+        so a malformed WORKSPACE_HYBRID_ALPHA raises here, not later when a
+        hybrid search first looks up a workspace's override."""
+        self._workspace_hybrid_alpha = parse_workspace_hybrid_alpha(self.workspace_hybrid_alpha_raw)
+        return self
+
+    @property
+    def workspace_hybrid_alpha(self) -> dict[str, float]:
+        """The parsed {workspace_id: alpha} mapping (see field above)."""
+        return self._workspace_hybrid_alpha
+
+    # Usage-based ranking boost (inherent#394): "ws_a=0.1,ws_b=0.3" -- a chunk
+    # whose content keeps reappearing in newer documents in the same
+    # workspace (see inh-ingestion-svc's reuse_detection.py, itself opt-in
+    # per workspace via WORKSPACE_REUSE_DETECTION) ranks somewhat higher for
+    # the same query. Same config-based shape as WORKSPACE_HYBRID_ALPHA above
+    # (see inh_contracts.workspace_reuse_boost's module docstring). Empty by
+    # default -- every workspace's ranking stays byte-for-byte identical to
+    # before this feature existed (SearchService._apply_reuse_boost is a
+    # no-op multiply-by-1.0 for a workspace with no entry here). See
+    # inh_contracts.reuse_boost for the bounded boost formula.
+    workspace_reuse_boost_raw: str = Field("", alias="WORKSPACE_REUSE_BOOST")
+    _workspace_reuse_boost: dict[str, float] = PrivateAttr(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _parse_workspace_reuse_boost(self) -> "Settings":
+        """Eagerly parse+validate at construction time (== service startup)
+        so a malformed WORKSPACE_REUSE_BOOST raises here, not later when a
+        search first looks up a workspace's boost weight."""
+        self._workspace_reuse_boost = parse_workspace_reuse_boost(self.workspace_reuse_boost_raw)
+        return self
+
+    @property
+    def workspace_reuse_boost(self) -> dict[str, float]:
+        """The parsed {workspace_id: weight} mapping (see field above)."""
+        return self._workspace_reuse_boost
+
     # Evals v1 — traffic-mined retrieval evals (design spec: evals-v1).
     # Capture is ON by default (opt-out model): every search is recorded to
     # eval_query_events by a fire-and-forget background task. Raw events are
@@ -513,6 +659,114 @@ class Settings(BaseSettings):
         alias="OAUTH_JWKS_CACHE_SECONDS",
         description="How long a fetched JWKS key set is cached before being refetched.",
     )
+
+    # OAuth caller -> Inherent user identity link (inherent#392 follow-up).
+    # #295 shipped OAuth authentication with NO way to actually execute a
+    # tool -- "identity resolution for bearer tokens... needs the identity
+    # link the commercial platform owns, not this repo". That made an OAuth
+    # caller (which is how claude.ai's custom connectors ALWAYS connect)
+    # unable to do anything but list tools, unusable for #392's actual
+    # point. These two settings add a minimal, generic, config-first link in
+    # the engine -- the same shape as WORKSPACE_VERTICAL_PACKS (#390) for a
+    # hand-onboarded pilot -- with a seam for the platform to take over
+    # later with no engine change (see src.services.auth.resolve_oauth_user).
+    # Both default empty/unset -- every OAuth caller resolves to no identity,
+    # byte-for-byte the pre-#392-follow-up behaviour, until an operator
+    # configures one of these.
+    oauth_user_id_claim: str | None = Field(
+        default=None,
+        alias="OAUTH_USER_ID_CLAIM",
+        description=(
+            "Name of a claim on the verified access token that carries this "
+            "resource's OWN Inherent user_id directly (e.g. "
+            "'inherent_user_id'). Checked BEFORE OAUTH_SUBJECT_USERS. This "
+            "is the seam for the platform's authorization server to mint "
+            "tokens carrying the platform's own user id, needing no further "
+            "change here -- unset by default (no such claim assumed)."
+        ),
+    )
+    # Mongo lookup step of the identity link (prime#329): map the token's
+    # `sub` to a user document in the SAME database the workspaces live in.
+    # All three unset = step skipped (claim -> static map, as before).
+    oauth_subject_lookup_collection: str | None = Field(
+        default=None,
+        alias="OAUTH_SUBJECT_LOOKUP_COLLECTION",
+        description="Mongo collection holding the users (e.g. 'users').",
+    )
+    oauth_subject_lookup_field: str | None = Field(
+        default=None,
+        alias="OAUTH_SUBJECT_LOOKUP_FIELD",
+        description=(
+            "Field in that collection equal to the token's `sub` (e.g. "
+            "'clerk_id'). Must be indexed by the collection's owner."
+        ),
+    )
+    oauth_subject_lookup_id_field: str = Field(
+        default="_id",
+        alias="OAUTH_SUBJECT_LOOKUP_ID_FIELD",
+        description="Field holding the Inherent user id (default '_id'; ObjectIds are stringified).",
+    )
+    oauth_subject_lookup_deleted_field: str = Field(
+        default="deleted_at",
+        alias="OAUTH_SUBJECT_LOOKUP_DELETED_FIELD",
+        description=(
+            "Soft-delete marker: a user whose document has a non-null value here "
+            "never resolves. Empty string disables the check."
+        ),
+    )
+    oauth_subject_users_raw: str = Field("", alias="OAUTH_SUBJECT_USERS")
+    _oauth_subject_users: dict[str, str] = PrivateAttr(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _parse_oauth_subject_users(self) -> "Settings":
+        """Eagerly parse+validate at construction time (== service startup)
+        so a malformed OAUTH_SUBJECT_USERS raises here, not later when an
+        OAuth call first tries to resolve its caller's identity."""
+        self._oauth_subject_users = _parse_kv_mapping(
+            self.oauth_subject_users_raw, setting_name="OAUTH_SUBJECT_USERS"
+        )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_oauth_subject_lookup(self) -> "Settings":
+        """Fail at startup on a half-configured or unsafe lookup, not on the
+        first OAuth call."""
+        collection = self.oauth_subject_lookup_collection
+        field = self.oauth_subject_lookup_field
+        if bool(collection) != bool(field):
+            raise ValueError(
+                "OAUTH_SUBJECT_LOOKUP_COLLECTION and OAUTH_SUBJECT_LOOKUP_FIELD "
+                "must be set together"
+            )
+        names = {
+            "OAUTH_SUBJECT_LOOKUP_COLLECTION": collection,
+            "OAUTH_SUBJECT_LOOKUP_FIELD": field,
+            "OAUTH_SUBJECT_LOOKUP_ID_FIELD": self.oauth_subject_lookup_id_field,
+            "OAUTH_SUBJECT_LOOKUP_DELETED_FIELD": self.oauth_subject_lookup_deleted_field,
+        }
+        for setting_name, value in names.items():
+            # None/"" = unset (for the deleted field: check disabled); only the
+            # id field must always be a real name.
+            if value is None or (value == "" and not setting_name.endswith("ID_FIELD")):
+                continue
+            if not _SIMPLE_IDENTIFIER.match(value):
+                raise ValueError(
+                    f"{setting_name} must be a simple identifier "
+                    f"(letters, digits, underscore), got {value!r}"
+                )
+        return self
+
+    @property
+    def oauth_subject_lookup_enabled(self) -> bool:
+        return bool(self.oauth_subject_lookup_collection and self.oauth_subject_lookup_field)
+
+    @property
+    def oauth_subject_users(self) -> dict[str, str]:
+        """The parsed {token `sub` claim: Inherent user_id} mapping -- a
+        static, operator-maintained fallback for a hand-onboarded OAuth
+        pilot with no OAUTH_USER_ID_CLAIM minted yet (see field docstring
+        above)."""
+        return self._oauth_subject_users
 
     @property
     def effective_oauth_jwks_url(self) -> str | None:

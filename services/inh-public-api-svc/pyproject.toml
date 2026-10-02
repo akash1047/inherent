@@ -66,6 +66,9 @@ dev = [
     "mypy==1.19.1",
     "bandit[toml]==1.9.3",
     "types-redis>=4.6.0",
+    # Builds the synthetic .docx fixture for the pilot-flow compose test
+    # (tests/integration/test_compose_pilot_flow.py). Test-only.
+    "python-docx>=1.0.0",
 ]
 
 [build-system]
@@ -100,6 +103,7 @@ markers = [
     "eval_gate: the retrieval baseline hard gate (ranking regression only)",
     "benchmark: latency/throughput benchmarks (loose SLO regression guards)",
     "security: auth/tenancy security regression tests (offline; #32)",
+    "real_data_plane: run the real owner-as-tenant lookup (src/services/data_plane.py) instead of the default caller-is-tenant stub (prime#331)",
     "contract: REST/MCP contract regression (response shapes, permissions, error codes)",
     # The PR-blocking end-to-end subset, run by .github/workflows/e2e-smoke.yml
     # as `-m "smoke and compose"`. Always combined with `compose`, never

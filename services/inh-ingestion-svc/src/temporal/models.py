@@ -33,6 +33,16 @@ class DocumentIngestionInput:
     storage_path: str
     storage_bucket: str | None = None
     storage_url: str | None = None
+    # Who actually uploaded (prime#331). `user_id` above is the data-plane
+    # identity: the workspace OWNER whose tenant holds the vectors. None on
+    # a workflow started before this field existed.
+    uploaded_by: str | None = None
+    # Source link (inherent#391): the connector's link back to the ORIGINAL
+    # file (e.g. a Drive webViewLink) — distinct from storage_url above,
+    # which is THIS engine's own stored copy. Already sanitized by the
+    # caller (trigger.py / app.py) before this input is built, so it is
+    # trusted verbatim everywhere it is threaded from here.
+    source_url: str | None = None
     timestamp: str = ""
 
     # Optional per-document chunking overrides. When None, the workflow
@@ -42,6 +52,15 @@ class DocumentIngestionInput:
     chunking_strategy: Literal["tokens", "sentences", "paragraphs"] | None = None
     max_chunk_size: int | None = None
     chunk_overlap: int | None = None
+
+    # The vertical pack this document's workspace is bound to (inherent#390),
+    # e.g. "handbook". None (the default) is the ONLY value every existing
+    # caller ever passes today -- resolving workspace_id -> pack name is the
+    # upload path's job (out of scope for this issue: workspace records are
+    # owned by a different service, see inherent#390's report), so this
+    # field exists as the wiring point a future change plugs into, without
+    # requiring any change here.
+    vertical_pack: str | None = None
 
 
 @dataclass
@@ -221,6 +240,11 @@ class ChunkData:
     # Defaults to "" so a chunk built without going through the activity
     # (unit tests constructing ChunkData directly) stays valid.
     chunking_strategy: str = ""
+    # This chunk's own section heading line, set only by the numbered_sections
+    # strategy (inherent#390) -- e.g. "1.1 Standard plan". Empty for every
+    # other strategy/every chunk staged before this field existed, so it is
+    # purely additive and never changes existing chunks' shape.
+    section_heading: str = ""
 
 
 @dataclass
@@ -245,6 +269,14 @@ class ChunkTextInput:
     # (or a content type with no registry entry) degrades to the pre-#129
     # global-config dispatch instead of crashing -- see _chunk_text_inner.
     content_type: str | None = None
+    # The vertical pack bound to this document's workspace (inherent#390),
+    # e.g. "handbook" -- a name looked up in VERTICAL_PACKS_DIR. None (the
+    # default) means "no pack bound" -- either pack discovery is off
+    # (VERTICAL_PACKS_DIR unset) or the workspace hasn't opted into one, and
+    # chunking behaves exactly as it did before this field existed. Resolving
+    # workspace_id -> pack name is the CALLER's job (the workflow/upload
+    # path); this activity only ever loads a pack it's explicitly told to.
+    vertical_pack: str | None = None
 
 
 @dataclass
@@ -255,6 +287,34 @@ class ChunkTextOutput:
     """
 
     chunk_count: int = 0
+
+
+@dataclass
+class TagChunksInput:
+    """Input for the tag_chunks activity (inherent#390 item 4).
+
+    Reads chunks from staging (same pattern as ChunkTextInput) and writes
+    them back with a "tags" key added to each chunk dict that got any.
+    """
+
+    workflow_run_id: str
+    document_id: str
+    # The vertical pack bound to this document's workspace. None (the
+    # default) means "no pack" -- tagging is skipped entirely and every
+    # chunk is written back completely unchanged (legacy behaviour exactly).
+    vertical_pack: str | None = None
+    # Trivially-derivable document-level values the rules tagger may use to
+    # fill string/date tag fields (e.g. {"title": "...", "uploaded_at":
+    # "2026-01-01"}) -- NOT free-text for the tagger to interpret; only used
+    # when a tag field's name matches a key here exactly (see RulesTagger).
+    document_metadata: dict[str, str] | None = None
+
+
+@dataclass
+class TagChunksOutput:
+    """Output from tag_chunks. Chunks (with tags) live in staging."""
+
+    tagged_count: int = 0
 
 
 @dataclass
@@ -277,6 +337,14 @@ class StoreDocumentInput:
     text_length: int
     processing_time_ms: int
     tenant_id: int | None = None
+    # The uploader (prime#331), threaded from DocumentIngestionInput so the
+    # processed_documents row keeps who uploaded next to the owner's user_id.
+    uploaded_by: str | None = None
+    # Source link (inherent#391): threaded from DocumentIngestionInput so the
+    # store activities can persist it alongside source_uri (storage_path).
+    # Already sanitized upstream; None for a workflow/caller that never had
+    # one (unchanged default, backward-compatible).
+    source_url: str | None = None
     # --- Conversation ingestion extension (#306) -----------------------------
     # append/document_type/external_id/metadata are additive, defaulted so
     # DocumentIngestionWorkflow (which never sets them) is byte-identical to
@@ -418,6 +486,7 @@ class CreatePendingDocumentInput:
     workflow_start_time: datetime
     storage_bucket: str | None = None
     storage_url: str | None = None
+    uploaded_by: str | None = None  # prime#331: the actual uploader
 
 
 # =============================================================================
@@ -686,3 +755,45 @@ class ChunkConversationOutput:
     """
 
     chunk_count: int = 0
+
+
+# =============================================================================
+# Workspace purge (inherent#395)
+# =============================================================================
+
+
+@dataclass
+class PurgeWorkspaceInput:
+    """Input for `PurgeWorkspaceWorkflow`.
+
+    `retain_audit_logs` defaults to False: the data-deletion commitment this
+    workflow exists for (pilot end, customer deletion request) is described
+    as covering "index and logs", so purging Mongo audit logs is the
+    default, not an opt-in. An operator sets this True only when a
+    retention requirement on the audit trail outlives the workspace itself
+    -- see the workflow's module docstring for that trade-off written out.
+    """
+
+    workspace_id: str
+    operator: str
+    retain_audit_logs: bool = False
+
+
+@dataclass
+class PurgeWorkspaceResult:
+    """Output of `PurgeWorkspaceWorkflow`: the verification report + receipt id.
+
+    `residue` is `{store_name: remaining_count}` after every delete step
+    ran -- all zeros (`verified=True`) is the proof-of-purge this feature
+    exists to produce. A non-zero entry means that store still has rows for
+    this workspace and the operator should re-run the purge (every step is
+    idempotent, so re-running is always safe).
+    """
+
+    workspace_id: str
+    purge_workflow_id: str
+    residue: dict[str, int]
+    verified: bool
+    revoked_api_keys: int
+    cancelled_ingestion_workflows: int
+    audit_logs_purged: bool

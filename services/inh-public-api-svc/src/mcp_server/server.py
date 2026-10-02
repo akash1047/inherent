@@ -111,6 +111,12 @@ from sqlalchemy import text
 from src.api.v1.whoami import build_whoami
 from src.config.constants import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE
 from src.config.settings import settings
+from src.mcp_server.audit import (
+    audit_denied,
+    dispatch_and_audit,
+    record_returned_chunk_ids,
+    record_workspace_ids,
+)
 from src.models.api_key import APIKeyInfo
 from src.models.document import (
     DEFAULT_MAX_CHARS,
@@ -121,8 +127,13 @@ from src.models.document import (
     windowed_document_context,
 )
 from src.models.evals import FeedbackRequest
-from src.services.auth import describe_workspace_denial, get_authorized_workspace_ids
+from src.services.auth import (
+    describe_workspace_denial,
+    get_authorized_workspace_ids,
+    viewer_write_denial,
+)
 from src.services.compensation import mark_document_failed_with_retry
+from src.services.data_plane import data_plane_user_id
 from src.services.database import get_database
 from src.services.document_intake import intake_document
 from src.services.eval_capture import capture_enabled, capture_search_event, purge_expired_events
@@ -131,6 +142,7 @@ from src.services.eval_scorecard import build_scorecard
 from src.services.lineage import build_lineage
 from src.services.search import (
     SearchService,
+    TagFilterError,
     build_search_request,
     get_search_service,
 )
@@ -205,6 +217,16 @@ class ToolDef:
     # this one. stdio (this module) ignores the flag entirely -- every tool
     # stays reachable over stdio regardless of its HTTP exposure.
     http_exposed: bool = True
+    # Whether this tool returns retrieved chunk content, and so must be
+    # attributed in the audit trail (inherent#393). Default False: most
+    # tools (whoami, upload_document, delete_document, ...) never surface
+    # evidence and are audited exactly as before this change -- no event at
+    # all. True for search_documents/search_memory/get_citations/
+    # get_document_context/list_chunks and every vertical-pack profile tool
+    # (``tool_profiles.build_profile_tools``). ``src/mcp_server/audit.py``'s
+    # ``dispatch_and_audit``/``audit_denied`` are the ONE choke point that
+    # reads this flag; nothing else in this module checks it.
+    returns_chunk_content: bool = False
 
 
 # Schema shared by the two search-shaped tools so they stay identical (#14/#40).
@@ -244,6 +266,19 @@ _SEARCH_INPUT_SCHEMA = {
             "type": "number",
             "description": "Hybrid fusion weight in [0,1] (1.0=vector-heavy, 0.0=keyword-heavy); only used when search_mode=hybrid",
             "default": 0.7,
+        },
+        # Vertical pack tag filters (inherent#392) -- same shape REST's
+        # SearchRequest.filters has had since #390: {field: value} or
+        # {field: [values]} (any-of). Only valid for a workspace bound to a
+        # vertical pack; an unbound workspace or an unknown field name gets a
+        # friendly "Error: ..." message (TagFilterError), never a traceback
+        # -- see _run_search's try/except below.
+        "filters": {
+            "type": "object",
+            "description": "Optional: vertical pack tag filters, {field: value} or "
+            "{field: [values]} (any-of). Requires the (single) searched workspace to be "
+            "bound to a vertical pack; an unknown field name is rejected with a message "
+            "naming the pack's actual fields.",
         },
         # include_context / context_window were advertised but never honored by
         # _run_search (a silent no-op). Use the dedicated get_document_context
@@ -338,6 +373,11 @@ def create_mcp_server() -> Server:
             # Permission parity with REST (#14): check BEFORE executing the body
             # so a denied key never reaches the search/db/verify services.
             if not key_info.has_permission(tool.permission):
+                # Attribution (#393): a permission-denied call to a
+                # retrieval-returning tool is still logged, with
+                # outcome="denied" and no returned ids -- see audit.py's
+                # docstring for why this is a no-op for every other tool.
+                audit_denied(tool, name, key_info, arguments, surface="mcp")
                 return [
                     TextContent(
                         type="text",
@@ -345,7 +385,9 @@ def create_mcp_server() -> Server:
                     )
                 ]
 
-            return await tool.handler(key_info, arguments)
+            # Attribution (#393): the ONE choke point for stdio -- see
+            # src/mcp_server/audit.py's module docstring.
+            return await dispatch_and_audit(tool, name, key_info, arguments, surface="mcp")
 
         except Exception as e:
             logger.error("MCP tool error", tool=name, error=str(e))
@@ -365,7 +407,7 @@ def _structured(summary: str, payload: object) -> list[TextContent]:
 
 
 async def _get_workspace_ids(
-    key_info: APIKeyInfo, requested_workspace_id: str | None
+    key_info: APIKeyInfo, requested_workspace_id: str | None, *, permission: str = "read"
 ) -> tuple[list[str], str | None]:
     """
     Determine which workspace IDs to use for a query.
@@ -387,16 +429,28 @@ async def _get_workspace_ids(
     key's own bound workspace costs nothing (it's the caller's own grant) and
     lets the caller retry immediately with the right id.
 
+    ``permission="write"`` (prime#331) applies the workspace role rule: a
+    workspace where the caller is only a viewer is not authorised, and the
+    rejection says so. Write tools pass it; read/search tools keep the default.
+
     Returns:
         tuple of (workspace_ids list, error message or None)
     """
     database = await get_database()
-    authorized = await get_authorized_workspace_ids(key_info, database)
+    authorized = await get_authorized_workspace_ids(key_info, database, permission=permission)
 
     if requested_workspace_id:
         # User specified a workspace - verify it is in the key's authorised set.
         if requested_workspace_id not in authorized:
-            return [], f"Error: {describe_workspace_denial(key_info, requested_workspace_id)}"
+            viewer_detail = (
+                await viewer_write_denial(key_info, requested_workspace_id, database)
+                if permission == "write"
+                else None
+            )
+            return (
+                [],
+                f"Error: {viewer_detail or describe_workspace_denial(key_info, requested_workspace_id)}",
+            )
         return [requested_workspace_id], None
     else:
         # No workspace specified - use every workspace the key is authorised
@@ -465,7 +519,23 @@ async def _run_search(
     event_id: str | None = None
     single_workspace = len(workspace_ids) == 1
     for workspace_id in workspace_ids:
-        response = await search_service.search(workspace_id, key_info.user_id, request)
+        # Friendly errors (inherent#392): TagFilterError (an unbound
+        # workspace, or a filter field the pack's tag schema doesn't
+        # declare) must surface as a normal "Error: ..." tool result, never
+        # an unhandled exception -- the stdio dispatcher's outer try/except
+        # would already turn this into text, but doing it here gives the
+        # SAME message on both transports and lets http_transport.py
+        # classify it as a `tool_error`/`validation_error` instead of the
+        # generic `internal_error` an uncaught exception gets there.
+        try:
+            # Search the workspace OWNER's tenant so a member sees the whole
+            # workspace (prime#331); capture below keeps the real caller.
+            tenant_user_id = await data_plane_user_id(
+                await get_database(), workspace_id, key_info.user_id
+            )
+            response = await search_service.search(workspace_id, tenant_user_id, request)
+        except TagFilterError as exc:
+            return [], workspace_ids, f"Error: {exc}", None
         for result in response.results:
             tagged.append((workspace_id, result))
 
@@ -543,6 +613,13 @@ async def _handle_search(key_info: APIKeyInfo, arguments: dict) -> list[TextCont
     if error:
         return [TextContent(type="text", text=error)]
 
+    # Attribution (#393): report the actually-returned chunk ids and searched
+    # workspaces to the audit choke point (src/mcp_server/audit.py). A no-op
+    # when this handler isn't running inside an audited dispatch (e.g. a unit
+    # test calling it directly).
+    record_returned_chunk_ids([result.chunk_id for _, result in tagged if result.chunk_id])
+    record_workspace_ids(workspace_ids)
+
     query = arguments.get("query", "")
     note = _coverage_note(workspace_ids)
     if not tagged:
@@ -574,6 +651,9 @@ async def _handle_search(key_info: APIKeyInfo, arguments: dict) -> list[TextCont
                 "score_source": result.score_source,
                 "is_stale": result.is_stale,
                 "source_uri": result.source_uri,
+                # Source link (inherent#391): the connector's link to the
+                # original file, distinct from source_uri above.
+                "source_url": result.source_url,
                 "content_hash": result.content_hash,
             }
         )
@@ -618,6 +698,10 @@ async def _handle_get_citations(key_info: APIKeyInfo, arguments: dict) -> list[T
     for workspace_id, result in tagged:
         if result.citation is not None:
             citations.append({"workspace_id": workspace_id, **result.citation.model_dump()})
+
+    # Attribution (#393): see _handle_search's comment above.
+    record_returned_chunk_ids([cit["chunk_id"] for cit in citations if cit.get("chunk_id")])
+    record_workspace_ids(workspace_ids)
 
     if not citations:
         return _structured(
@@ -700,6 +784,9 @@ async def _handle_get_context(key_info: APIKeyInfo, arguments: dict) -> list[Tex
         "offset": window.offset,
         "next_offset": window.next_offset,
     }
+    # Attribution (#393): see _handle_search's comment for the mechanism.
+    record_returned_chunk_ids([chunk.id for chunk in window.chunks])
+    record_workspace_ids([document.workspace_id])
     return _structured(result_text, payload)
 
 
@@ -778,7 +865,9 @@ async def _handle_verify_claim(key_info: APIKeyInfo, arguments: dict) -> list[Te
     return _structured(summary, verdict.model_dump())
 
 
-async def _resolve_document_for_user(key_info: APIKeyInfo, document_id: str):
+async def _resolve_document_for_user(
+    key_info: APIKeyInfo, document_id: str, *, permission: str = "read"
+):
     """Fetch a document by id and verify the key is authorised for its workspace.
 
     Authorisation via ``get_authorized_workspace_ids`` (#138): a
@@ -797,6 +886,12 @@ async def _resolve_document_for_user(key_info: APIKeyInfo, document_id: str):
     REST's undifferentiated 404 exists to prevent. Do not reintroduce a
     distinguishable message for the unauthorized branch.
 
+    ``permission="write"`` (prime#331) is passed by every document-scoped
+    write tool: a viewer of the document's workspace is refused with a
+    role-specific message (safe: they can already read the document, so it
+    is not an existence oracle). Everyone else still gets the undifferentiated
+    "not found".
+
     Returns (document, workspace_ids, error_text). On any access failure the
     error_text is set and the document is None, so callers return without
     ever reading further data.
@@ -806,8 +901,12 @@ async def _resolve_document_for_user(key_info: APIKeyInfo, document_id: str):
     not_found = f"Error: Document '{document_id}' not found"
     if not document:
         return None, [], not_found
-    authorized = await get_authorized_workspace_ids(key_info, database)
+    authorized = await get_authorized_workspace_ids(key_info, database, permission=permission)
     if document.workspace_id not in authorized:
+        if permission == "write":
+            viewer_detail = await viewer_write_denial(key_info, document.workspace_id, database)
+            if viewer_detail:
+                return None, authorized, f"Error: {viewer_detail}"
         return None, authorized, not_found
     return document, authorized, None
 
@@ -816,8 +915,9 @@ async def _handle_explain_lineage(key_info: APIKeyInfo, arguments: dict) -> list
     """Handle explain_lineage: return provenance + freshness for a doc/chunk (#40).
 
     Reuses already-ingested data only (no new business logic): the document row
-    and its chunks, with provenance fields (``source_uri``, ``content_hash``,
-    ``ingested_at``) read from chunk/document metadata. ``is_stale`` is computed
+    and its chunks, with provenance fields (``source_uri``, ``source_url``,
+    ``content_hash``, ``ingested_at``) read from chunk/document metadata.
+    ``is_stale`` is computed
     with the SAME freshness logic the search path uses
     (``SearchService._compute_is_stale``), so lineage and search agree.
     """
@@ -863,7 +963,7 @@ async def _handle_refresh_stale_source(key_info: APIKeyInfo, arguments: dict) ->
     if not document_id:
         return [TextContent(type="text", text="Error: Document ID is required")]
 
-    document, _, error = await _resolve_document_for_user(key_info, document_id)
+    document, _, error = await _resolve_document_for_user(key_info, document_id, permission="write")
     if error:
         return [TextContent(type="text", text=error)]
 
@@ -882,6 +982,7 @@ async def _handle_refresh_stale_source(key_info: APIKeyInfo, arguments: dict) ->
         document_id=fields["document_id"],
         workspace_id=fields["workspace_id"],
         user_id=fields["user_id"],
+        uploaded_by=fields.get("uploaded_by"),  # preserved on refresh
         filename=fields["filename"],
         original_filename=fields["original_filename"],
         content_type=fields["content_type"],
@@ -898,6 +999,7 @@ async def _handle_refresh_stale_source(key_info: APIKeyInfo, arguments: dict) ->
         "document_id": fields["document_id"],
         "workspace_id": fields["workspace_id"],
         "user_id": fields["user_id"],
+        "uploaded_by": fields.get("uploaded_by"),
         "filename": fields["filename"],
         "original_filename": fields["original_filename"],
         "content_type": fields["content_type"],
@@ -1020,7 +1122,7 @@ async def _handle_delete_document(key_info: APIKeyInfo, arguments: dict) -> list
     if not document_id:
         return [TextContent(type="text", text="Error: Document ID is required")]
 
-    document, _, error = await _resolve_document_for_user(key_info, document_id)
+    document, _, error = await _resolve_document_for_user(key_info, document_id, permission="write")
     if error:
         return [TextContent(type="text", text=error)]
 
@@ -1082,6 +1184,9 @@ async def _handle_list_chunks(key_info: APIKeyInfo, arguments: dict) -> list[Tex
     database = await get_database()
     chunks = await database.get_document_chunks_by_doc_id(document.id)
     payload = [chunk.model_dump() for chunk in chunks]
+    # Attribution (#393): see _handle_search's comment for the mechanism.
+    record_returned_chunk_ids([chunk.id for chunk in chunks])
+    record_workspace_ids([document.workspace_id])
     return _structured(f"{len(chunks)} chunks for document '{document.id}'", payload)
 
 
@@ -1095,7 +1200,7 @@ async def _handle_create_chunk(key_info: APIKeyInfo, arguments: dict) -> list[Te
     if content_err:
         return [TextContent(type="text", text=content_err)]
 
-    document, _, error = await _resolve_document_for_user(key_info, document_id)
+    document, _, error = await _resolve_document_for_user(key_info, document_id, permission="write")
     if error:
         return [TextContent(type="text", text=error)]
 
@@ -1145,7 +1250,7 @@ async def _handle_edit_chunk(key_info: APIKeyInfo, arguments: dict) -> list[Text
     except (TypeError, ValueError):
         return [TextContent(type="text", text="Error: chunk_index must be an integer")]
 
-    document, _, error = await _resolve_document_for_user(key_info, document_id)
+    document, _, error = await _resolve_document_for_user(key_info, document_id, permission="write")
     if error:
         return [TextContent(type="text", text=error)]
 
@@ -1192,7 +1297,7 @@ async def _handle_delete_chunk(key_info: APIKeyInfo, arguments: dict) -> list[Te
     except (TypeError, ValueError):
         return [TextContent(type="text", text="Error: chunk_index must be an integer")]
 
-    document, _, error = await _resolve_document_for_user(key_info, document_id)
+    document, _, error = await _resolve_document_for_user(key_info, document_id, permission="write")
     if error:
         return [TextContent(type="text", text=error)]
 
@@ -1251,7 +1356,9 @@ async def _resolve_single_workspace_for_upload(
     Returns (workspace_id, error_text); on error workspace_id is None.
     """
     if requested_workspace_id:
-        workspace_ids, error = await _get_workspace_ids(key_info, requested_workspace_id)
+        workspace_ids, error = await _get_workspace_ids(
+            key_info, requested_workspace_id, permission="write"
+        )
         if error:
             return None, error
         return workspace_ids[0], None
@@ -1260,7 +1367,7 @@ async def _resolve_single_workspace_for_upload(
     # narrows to its one workspace here too (len(owned) == 1), never forcing
     # disambiguation among workspaces the key isn't even bound to.
     database = await get_database()
-    owned = await get_authorized_workspace_ids(key_info, database)
+    owned = await get_authorized_workspace_ids(key_info, database, permission="write")
     if not owned:
         return None, "Error: No workspaces found. Upload documents to create a workspace."
     if len(owned) > 1:
@@ -1538,6 +1645,7 @@ _TOOLS: dict[str, ToolDef] = {
         input_schema=_SEARCH_INPUT_SCHEMA,
         permission="search",
         handler=_handle_search,
+        returns_chunk_content=True,
     ),
     "search_memory": ToolDef(
         description="Memory primitive: retrieve evidence chunks for a query (canonical "
@@ -1551,6 +1659,7 @@ _TOOLS: dict[str, ToolDef] = {
         # two tools doing one job costs every HTTP agent permanent context
         # overhead with no capability gained. Unchanged on stdio.
         http_exposed=False,
+        returns_chunk_content=True,
     ),
     "get_citations": ToolDef(
         description="Run a search and return the claim-level Citation objects attached to "
@@ -1564,6 +1673,7 @@ _TOOLS: dict[str, ToolDef] = {
         # (chunk_id, document_name, content, start_char, end_char). Unchanged
         # on stdio.
         http_exposed=False,
+        returns_chunk_content=True,
     ),
     "get_document_context": ToolDef(
         description="Get a bounded window of a document's content for context. Response is "
@@ -1596,6 +1706,7 @@ _TOOLS: dict[str, ToolDef] = {
         },
         permission="read",
         handler=_handle_get_context,
+        returns_chunk_content=True,
     ),
     "list_documents": ToolDef(
         description="List all documents. Omit workspace_id to list from every workspace "
@@ -1662,8 +1773,8 @@ _TOOLS: dict[str, ToolDef] = {
     ),
     "explain_lineage": ToolDef(
         description="Memory primitive: explain a document's (or chunk's) provenance and "
-        "freshness — source_uri, content_hash, ingested_at, is_stale and document_name — "
-        "from already-ingested data. Requires 'read' permission.",
+        "freshness — source_uri, source_url, content_hash, ingested_at, is_stale and "
+        "document_name — from already-ingested data. Requires 'read' permission.",
         input_schema={
             "type": "object",
             "properties": {
@@ -1782,6 +1893,7 @@ _TOOLS: dict[str, ToolDef] = {
         },
         permission="read",
         handler=_handle_list_chunks,
+        returns_chunk_content=True,
     ),
     "create_chunk": ToolDef(
         description="Append a chunk to a document at max(chunk_index)+1 (#133 Option A) — "

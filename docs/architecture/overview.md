@@ -441,7 +441,8 @@ this page does not redraw it. What matters for the end-to-end picture:
   expense. Set `ENABLE_DIVERSIFICATION=false` to restore the prior ranking.
 - A **citation** is built purely from the matched chunk's own returned
   fields — `chunk_id`, `document_id`, `content`, `start_char`/`end_char`,
-  `score`, `source_uri` (`services/inh-public-api-svc/src/services/search.py:602-616`)
+  `score`, `source_uri`, `source_url`
+  (`services/inh-public-api-svc/src/services/search.py:602-616`)
   — so evidence is verifiable without a second lookup. `start_char`/`end_char`
   are the same offsets the chunker computed at ingestion time (§6) against
   the *original extracted text* — they are what makes a citation an
@@ -602,6 +603,23 @@ the review follow-up, and `TestPdfFailurePaths`/`TestEpubFailurePaths`/
 `TestRtfFailurePaths`/`TestOdtFailurePaths`/`TestSubtitleFailurePaths` in
 `test_extraction_by_type.py` each pin that this stays true for their own
 extractor.
+
+> **Status update (2026-09-28): DOCX/PDF extraction structure (#389).**
+> `_extract_docx_text` and `_extract_pdf_text` line numbers above predate
+> #389 and have shifted; the *construction-only wrap / MemoryError-stays-
+> retryable* contract described in this section is unchanged and still pins
+> both extractors (`TestDocxFailurePaths`/`TestPdfFailurePaths` in
+> `test_extraction_by_type.py`). What changed is what happens AFTER
+> construction succeeds: `_extract_docx_text` now walks `doc.element.body`
+> in document order (paragraphs and tables interleaved) via
+> `_docx_body_to_text`, rendering heading/title styles as markdown and
+> automatic list/outline numbering inline (see
+> `src/temporal/activities/docx_numbering.py`) instead of returning
+> `doc.paragraphs`' bare text; `_extract_pdf_text` now runs each page's text
+> through `_normalize_pdf_page_text` (conservative hyphenation/whitespace
+> cleanup, never touching pypdf's own line breaks) before joining pages. See
+> `docs/reference/file-types.md`'s "Structure-preserving DOCX/PDF
+> extraction" section for the full behavior.
 
 **The dead-letter path.** A terminal workflow failure — after retries are
 exhausted, or immediately for a non-retryable error — is recorded via

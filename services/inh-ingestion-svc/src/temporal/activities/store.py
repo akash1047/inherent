@@ -7,6 +7,7 @@ Uses shared connection pools from shared_services.
 import time
 
 import structlog
+from inh_contracts.events import CONTRACT_VERSION
 from temporalio import activity
 
 from src.models.document import DocumentChunk, DocumentUploadMessage
@@ -43,6 +44,28 @@ def _risk_metadata(chunk_dict: dict) -> dict | None:
     strategy = chunk_dict.get("chunking_strategy")
     if strategy:
         metadata["chunking_strategy"] = strategy
+
+    # Section heading (inherent#390's numbered_sections strategy) -- same
+    # additive, empty-means-absent pattern as chunking_strategy above.
+    section_heading = chunk_dict.get("section_heading")
+    if section_heading:
+        metadata["section_heading"] = section_heading
+
+    # Pack tags (inherent#390 item 4): the rules tagger writes
+    # {field_name: value} straight into the staged chunk dict under "tags"
+    # for a pack-enabled workspace; every other chunk simply never carries
+    # this key. Kept in metadata JSONB (structured) -- the Weaviate
+    # "field=value" TEXT_ARRAY projection lives in weaviate.py, built from
+    # this same dict so the two representations can't drift apart.
+    tags = chunk_dict.get("tags")
+    if tags:
+        metadata["tags"] = tags
+        # Precomputed "field=value" strings for the Weaviate TEXT_ARRAY
+        # property (see tagging.py's _tags_as_weaviate_strings) -- carried
+        # alongside the structured dict so weaviate.py's promote-from-
+        # metadata write (store_chunks_with_tenant) doesn't need to recompute
+        # or re-import the tagging module.
+        metadata["tags_weaviate"] = chunk_dict.get("tags_weaviate") or []
 
     # Conversation turn attribution (#306): chunk_conversation stamps these
     # onto every staged chunk dict; an ordinary document chunk from chunk_text
@@ -116,6 +139,23 @@ async def store_in_postgresql(input: StoreDocumentInput) -> StoreDocumentOutput:
             storage_bucket=None,
             storage_url=None,
             timestamp="",  # Not needed for storage
+            # These four are all default-valued/optional on the shared
+            # contract (inh_contracts.events) and irrelevant to this
+            # internal DocumentUploadMessage-like construction, but are
+            # passed explicitly (not omitted) because inh_contracts has no
+            # mypy plugin configured here -- without one, mypy's plain
+            # dataclass_transform handling of pydantic models does not
+            # recognize a `Field(default, ...)` call as making a field
+            # optional, so it flags any omitted field as a missing required
+            # argument regardless of its runtime default.
+            contract_version=CONTRACT_VERSION,
+            source=None,
+            connection_id=None,
+            sync_id=None,
+            # Source link (inherent#391): carried through from the workflow
+            # input so store_processed_document can persist it per chunk.
+            source_url=input.source_url,
+            uploaded_by=input.uploaded_by,
         )
 
         # #364: out-parameter that store_processed_document fills in with
@@ -411,6 +451,9 @@ async def store_in_weaviate(input: StoreDocumentInput) -> StoreDocumentOutput:
             content_type=input.content_type,
             # Provenance (#41): record where the source bytes live.
             source_uri=input.storage_path,
+            # Source link (inherent#391): the connector's link back to the
+            # original file, distinct from source_uri above.
+            source_url=input.source_url,
         )
 
         duration_ms = int((time.monotonic() - start) * 1000)
@@ -422,6 +465,47 @@ async def store_in_weaviate(input: StoreDocumentInput) -> StoreDocumentOutput:
             user_id=input.user_id,
             chunks_stored=len(chunks),
         )
+
+        # Usage-based ranking boost: chunk reuse detection (inherent#394).
+        # Opt-in per workspace (WORKSPACE_REUSE_DETECTION, off by default) --
+        # a workspace not listed pays zero extra cost here, byte-identical to
+        # before this feature existed. Best-effort: the WHOLE block (settings
+        # lookup included) is caught and logged, never re-raised -- this must
+        # never fail ingestion, which is why it runs AFTER the document's own
+        # store already succeeded.
+        try:
+            from src.temporal.shared_services import get_settings
+
+            settings = get_settings()
+            if input.workspace_id in settings.workspace_reuse_detection:
+                from src.services.reuse_detection import detect_and_record_chunk_reuse
+
+                reused = await detect_and_record_chunk_reuse(
+                    weaviate_service=weaviate_service,
+                    db_service=db_service,
+                    workspace_id=input.workspace_id,
+                    user_id=input.user_id,
+                    document_id=input.document_id,
+                    chunks=chunks,
+                    vector_similarity_threshold=settings.reuse_similarity_threshold,
+                    text_similarity_threshold=settings.reuse_text_similarity_threshold,
+                    top_k=settings.reuse_top_k,
+                    min_chunk_chars=settings.reuse_min_chunk_chars,
+                )
+                if reused:
+                    logger.info(
+                        "Recorded chunk reuse",
+                        document_id=input.document_id,
+                        workspace_id=input.workspace_id,
+                        reuse_events_recorded=reused,
+                    )
+        except Exception as reuse_err:  # noqa: BLE001 -- best-effort (#394)
+            logger.warning(
+                "Chunk reuse detection failed (non-fatal)",
+                document_id=input.document_id,
+                workspace_id=input.workspace_id,
+                error=str(reuse_err),
+            )
 
         # Record lineage event on success
         try:

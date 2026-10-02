@@ -63,6 +63,11 @@ def _make_mock_settings(**overrides):
         "temporal_namespace": "default",
         "temporal_task_queue": "document-ingestion",
         "log_level": "INFO",
+        # Vertical pack binding (inherent#390 follow-up): a real dict, not a
+        # MagicMock, so `.get(workspace_id)` returns real None by default.
+        "workspace_vertical_packs": {},
+        # Team workspaces (prime#331): no Mongo in these tests.
+        "workspace_owner_lookup_enabled": False,
     }
     defaults.update(overrides)
     s = MagicMock()
@@ -427,6 +432,83 @@ class TestIngestTrigger:
         _, kwargs = client._mock_temporal_client.start_workflow.call_args
         assert kwargs["memo"] == {"source": "api-direct"}
 
+    # -------------------------------------------------------------------
+    # inherent#390 follow-up: workspace -> vertical pack binding resolved
+    # HERE (plain application code), not inside workflow code.
+    # -------------------------------------------------------------------
+
+    def test_workflow_input_carries_vertical_pack_from_mapping(self):
+        """A workspace mapped in WORKSPACE_VERTICAL_PACKS gets its pack name
+        threaded onto DocumentIngestionInput.vertical_pack."""
+        mock_settings = _make_mock_settings(workspace_vertical_packs={"ws_001": "handbook"})
+        mock_temporal_client = AsyncMock()
+        mock_handle = AsyncMock()
+        mock_handle.result = AsyncMock(return_value=_FakeWorkflowResult())
+        mock_temporal_client.start_workflow = AsyncMock(return_value=mock_handle)
+
+        with (
+            patch("src.api.app.TemporalWorkerManager") as mock_manager_cls,
+            patch("src.api.auth.get_settings", return_value=mock_settings),
+        ):
+            instance = mock_manager_cls.return_value
+            instance.start = AsyncMock()
+            instance.stop = AsyncMock()
+            instance.get_client = AsyncMock(return_value=mock_temporal_client)
+            instance.is_running = True
+
+            from src.api.app import create_app
+
+            app = create_app(mock_settings)
+            with TestClient(app) as tc:
+                resp = tc.post(
+                    "/ingest",
+                    json=_INGEST_PAYLOAD,
+                    headers={"X-API-Key": VALID_API_KEY},
+                )
+
+        assert resp.status_code == 202
+        args, _kwargs = mock_temporal_client.start_workflow.call_args
+        workflow_input = args[1]
+        assert workflow_input.vertical_pack == "handbook"
+
+    def test_workflow_input_vertical_pack_none_when_unmapped(self, client: TestClient):
+        """The default fixture's settings map no workspace at all -- every
+        existing /ingest call must be completely unaffected."""
+        client.post(
+            "/ingest",
+            json=_INGEST_PAYLOAD,
+            headers={"X-API-Key": VALID_API_KEY},
+        )
+        args, _kwargs = client._mock_temporal_client.start_workflow.call_args
+        workflow_input = args[1]
+        assert workflow_input.vertical_pack is None
+
+    def test_source_url_reaches_workflow_input(self, client: TestClient):
+        """A valid source_url (inherent#391) is passed through unchanged."""
+        payload = {**_INGEST_PAYLOAD, "source_url": "https://drive.google.com/file/d/abc/view"}
+        client.post("/ingest", json=payload, headers={"X-API-Key": VALID_API_KEY})
+        args, _kwargs = client._mock_temporal_client.start_workflow.call_args
+        workflow_input = args[1]
+        assert workflow_input.source_url == "https://drive.google.com/file/d/abc/view"
+
+    def test_unsafe_source_url_sanitized_to_none_not_rejected(self, client: TestClient):
+        """An unsafe source_url degrades to None -- it never fails the upload
+        (inherent#391 policy: a citation field, not something ingestion
+        depends on)."""
+        payload = {**_INGEST_PAYLOAD, "source_url": "javascript:alert(1)"}
+        resp = client.post("/ingest", json=payload, headers={"X-API-Key": VALID_API_KEY})
+        assert resp.status_code == 202
+        args, _kwargs = client._mock_temporal_client.start_workflow.call_args
+        workflow_input = args[1]
+        assert workflow_input.source_url is None
+
+    def test_missing_source_url_defaults_to_none(self, client: TestClient):
+        """Every existing /ingest caller (no source_url at all) is unaffected."""
+        client.post("/ingest", json=_INGEST_PAYLOAD, headers={"X-API-Key": VALID_API_KEY})
+        args, _kwargs = client._mock_temporal_client.start_workflow.call_args
+        workflow_input = args[1]
+        assert workflow_input.source_url is None
+
     def test_403_detail_states_both_accepted_storage_path_forms(self, client: TestClient):
         """Attacker-persona review finding: naming the mismatch without
         stating what a CORRECT value looks like leaves an operator on a
@@ -649,3 +731,186 @@ class TestDeadLetterRetrySupersedePolicy:
         finally:
             real_trigger._client = None
             real_trigger._initialized = False
+
+
+# ---------------------------------------------------------------------------
+# Admin purge route tests (inherent#395)
+# ---------------------------------------------------------------------------
+
+
+class TestAdminPurgeWorkspace:
+    """POST/GET /admin/workspaces/{id}/purge -- same auth as every other mutating route."""
+
+    def test_missing_key_returns_401(self, client: TestClient):
+        resp = client.post("/admin/workspaces/ws_001/purge", json={"operator": "op@example.com"})
+        assert resp.status_code == 401
+
+    def test_wrong_key_returns_403(self, client: TestClient):
+        resp = client.post(
+            "/admin/workspaces/ws_001/purge",
+            json={"operator": "op@example.com"},
+            headers={"X-API-Key": "wrong-key"},
+        )
+        assert resp.status_code == 403
+
+    def test_get_status_also_requires_key(self, client: TestClient):
+        resp = client.get("/admin/workspaces/ws_001/purge/purge-ws_001")
+        assert resp.status_code == 401
+
+    def test_correct_key_starts_purge_and_returns_job_id(self, client: TestClient):
+        resp = client.post(
+            "/admin/workspaces/ws_001/purge",
+            json={"operator": "op@example.com"},
+            headers={"X-API-Key": VALID_API_KEY},
+        )
+        assert resp.status_code == 202
+        body = resp.json()
+        assert body["purge_workflow_id"] == "purge-ws_001"
+        assert body["workspace_id"] == "ws_001"
+
+        # Deterministic workflow id, started against the ingestion task queue.
+        _, kwargs = client._mock_temporal_client.start_workflow.call_args
+        assert kwargs["id"] == "purge-ws_001"
+
+    def test_repeat_trigger_is_idempotent(self, client: TestClient):
+        """A second POST while a purge is already running/completed must not error."""
+        from temporalio.exceptions import WorkflowAlreadyStartedError
+
+        client._mock_temporal_client.start_workflow = AsyncMock(
+            side_effect=WorkflowAlreadyStartedError(
+                workflow_id="purge-ws_001", run_id="run1", workflow_type="PurgeWorkspaceWorkflow"
+            )
+        )
+
+        resp = client.post(
+            "/admin/workspaces/ws_001/purge",
+            json={"operator": "op@example.com"},
+            headers={"X-API-Key": VALID_API_KEY},
+        )
+
+        assert resp.status_code == 202
+        assert resp.json()["purge_workflow_id"] == "purge-ws_001"
+
+    def test_get_status_still_running(self, client: TestClient):
+        from temporalio.client import WorkflowExecutionStatus
+
+        description = MagicMock()
+        description.status = WorkflowExecutionStatus.RUNNING
+        client._mock_handle.describe = AsyncMock(return_value=description)
+
+        resp = client.get(
+            "/admin/workspaces/ws_001/purge/purge-ws_001",
+            headers={"X-API-Key": VALID_API_KEY},
+        )
+
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "purging"
+        assert resp.json()["residue"] is None
+
+    def test_get_status_completed_returns_report(self, client: TestClient):
+        from temporalio.client import WorkflowExecutionStatus
+
+        from src.temporal.models import PurgeWorkspaceResult
+
+        description = MagicMock()
+        description.status = WorkflowExecutionStatus.COMPLETED
+        client._mock_handle.describe = AsyncMock(return_value=description)
+        client._mock_handle.result = AsyncMock(
+            return_value=PurgeWorkspaceResult(
+                workspace_id="ws_001",
+                purge_workflow_id="purge-ws_001",
+                residue={"processed_documents": 0},
+                verified=True,
+                revoked_api_keys=1,
+                cancelled_ingestion_workflows=0,
+                audit_logs_purged=True,
+            )
+        )
+
+        with patch("src.temporal.shared_services.get_db_service") as mock_get_db:
+            mock_db = MagicMock()
+            mock_db.get_purge_receipt_by_workflow_id = AsyncMock(
+                return_value={"verified": True, "operator": "op@example.com"}
+            )
+            mock_get_db.return_value = mock_db
+
+            resp = client.get(
+                "/admin/workspaces/ws_001/purge/purge-ws_001",
+                headers={"X-API-Key": VALID_API_KEY},
+            )
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "completed"
+        assert body["verified"] is True
+        assert body["residue"] == {"processed_documents": 0}
+        # Receipt surfaced verbatim -- content-free by construction (see
+        # DatabaseService.record_purge_receipt), never document text.
+        assert body["receipt"]["operator"] == "op@example.com"
+
+    def test_get_status_completed_decodes_result_like_real_temporal(self, client: TestClient):
+        """A handle fetched WITHOUT ``result_type`` decodes the dataclass result to a plain dict.
+
+        The mocks above return a ``PurgeWorkspaceResult`` from ``handle.result()``
+        unconditionally, which real Temporal does not: ``get_workflow_handle(id)``
+        with no ``result_type`` returns the JSON as a ``dict``, and the route's
+        ``result.residue`` then raised ``AttributeError`` -> HTTP 500 on every
+        completed purge (found by the live pilot-flow E2E). This mock decodes
+        the way Temporal does, so the route must ask for the typed result.
+        """
+        from temporalio.client import WorkflowExecutionStatus
+
+        from src.temporal.models import PurgeWorkspaceResult
+
+        typed = PurgeWorkspaceResult(
+            workspace_id="ws_001",
+            purge_workflow_id="purge-ws_001",
+            residue={"processed_documents": 0},
+            verified=True,
+            revoked_api_keys=1,
+            cancelled_ingestion_workflows=0,
+            audit_logs_purged=True,
+        )
+        description = MagicMock()
+        description.status = WorkflowExecutionStatus.COMPLETED
+
+        def _get_workflow_handle(workflow_id, *, result_type=None, **_kwargs):
+            handle = AsyncMock()
+            handle.describe = AsyncMock(return_value=description)
+            handle.result = AsyncMock(
+                return_value=typed if result_type is PurgeWorkspaceResult else typed.__dict__
+            )
+            return handle
+
+        client._mock_temporal_client.get_workflow_handle = MagicMock(
+            side_effect=_get_workflow_handle
+        )
+
+        with patch("src.temporal.shared_services.get_db_service") as mock_get_db:
+            mock_db = MagicMock()
+            mock_db.get_purge_receipt_by_workflow_id = AsyncMock(return_value={"verified": True})
+            mock_get_db.return_value = mock_db
+
+            resp = client.get(
+                "/admin/workspaces/ws_001/purge/purge-ws_001",
+                headers={"X-API-Key": VALID_API_KEY},
+            )
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["status"] == "completed"
+        assert body["verified"] is True
+        assert body["residue"] == {"processed_documents": 0}
+
+    def test_get_status_unknown_workflow_returns_not_found(self, client: TestClient):
+        from temporalio.service import RPCError
+
+        client._mock_handle.describe = AsyncMock(side_effect=RPCError("not found", None, None))
+
+        resp = client.get(
+            "/admin/workspaces/ws_999/purge/purge-ws_999",
+            headers={"X-API-Key": VALID_API_KEY},
+        )
+
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "not_found"

@@ -15,14 +15,35 @@ from inh_contracts.naming import (
     get_user_tenant_name,
     get_workspace_collection_name,
 )
+from inh_contracts.reuse_boost import apply_reuse_boost
+from inh_contracts.source_url import sanitize_source_url
 
 from src.config import settings
 from src.models.citation import Citation
 from src.models.search import ScoreSource, SearchRequest, SearchResponse, SearchResult
 from src.services.database import DatabaseService, get_database
+from src.services.workspace_pack import resolve_workspace_pack
 from src.utils import get_logger
 
 logger = get_logger(__name__)
+
+
+# Global default hybrid fusion weight (inherent#391): unchanged from the
+# field's old fixed default of 0.7, used whenever a request omits alpha AND
+# its workspace has no WORKSPACE_HYBRID_ALPHA override configured. Keeping
+# this the same value that used to live directly on the field means a
+# deployment with no override configured is byte-for-byte unaffected.
+DEFAULT_HYBRID_ALPHA = 0.7
+
+
+class TagFilterError(ValueError):
+    """`request.filters` is invalid for this workspace (inherent#390 item 5).
+
+    Raised for: filters given on a workspace with no vertical pack bound, or
+    a filter field name that isn't in the bound pack's tag schema. The API
+    layer maps this to HTTP 400 with the message as-is (it never leaks
+    anything beyond the pack's own public field names).
+    """
 
 
 def _require_safe_name(name: str, kind: str) -> None:
@@ -58,6 +79,12 @@ _SEARCH_REQUEST_FIELDS: tuple[str, ...] = (
     "context_window",
     "search_mode",
     "alpha",
+    # Vertical pack tag filters (inherent#392): search_documents/search_memory
+    # now accept the SAME `filters` shape REST's SearchRequest already had
+    # since #390 -- {field: value} or {field: [values]} -- instead of
+    # silently dropping it. See server.py's _run_search for the friendly
+    # TagFilterError -> "Error: ..." mapping (never a raw 500/traceback).
+    "filters",
 )
 
 
@@ -550,6 +577,23 @@ class SearchService:
         See the API layer for the multi-workspace partial-result policy.
         """
         start_time = time.time()
+        # Vertical pack tag filter validation (inherent#390 item 5) — BEFORE
+        # any Weaviate call, so a bad filter never spends a query. Raises
+        # TagFilterError (-> HTTP 400 at the API layer) rather than silently
+        # ignoring an unusable filter.
+        self._validate_tag_filters(workspace_id, request.filters)
+        # Per-workspace hybrid alpha (inherent#391): a request's own explicit
+        # alpha always wins; only when the caller omitted it (alpha is None)
+        # do we fall back to this workspace's WORKSPACE_HYBRID_ALPHA entry,
+        # then the global default. Resolved once, here, so every downstream
+        # read of request.alpha (the GraphQL query builder, the provenance
+        # echoed on each result) sees the same value without needing its own
+        # fallback logic.
+        if request.alpha is None:
+            effective_alpha = settings.workspace_hybrid_alpha.get(
+                workspace_id, DEFAULT_HYBRID_ALPHA
+            )
+            request = request.model_copy(update={"alpha": effective_alpha})
         results = await self._search_weaviate(workspace_id, user_id, request, query_vector)
         # Advanced-methods dispatch point (#47). NO-OP by default — when the
         # experimental flags are off (the default) this returns results
@@ -871,6 +915,15 @@ class SearchService:
             source_uri = chunk.get("source_uri")
             source_uri = source_uri if isinstance(source_uri, str) else None
 
+            # Source link (inherent#391): promoted the same way as source_uri
+            # above, but re-sanitized here too -- defense in depth against a
+            # chunk written before this validation existed, or written
+            # directly (bypassing the upload boundary's own sanitizer).
+            raw_source_url = chunk.get("source_url")
+            source_url = sanitize_source_url(
+                raw_source_url if isinstance(raw_source_url, str) else None
+            )
+
             # Freshness (#42): promote ingested_at and compute staleness. Stale
             # results are flagged, not dropped (see _compute_is_stale).
             # `content_type` is selected purely to identify a conversation
@@ -897,6 +950,25 @@ class SearchService:
                 if content_risk and isinstance(raw_reasons, list) and raw_reasons
                 else None
             )
+
+            # Vertical pack tags (inherent#390 item 5): Weaviate's "field=value"
+            # TEXT_ARRAY -> {field: value}. Malformed entries (no "=", e.g. from
+            # a future format change) are skipped rather than raising.
+            raw_tags = chunk.get("tags")
+            tags: dict[str, str] | None = None
+            if isinstance(raw_tags, list) and raw_tags:
+                parsed = {}
+                for entry in raw_tags:
+                    if isinstance(entry, str) and "=" in entry:
+                        field_name, _, value = entry.partition("=")
+                        parsed[field_name] = value
+                tags = parsed or None
+
+            # Usage-based ranking boost (inherent#394): promote the raw
+            # count so it's available both for the boost math below AND for
+            # transparency on the returned result (see SearchResult.reuse_count).
+            raw_reuse_count = chunk.get("reuse_count")
+            reuse_count = raw_reuse_count if isinstance(raw_reuse_count, int) else 0
 
             rounded_score = round(score, 4)
             chunk_id = additional.get("id", "")
@@ -931,6 +1003,7 @@ class SearchService:
                 score=rounded_score,
                 score_source=score_source,
                 source_uri=source_uri,
+                source_url=source_url,
                 ingested_at=ingested_at,
                 is_stale=is_stale,
             )
@@ -951,13 +1024,26 @@ class SearchService:
                     alpha=result_alpha,
                     content_hash=content_hash if isinstance(content_hash, str) else None,
                     source_uri=source_uri,
+                    source_url=source_url,
                     ingested_at=ingested_at,
                     is_stale=is_stale,
                     content_risk=content_risk,
                     content_risk_reasons=content_risk_reasons,
+                    tags=tags,
+                    reuse_count=reuse_count,
                     citation=citation,
                 )
             )
+        # Usage-based ranking boost (inherent#394): applied AFTER fusion (the
+        # Weaviate score/certainty this loop just resolved into `score`, for
+        # semantic/hybrid/keyword alike -- all three modes share this method)
+        # and BEFORE diversify/truncate, so a boosted chunk can win a spot in
+        # the page it would otherwise have been cut from. Unset/empty
+        # WORKSPACE_REUSE_BOOST (the default) makes this a no-op -- see
+        # _apply_reuse_boost's docstring for the byte-for-byte-unchanged
+        # guarantee that matters for #394's own ordering test.
+        results = self._apply_reuse_boost(results, workspace_id)
+
         # Truncate back to the requested page size after min_score filtering
         # (the query may have over-fetched to avoid under-filling) (#31), or
         # diversify-then-truncate when enable_diversification is on (#146,
@@ -966,6 +1052,39 @@ class SearchService:
         if settings.enable_diversification:
             return self._diversify_by_document(results, request.limit)
         return results[: request.limit]
+
+    @staticmethod
+    def _apply_reuse_boost(results: list[SearchResult], workspace_id: str) -> list[SearchResult]:
+        """Boost each result's score by its chunk's reuse_count, then re-sort (inherent#394).
+
+        ``score * min(cap, 1 + weight * log1p(reuse_count))`` (see
+        ``inh_contracts.reuse_boost`` for the full formula/rationale) where
+        ``weight`` is this workspace's ``WORKSPACE_REUSE_BOOST`` entry, or
+        ``0.0`` when unset -- which multiplies every score by exactly 1.0,
+        so a workspace with no override (the default) gets BYTE-FOR-BYTE the
+        same ordering as before this feature existed (pinned by
+        ``test_search_reuse_boost.py``'s "no override" ordering test). A chunk that
+        was never detected as reused (``reuse_count == 0``) is likewise
+        always multiplied by exactly 1.0, even for a workspace WITH a
+        configured weight.
+
+        Re-sorts by the boosted score (descending) since a boost can change
+        relative order -- callers downstream (diversify/truncate) assume
+        ``results`` arrives score-sorted, same invariant Weaviate's own
+        response provided before any boost existed.
+        """
+        weight = settings.workspace_reuse_boost.get(workspace_id, 0.0)
+        if weight <= 0.0:
+            return results  # no override configured -- skip the no-op work entirely
+
+        boosted = [
+            r.model_copy(
+                update={"score": round(apply_reuse_boost(r.score, r.reuse_count, weight), 4)}
+            )
+            for r in results
+        ]
+        boosted.sort(key=lambda r: r.score, reverse=True)
+        return boosted
 
     @staticmethod
     def _diversify_by_document(results: list[SearchResult], limit: int) -> list[SearchResult]:
@@ -1046,11 +1165,22 @@ class SearchService:
                 fetch_limit,
                 min(100, request.limit * settings.diversification_over_fetch_multiplier),
             )
-        where_clause = ""
+        # Combine the document_ids filter (#218) with pack tag filters
+        # (inherent#390 item 5) -- both apply together (ANDed) when both are
+        # given, exactly like #218's own "keep document_ids working" bar.
+        where_operands: list[str] = []
         if request.document_ids:
-            where_clause = (
-                f"where: {self._format_where(['document_id'], 'ContainsAny', request.document_ids)}"
+            where_operands.append(
+                self._format_where(["document_id"], "ContainsAny", request.document_ids)
             )
+        where_operands.extend(self._tag_filter_operands(request.filters))
+
+        where_clause = ""
+        if len(where_operands) == 1:
+            where_clause = f"where: {where_operands[0]}"
+        elif len(where_operands) > 1:
+            joined = ", ".join(where_operands)
+            where_clause = f"where: {{ operator: And, operands: [{joined}] }}"
 
         if request.search_mode == "keyword":
             search_args = f'bm25: {{ query: "{escaped_query}" }}'
@@ -1090,10 +1220,14 @@ class SearchService:
                     end_char
                     content_hash
                     source_uri
+                    source_url
                     ingested_at
                     content_type
                     content_risk
                     content_risk_reasons
+                    tags
+                    section_heading
+                    reuse_count
                     _additional {{ id score certainty distance }}
                 }}
             }}
@@ -1107,6 +1241,48 @@ class SearchService:
     # instead of being interpolated unchecked into a GraphQL query string
     # (#218 pattern sweep).
     _WHERE_OPERATORS = frozenset({"Equal", "ContainsAny", "ContainsAll"})
+
+    @staticmethod
+    def _validate_tag_filters(
+        workspace_id: str, filters: dict[str, str | list[str]] | None
+    ) -> None:
+        """Validate `filters` against the workspace's bound vertical pack.
+
+        No filters given -> no-op (the overwhelming majority of requests,
+        completely unaffected). Filters given but the workspace has no pack
+        bound, or a filter names a field the pack's tag schema doesn't
+        declare -> ``TagFilterError`` (see its docstring).
+        """
+        if not filters:
+            return
+        vertical = resolve_workspace_pack(workspace_id)
+        if vertical is None:
+            raise TagFilterError(
+                "search filters require the workspace to be bound to a vertical pack; "
+                "this workspace has none"
+            )
+        unknown = set(filters) - set(vertical.tags.fields)
+        if unknown:
+            raise TagFilterError(
+                f"unknown filter field(s) {sorted(unknown)}; "
+                f"this pack's tag schema declares {sorted(vertical.tags.fields)}"
+            )
+
+    @staticmethod
+    def _tag_filter_operands(filters: dict[str, str | list[str]] | None) -> list[str]:
+        """Render `filters` as Weaviate `where` operand strings on the `tags`
+        TEXT_ARRAY property (inherent#390 item 5's recommended representation:
+        "field=value" strings). One operand per field (ANDed together by the
+        caller); within a field, any of its given values matches (ContainsAny).
+        Assumes `_validate_tag_filters` already ran -- this never itself checks
+        field names against a schema.
+        """
+        operands = []
+        for field, value in (filters or {}).items():
+            values = value if isinstance(value, list) else [value]
+            wanted = [f"{field}={v}" for v in values]
+            operands.append(SearchService._format_where(["tags"], "ContainsAny", wanted))
+        return operands
 
     @staticmethod
     def _format_where(path: list[str], operator: str, value: str | list[str]) -> str:

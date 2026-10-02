@@ -10,9 +10,11 @@ from typing import Any
 import structlog
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     Column,
     DateTime,
     Engine,
+    Float,
     ForeignKey,
     Index,
     Integer,
@@ -222,6 +224,9 @@ class DatabaseService:
             Column("document_id", String(100), nullable=False, unique=True),
             Column("workspace_id", String(100), nullable=False),
             Column("user_id", String(100), nullable=False),
+            # Who actually uploaded (prime#331, migration 025); user_id is the
+            # workspace owner's tenant. Nullable: older rows have none.
+            Column("uploaded_by", String(100), nullable=True),
             Column("tenant_id", BigInteger, nullable=True),  # New: tenant reference
             Column("filename", String(500), nullable=False),
             Column("original_filename", String(500), nullable=False),
@@ -231,6 +236,11 @@ class DatabaseService:
             Column("storage_path", String(1000), nullable=False),
             Column("storage_bucket", String(255), nullable=True),
             Column("storage_url", String(2000), nullable=True),
+            # Source link (inherent#391, migration 021): the connector's link
+            # back to the ORIGINAL file in its source system (e.g. a Drive
+            # webViewLink). Distinct from storage_url above, which points at
+            # THIS engine's own stored copy. Nullable/additive.
+            Column("source_url", String(2000), nullable=True),
             Column("status", String(20), nullable=False, default="pending"),
             Column("error_message", Text, nullable=True),
             Column("chunk_count", Integer, default=0),
@@ -316,6 +326,10 @@ class DatabaseService:
             # Provenance (#41): nullable, additive. See migration 008.
             Column("content_hash", String(64), nullable=True),
             Column("source_uri", String(2000), nullable=True),
+            # Source link (inherent#391, migration 021): same shape/rationale
+            # as processed_documents.source_url above, denormalized onto each
+            # chunk so search results can carry it without a document join.
+            Column("source_url", String(2000), nullable=True),
             Column(
                 "created_at",
                 DateTime(timezone=True),
@@ -331,6 +345,15 @@ class DatabaseService:
                 nullable=True,
                 default=lambda: datetime.now(UTC),
             ),
+            # Usage-based ranking boost (inherent#394, migration 024): how many
+            # times this chunk's content has been detected as reused in a
+            # NEWER document in this same workspace (see
+            # src/services/reuse_detection.py). Defaults to 0 -- unreused
+            # until a later ingest says otherwise. Mirrored onto the Weaviate
+            # object so the public API's ranking boost reads it without a DB
+            # join (see weaviate.py's `reuse_count` property).
+            Column("reuse_count", Integer, nullable=False, default=0),
+            Column("last_reused_at", DateTime(timezone=True), nullable=True),
             UniqueConstraint(
                 "processed_document_id", "chunk_index", name="uq_document_chunks_doc_idx"
             ),
@@ -338,6 +361,40 @@ class DatabaseService:
             Index("idx_document_chunks_workspace_id", "workspace_id"),
             Index("idx_document_chunks_tenant_id", "tenant_id"),
             Index("idx_document_chunks_processed_document_id", "processed_document_id"),
+        )
+
+        # Chunk reuse events (inherent#394, migration 024): idempotency ledger
+        # for the reuse-detection step. One row per (source_chunk, reusing
+        # document, reusing chunk's CURRENT content) triple -- see the
+        # migration file for the full dedupe-key rationale.
+        self.chunk_reuse_events = Table(
+            "chunk_reuse_events",
+            self.metadata,
+            Column("id", BigInteger, primary_key=True, autoincrement=True),
+            Column(
+                "source_chunk_id",
+                BigInteger,
+                ForeignKey("document_chunks.id", ondelete="CASCADE"),
+                nullable=False,
+            ),
+            Column("reusing_document_id", String(100), nullable=False),
+            Column("reusing_chunk_content_hash", String(64), nullable=False),
+            Column("workspace_id", String(100), nullable=False),
+            Column("similarity", Float, nullable=False),
+            Column(
+                "created_at",
+                DateTime(timezone=True),
+                nullable=False,
+                default=lambda: datetime.now(UTC),
+            ),
+            UniqueConstraint(
+                "source_chunk_id",
+                "reusing_document_id",
+                "reusing_chunk_content_hash",
+                name="uq_chunk_reuse_dedupe",
+            ),
+            Index("idx_chunk_reuse_events_source_chunk", "source_chunk_id"),
+            Index("idx_chunk_reuse_events_workspace_id", "workspace_id"),
         )
 
         # Ingestion events table: Data lineage / audit trail for pipeline steps
@@ -477,6 +534,67 @@ class DatabaseService:
             Index("idx_redaction_audit_turn_id", "turn_id"),
             Index("idx_redaction_audit_workflow_run_id", "workflow_run_id"),
             Index("idx_redaction_audit_document_id", "document_id"),
+        )
+
+        # Workspace purge state (inherent#395, migration 023): the gate
+        # `ensure_workspace_ready` checks before letting new documents into a
+        # workspace, and the marker PurgeWorkspaceWorkflow's steps use to
+        # know a workspace is off-limits for new ingest while the purge is
+        # in flight. Lives in its own table (not a column on
+        # workspace_metadata) because the purge deletes that row outright
+        # (see delete_workspace_data) -- purge state has to outlive it.
+        self.workspace_purge_state = Table(
+            "workspace_purge_state",
+            self.metadata,
+            Column("workspace_id", String(100), primary_key=True),
+            Column("status", String(20), nullable=False, default="purging"),
+            Column(
+                "requested_at",
+                DateTime(timezone=True),
+                nullable=False,
+                server_default=func.now(),
+            ),
+            Column(
+                "updated_at",
+                DateTime(timezone=True),
+                nullable=False,
+                server_default=func.now(),
+                onupdate=func.now(),
+            ),
+        )
+
+        # Durable purge receipts (inherent#395): per-store row COUNTS only
+        # (before/after), never document content -- proof a data-deletion
+        # commitment was honored. Keyed by the purge workflow id so
+        # re-recording the SAME run's receipt is an idempotent upsert.
+        self.workspace_purge_receipts = Table(
+            "workspace_purge_receipts",
+            self.metadata,
+            Column("purge_workflow_id", String(255), primary_key=True),
+            Column("workspace_id", String(100), nullable=False),
+            Column("operator", String(255), nullable=False),
+            Column("retain_audit_logs", Boolean, nullable=False, default=False),
+            Column("counts_before", JSONB, nullable=False, default={}),
+            Column("counts_after", JSONB, nullable=False, default={}),
+            Column("verified", Boolean, nullable=False, default=False),
+            Column(
+                "requested_at",
+                DateTime(timezone=True),
+                nullable=False,
+                server_default=func.now(),
+            ),
+            Column("completed_at", DateTime(timezone=True), nullable=True),
+            Column(
+                "created_at",
+                DateTime(timezone=True),
+                nullable=False,
+                server_default=func.now(),
+            ),
+            Index(
+                "idx_workspace_purge_receipts_workspace_id",
+                "workspace_id",
+                "created_at",
+            ),
         )
 
     def connect(self) -> None:
@@ -987,6 +1105,7 @@ class DatabaseService:
                     "document_id": message.document_id,
                     "workspace_id": message.workspace_id,
                     "user_id": message.user_id,
+                    "uploaded_by": message.uploaded_by,
                     "tenant_id": tenant_id,
                     "filename": message.filename,
                     "original_filename": message.original_filename,
@@ -1007,6 +1126,9 @@ class DatabaseService:
                     "storage_path": message.storage_path,
                     "storage_bucket": message.storage_bucket,
                     "storage_url": message.storage_url,
+                    # Source link (inherent#391): insert-only, same as
+                    # storage_url above -- not re-asserted in update_set.
+                    "source_url": message.source_url,
                     "status": DocumentStatus.PROCESSED.value,
                     # append (retry-idempotency follow-up): 0, not
                     # len(chunks)/text_length -- for append, the dedicated
@@ -1176,6 +1298,10 @@ class DatabaseService:
                     # source bytes live. Prefer the storage_path, fall back to a
                     # remote storage_url; NULL when neither is known.
                     source_uri = message.storage_path or message.storage_url
+                    # Source link (inherent#391): no fallback -- unlike
+                    # source_uri, there is no internal substitute for a
+                    # connector-supplied original-file link.
+                    source_url = message.source_url
 
                     # append (#306, retry-idempotency follow-up): `chunk.
                     # chunk_index` is used VERBATIM, never renumbered here --
@@ -1240,6 +1366,7 @@ class DatabaseService:
                                 chunk.content.encode("utf-8")
                             ).hexdigest(),
                             "source_uri": source_uri,
+                            "source_url": source_url,
                             "created_at": now,
                             # Freshness (#42): stamp ingest time so the API can age
                             # returned evidence. On re-ingestion (refresh path) the
@@ -1418,6 +1545,7 @@ class DatabaseService:
         workflow_start_time: datetime,
         storage_bucket: str | None = None,
         storage_url: str | None = None,
+        uploaded_by: str | None = None,
     ) -> bool:
         """Create a minimal 'processing' processed_documents row up front (#10)
         AND claim the fencing token for this workflow run (#110).
@@ -1467,6 +1595,7 @@ class DatabaseService:
                     document_id=document_id,
                     workspace_id=workspace_id,
                     user_id=user_id,
+                    uploaded_by=uploaded_by,
                     filename=filename,
                     original_filename=original_filename,
                     content_type=content_type,
@@ -1741,6 +1870,111 @@ class DatabaseService:
             ).first()
             return row is not None
 
+    async def get_chunk_for_reuse(
+        self, document_id: str, chunk_index: int
+    ) -> dict[str, Any] | None:
+        """Look up a chunk's identity for reuse bookkeeping (inherent#394).
+
+        Called with the (document_id, chunk_index) of a candidate SOURCE
+        chunk a reuse-detection near-object query just matched, to resolve
+        it to the Postgres row ``record_chunk_reuse`` needs to update.
+        Returns ``None`` when no such row exists (e.g. the matched Weaviate
+        object is stale relative to Postgres -- best-effort, the caller
+        simply skips it).
+        """
+        if not self.engine:
+            raise RuntimeError("Database not connected")
+
+        with self.get_session() as session:
+            row = session.execute(
+                select(
+                    self.document_chunks.c.id,
+                    self.document_chunks.c.reuse_count,
+                ).where(
+                    self.document_chunks.c.document_id == document_id,
+                    self.document_chunks.c.chunk_index == chunk_index,
+                )
+            ).first()
+            if row is None:
+                return None
+            return {"id": row[0], "reuse_count": row[1]}
+
+    async def record_chunk_reuse(
+        self,
+        *,
+        source_chunk_id: int,
+        reusing_document_id: str,
+        reusing_chunk_content_hash: str,
+        workspace_id: str,
+        similarity: float,
+    ) -> int | None:
+        """Idempotently record one reuse event and bump reuse_count (inherent#394).
+
+        Dedupe key: ``(source_chunk_id, reusing_document_id,
+        reusing_chunk_content_hash)`` -- see migration 024's docstring. A
+        second call with the SAME triple (e.g. re-ingesting an unchanged
+        document) hits ``ON CONFLICT DO NOTHING``: no new event row, no
+        double increment, and this returns ``None`` so the caller knows to
+        skip re-patching Weaviate too. A genuinely NEW triple (first time
+        this source chunk is reused by this document at this content, or a
+        previously-reused chunk edited to a new content_hash) inserts a row
+        and atomically increments ``document_chunks.reuse_count`` in the
+        same call, returning the chunk's new count.
+
+        The increment (``reuse_count = reuse_count + 1``) happens in SQL, on
+        the SAME row the just-inserted event references, so two concurrent
+        reuse detections for two different reusing documents both land
+        correctly instead of racing a read-modify-write in Python.
+        """
+        if not self.engine:
+            raise RuntimeError("Database not connected")
+
+        with self.get_session() as session:
+            insert_result = session.execute(
+                pg_insert(self.chunk_reuse_events)
+                .values(
+                    source_chunk_id=source_chunk_id,
+                    reusing_document_id=reusing_document_id,
+                    reusing_chunk_content_hash=reusing_chunk_content_hash,
+                    workspace_id=workspace_id,
+                    similarity=similarity,
+                )
+                .on_conflict_do_nothing(
+                    index_elements=[
+                        "source_chunk_id",
+                        "reusing_document_id",
+                        "reusing_chunk_content_hash",
+                    ]
+                )
+            )
+            if (insert_result.rowcount or 0) == 0:
+                # Already recorded for this exact (source, reusing document,
+                # content) triple -- idempotent no-op, matching #394's
+                # "re-ingesting the same unchanged document must not
+                # double-count" requirement.
+                return None
+
+            now = datetime.now(UTC)
+            update_result = session.execute(
+                self.document_chunks.update()
+                .where(self.document_chunks.c.id == source_chunk_id)
+                .values(
+                    reuse_count=self.document_chunks.c.reuse_count + 1,
+                    last_reused_at=now,
+                )
+                .returning(self.document_chunks.c.reuse_count)
+            )
+            row = update_result.first()
+            new_count = int(row[0]) if row is not None else None
+            logger.info(
+                "Recorded chunk reuse",
+                source_chunk_id=source_chunk_id,
+                reusing_document_id=reusing_document_id,
+                workspace_id=workspace_id,
+                new_reuse_count=new_count,
+            )
+            return new_count
+
     async def get_document_chunks(
         self,
         document_id: str,
@@ -1889,6 +2123,303 @@ class DatabaseService:
                 )
 
             return int(count)  # type: ignore[arg-type]
+
+    # =========================================================================
+    # Workspace Purge (inherent#395)
+    #
+    # Everything below supports the operator-triggered PurgeWorkspaceWorkflow:
+    # the purge-state gate, deletes for the per-workspace tables that
+    # `delete_workspace_data`/`delete_workspace_documents` above do NOT
+    # touch (they only ever covered processed_documents + its cascaded
+    # document_chunks), a residue count for the verification report, and the
+    # durable receipt. Every delete is a plain `WHERE workspace_id = ...`
+    # statement, so re-running it after it already deleted everything just
+    # deletes zero rows -- idempotent by construction, no extra bookkeeping
+    # needed.
+    # =========================================================================
+
+    async def set_workspace_purge_status(self, workspace_id: str, status: str) -> None:
+        """Upsert this workspace's purge marker (idempotent: same status twice is a no-op write).
+
+        Args:
+            workspace_id: The workspace being purged.
+            status: 'purging' (blocks new ingest, purge in progress) or
+                'purged' (terminal -- purge completed and verified).
+        """
+        if not self.engine:
+            raise RuntimeError("Database not connected")
+
+        if status not in ("purging", "purged"):
+            raise ValueError(f"Invalid purge status: {status!r}")
+
+        with self.get_session() as session:
+            stmt = pg_insert(self.workspace_purge_state).values(
+                workspace_id=workspace_id,
+                status=status,
+            )
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["workspace_id"],
+                set_={"status": status, "updated_at": func.now()},
+            )
+            session.execute(stmt)
+
+        logger.info("Set workspace purge status", workspace_id=workspace_id, status=status)
+
+    async def get_workspace_purge_status(self, workspace_id: str) -> str | None:
+        """Return this workspace's purge status, or None if it has never been purged."""
+        if not self.engine:
+            raise RuntimeError("Database not connected")
+
+        with self.get_session() as session:
+            row = session.execute(
+                select(self.workspace_purge_state.c.status).where(
+                    self.workspace_purge_state.c.workspace_id == workspace_id
+                )
+            ).first()
+            return row[0] if row else None
+
+    async def get_in_flight_document_ids(self, workspace_id: str) -> list[str]:
+        """Document ids in this workspace still mid-ingestion (pending/processing).
+
+        Used by the purge workflow to cancel the corresponding Temporal
+        ingestion workflows (workflow id ``f"ingest-{document_id}"``) before
+        deleting any data, so a slow in-flight run can't write a document
+        back in after the purge has already counted it as gone.
+        """
+        if not self.engine:
+            raise RuntimeError("Database not connected")
+
+        with self.get_session() as session:
+            rows = session.execute(
+                select(self.processed_documents.c.document_id).where(
+                    self.processed_documents.c.workspace_id == workspace_id,
+                    self.processed_documents.c.status.in_(
+                        [DocumentStatus.PENDING.value, DocumentStatus.PROCESSING.value]
+                    ),
+                )
+            ).all()
+            return [r[0] for r in rows]
+
+    async def delete_workspace_side_tables(self, workspace_id: str) -> dict[str, int]:
+        """Delete the per-workspace Postgres rows outside processed_documents/chunks.
+
+        These tables have no FK cascade from processed_documents (unlike
+        document_chunks), so `delete_workspace_data` never touched them:
+        dead_letter_jobs, ingestion_events, redaction_audit, and the
+        workspace_stats_ledger idempotency ledger. Returns the count deleted
+        per table.
+        """
+        if not self.engine:
+            raise RuntimeError("Database not connected")
+
+        deleted: dict[str, int] = {}
+        with self.get_session() as session:
+            for table in (
+                self.dead_letter_jobs,
+                self.ingestion_events,
+                self.redaction_audit,
+                self.workspace_stats_ledger,
+            ):
+                result = session.execute(table.delete().where(table.c.workspace_id == workspace_id))
+                deleted[table.name] = int(result.rowcount)  # type: ignore[arg-type]
+
+        logger.info("Deleted workspace side tables", workspace_id=workspace_id, **deleted)
+        return deleted
+
+    # eval_query_events/eval_feedback/eval_cases/eval_runs (eval_run_results
+    # cascades from eval_runs) are owned/written by inh-public-api-svc's
+    # eval_capture.py, but they live in this SAME Postgres database (see
+    # migration 015's own comment: "Workspace deletion must delete eval rows
+    # by workspace_id, app-level, like the other per-workspace tables").
+    # There is no SQLAlchemy Table object for them here (nothing in
+    # inh-ingestion-svc reads/writes eval rows outside this purge), so these
+    # are plain `text()` deletes by table name rather than duplicating
+    # public-api's ORM models into this service.
+    _EVAL_TABLES = ("eval_query_events", "eval_feedback", "eval_cases", "eval_runs")
+
+    async def delete_workspace_eval_data(self, workspace_id: str) -> dict[str, int]:
+        """Delete this workspace's rows from the (public-api-owned) eval tables."""
+        if not self.engine:
+            raise RuntimeError("Database not connected")
+
+        deleted: dict[str, int] = {}
+        with self.get_session() as session:
+            for table_name in self._EVAL_TABLES:
+                result = session.execute(
+                    # table_name comes only from the _EVAL_TABLES allowlist and
+                    # workspace_id is bound, so nothing untrusted is interpolated.
+                    text(
+                        f"DELETE FROM {table_name} WHERE workspace_id = :workspace_id"  # nosec B608
+                    ),  # noqa: S608
+                    {"workspace_id": workspace_id},
+                )
+                deleted[table_name] = int(result.rowcount)  # type: ignore[arg-type]
+
+        logger.info("Deleted workspace eval data", workspace_id=workspace_id, **deleted)
+        return deleted
+
+    async def revoke_workspace_api_keys(self, workspace_id: str) -> int:
+        """Revoke (not delete) every active API key scoped to this workspace.
+
+        Purge REVOKES rather than deletes keys: a revoked key still lets an
+        operator see who had access to a now-purged workspace and when it
+        was cut off (audit value), and `verify_api_key`/key lookups already
+        treat status != 'active' as unusable, so revoking is sufficient to
+        stop all further use. Returns the number of keys revoked.
+        """
+        if not self.engine:
+            raise RuntimeError("Database not connected")
+
+        with self.get_session() as session:
+            result = session.execute(
+                self.api_keys.update()
+                .where(
+                    self.api_keys.c.workspace_id == workspace_id,
+                    self.api_keys.c.status == "active",
+                )
+                .values(status="revoked", updated_at=func.now())
+            )
+            count = int(result.rowcount)  # type: ignore[arg-type]
+
+        logger.info("Revoked workspace API keys", workspace_id=workspace_id, count=count)
+        return count
+
+    async def count_workspace_residue(self, workspace_id: str) -> dict[str, int]:
+        """Count remaining rows per Postgres store for this workspace.
+
+        Zero everywhere means Postgres holds nothing left for this
+        workspace. Used both BEFORE a purge (the receipt's `counts_before`)
+        and AFTER (`counts_after` / the verification report).
+        """
+        if not self.engine:
+            raise RuntimeError("Database not connected")
+
+        counts: dict[str, int] = {}
+        with self.get_session() as session:
+            for table in (
+                self.workspace_metadata,
+                self.processed_documents,
+                self.document_chunks,
+                self.dead_letter_jobs,
+                self.ingestion_events,
+                self.redaction_audit,
+                self.workspace_stats_ledger,
+            ):
+                counts[table.name] = int(
+                    session.execute(
+                        select(func.count())
+                        .select_from(table)
+                        .where(table.c.workspace_id == workspace_id)
+                    ).scalar_one()
+                )
+
+            counts["api_keys_active"] = int(
+                session.execute(
+                    select(func.count())
+                    .select_from(self.api_keys)
+                    .where(
+                        self.api_keys.c.workspace_id == workspace_id,
+                        self.api_keys.c.status == "active",
+                    )
+                ).scalar_one()
+            )
+
+            for table_name in self._EVAL_TABLES:
+                counts[table_name] = int(
+                    session.execute(
+                        # Allowlisted table_name, bound workspace_id (see above).
+                        text(
+                            f"SELECT COUNT(*) FROM {table_name} WHERE workspace_id = :workspace_id"  # nosec B608
+                        ),  # noqa: S608
+                        {"workspace_id": workspace_id},
+                    ).scalar_one()
+                )
+
+        return counts
+
+    async def record_purge_receipt(
+        self,
+        purge_workflow_id: str,
+        workspace_id: str,
+        operator: str,
+        retain_audit_logs: bool,
+        counts_before: dict[str, int],
+        counts_after: dict[str, int],
+        verified: bool,
+    ) -> None:
+        """Upsert the durable purge receipt for one purge run (idempotent by purge_workflow_id).
+
+        Content-free by construction: every value here is either an
+        identifier/flag or a per-store integer count, never document text.
+        """
+        if not self.engine:
+            raise RuntimeError("Database not connected")
+
+        with self.get_session() as session:
+            stmt = pg_insert(self.workspace_purge_receipts).values(
+                purge_workflow_id=purge_workflow_id,
+                workspace_id=workspace_id,
+                operator=operator,
+                retain_audit_logs=retain_audit_logs,
+                counts_before=counts_before,
+                counts_after=counts_after,
+                verified=verified,
+                completed_at=func.now(),
+            )
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["purge_workflow_id"],
+                set_={
+                    "counts_before": counts_before,
+                    "counts_after": counts_after,
+                    "verified": verified,
+                    "completed_at": func.now(),
+                },
+            )
+            session.execute(stmt)
+
+        logger.info(
+            "Recorded workspace purge receipt",
+            purge_workflow_id=purge_workflow_id,
+            workspace_id=workspace_id,
+            verified=verified,
+        )
+
+    async def get_purge_receipt(self, workspace_id: str) -> dict[str, Any] | None:
+        """Return the most recent purge receipt for a workspace, or None."""
+        if not self.engine:
+            raise RuntimeError("Database not connected")
+
+        with self.get_session() as session:
+            row = (
+                session.execute(
+                    select(self.workspace_purge_receipts)
+                    .where(self.workspace_purge_receipts.c.workspace_id == workspace_id)
+                    .order_by(self.workspace_purge_receipts.c.created_at.desc())
+                    .limit(1)
+                )
+                .mappings()
+                .first()
+            )
+            return dict(row) if row else None
+
+    async def get_purge_receipt_by_workflow_id(
+        self, purge_workflow_id: str
+    ) -> dict[str, Any] | None:
+        """Return the purge receipt for a specific purge workflow run, or None."""
+        if not self.engine:
+            raise RuntimeError("Database not connected")
+
+        with self.get_session() as session:
+            row = (
+                session.execute(
+                    select(self.workspace_purge_receipts).where(
+                        self.workspace_purge_receipts.c.purge_workflow_id == purge_workflow_id
+                    )
+                )
+                .mappings()
+                .first()
+            )
+            return dict(row) if row else None
 
     async def get_processing_stats(self, workspace_id: str) -> dict[str, Any]:
         """Get processing statistics, always scoped to a workspace.

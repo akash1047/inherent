@@ -16,6 +16,7 @@ from typing import Literal
 import structlog
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse
+from inh_contracts.source_url import sanitize_source_url
 from pydantic import BaseModel, Field
 from temporalio.client import Client, WorkflowFailureError
 from temporalio.exceptions import TerminatedError, WorkflowAlreadyStartedError
@@ -31,15 +32,22 @@ from src.api.ownership import (
 from src.config.settings import Settings
 from src.services.database import DatabaseService
 from src.services.metrics import get_metrics
+from src.services.tenant_owner import resolve_tenant_user_id
 from src.temporal.models import (
     ChunkEditInput,
     ChunkEditResult,
     DocumentIngestionInput,
+    PurgeWorkspaceInput,
+    PurgeWorkspaceResult,
     WorkflowResult,
 )
 from src.temporal.trigger import build_ingestion_source_memo
 from src.temporal.worker import TemporalWorkerManager
-from src.temporal.workflows import ChunkEditWorkflow, DocumentIngestionWorkflow
+from src.temporal.workflows import (
+    ChunkEditWorkflow,
+    DocumentIngestionWorkflow,
+    PurgeWorkspaceWorkflow,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -83,6 +91,14 @@ class IngestRequest(BaseModel):
     storage_path: str = Field(..., min_length=1, description="Path to file in storage")
     storage_bucket: str | None = Field(None, description="Storage bucket name")
     storage_url: str | None = Field(None, description="Direct URL to the file")
+    # Source link (inherent#391): the caller's link back to the ORIGINAL file
+    # in its source system (e.g. a Drive webViewLink) — distinct from
+    # storage_url above, which points at THIS engine's own stored copy.
+    # Sanitized (http/https only, see inh_contracts.source_url) at the route
+    # below before it ever reaches DocumentIngestionInput.
+    source_url: str | None = Field(
+        None, description="Link to the original file in its source system, if any"
+    )
 
     model_config = {
         "json_schema_extra": {
@@ -168,6 +184,46 @@ class HealthResponse(BaseModel):
     status: Literal["healthy", "degraded"]
     temporal_worker: bool
     version: str
+
+
+class PurgeWorkspaceRequest(BaseModel):
+    """Body for POST /admin/workspaces/{workspace_id}/purge (inherent#395)."""
+
+    operator: str = Field(
+        ..., min_length=1, description="Who requested this purge, for the receipt"
+    )
+    retain_audit_logs: bool = Field(
+        False,
+        description=(
+            "Skip deleting Mongo audit logs for this workspace. Default False "
+            "(purge) -- the data-deletion commitment this endpoint exists for "
+            "names 'index and logs' explicitly; set True only for a "
+            "retention requirement that outlives the workspace."
+        ),
+    )
+
+
+class PurgeWorkspaceAcceptedResponse(BaseModel):
+    """202 response: the purge has started, poll GET for the report."""
+
+    purge_workflow_id: str
+    workspace_id: str
+
+
+class PurgeWorkspaceReportResponse(BaseModel):
+    """GET /admin/workspaces/{workspace_id}/purge/{purge_workflow_id}: status + verification report.
+
+    ``residue``/``verified``/``receipt`` are only populated once the purge
+    workflow has completed -- while it is still running, ``status`` is
+    ``"purging"`` and those fields are ``None``.
+    """
+
+    purge_workflow_id: str
+    workspace_id: str
+    status: Literal["purging", "completed", "not_found"]
+    residue: dict[str, int] | None = None
+    verified: bool | None = None
+    receipt: dict[str, object] | None = None
 
 
 # =============================================================================
@@ -326,10 +382,13 @@ def create_app(settings: Settings) -> FastAPI:
         # this module already follow (see ownership.py).
         workspace_id = require_storage_path_workspace_prefix(body.storage_path, body.workspace_id)
 
+        # Tenant = the workspace owner; the body's user is the uploader
+        # (prime#331, see src/services/tenant_owner.py).
         workflow_input = DocumentIngestionInput(
             document_id=body.document_id,
             workspace_id=workspace_id,
-            user_id=body.user_id,
+            user_id=await resolve_tenant_user_id(settings, workspace_id, body.user_id),
+            uploaded_by=body.user_id,
             filename=body.filename,
             original_filename=body.original_filename,
             content_type=body.content_type,
@@ -338,7 +397,16 @@ def create_app(settings: Settings) -> FastAPI:
             storage_path=body.storage_path,
             storage_bucket=body.storage_bucket,
             storage_url=body.storage_url,
+            # Source link (inherent#391): sanitized here, once, at the
+            # boundary — never an error, a bad value just becomes None.
+            source_url=sanitize_source_url(body.source_url),
             timestamp=datetime.now(UTC).isoformat(),
+            # Vertical pack binding (inherent#390 follow-up): resolved HERE,
+            # in plain application code, from the operator-configured
+            # WORKSPACE_VERTICAL_PACKS mapping -- never inside the workflow
+            # (Temporal determinism, #38). None (unmapped workspace) is the
+            # pre-existing, unaffected default.
+            vertical_pack=settings.workspace_vertical_packs.get(workspace_id),
         )
 
         workflow_id = f"ingest-{body.document_id}"
@@ -992,4 +1060,116 @@ def create_app(settings: Settings) -> FastAPI:
         return {"abandoned": True, "job_id": job_id}
 
     app.include_router(dl_router)
+
+    # ------------------------------------------------------------------
+    # Admin purge route (protected, inherent#395)
+    # ------------------------------------------------------------------
+    #
+    # Auth: gated by the SAME `verify_api_key` dependency as every other
+    # mutating route in this file -- the shared INGESTION_API_KEY is
+    # already this service's internal/operator secret (no per-tenant
+    # customer ever holds it; public-api-svc holds it to call ingestion
+    # service-to-service). Deliberately not a new auth mechanism -- the
+    # issue asks to reuse the existing admin/operator pattern, not invent
+    # a second, weaker one.
+
+    admin_router = APIRouter(
+        prefix="/admin/workspaces",
+        tags=["admin"],
+        dependencies=[Depends(verify_api_key)],
+    )
+
+    @admin_router.post(
+        "/{workspace_id}/purge",
+        status_code=202,
+        response_model=PurgeWorkspaceAcceptedResponse,
+    )
+    async def purge_workspace(
+        workspace_id: str,
+        body: PurgeWorkspaceRequest,
+        request: Request,
+    ):
+        """Start (or resume) an idempotent full purge of every store's data for this workspace.
+
+        Deterministic workflow id (``purge-{workspace_id}``): calling this
+        twice for the same workspace while a purge is already running
+        resumes/attaches to that SAME run rather than starting a second,
+        overlapping one -- a `WorkflowAlreadyStartedError` on the retry is
+        swallowed and the existing job id returned, matching the "idempotent
+        trigger" requirement.
+        """
+        client: Client = request.app.state.temporal_client
+        settings: Settings = request.app.state.settings
+
+        purge_workflow_id = f"purge-{workspace_id}"
+        try:
+            await client.start_workflow(
+                PurgeWorkspaceWorkflow.run,
+                PurgeWorkspaceInput(
+                    workspace_id=workspace_id,
+                    operator=body.operator,
+                    retain_audit_logs=body.retain_audit_logs,
+                ),
+                id=purge_workflow_id,
+                task_queue=settings.temporal_task_queue,
+            )
+        except WorkflowAlreadyStartedError:
+            logger.info(
+                "Purge already running/completed for workspace; returning existing job",
+                workspace_id=workspace_id,
+                purge_workflow_id=purge_workflow_id,
+            )
+
+        return PurgeWorkspaceAcceptedResponse(
+            purge_workflow_id=purge_workflow_id, workspace_id=workspace_id
+        )
+
+    @admin_router.get(
+        "/{workspace_id}/purge/{purge_workflow_id}",
+        response_model=PurgeWorkspaceReportResponse,
+    )
+    async def get_purge_status(
+        workspace_id: str,
+        purge_workflow_id: str,
+        request: Request,
+    ):
+        """Poll a purge job's status; once completed, returns the verification report + receipt."""
+        from src.temporal import shared_services
+
+        client: Client = request.app.state.temporal_client
+
+        try:
+            # result_type: without it Temporal decodes the dataclass result to a
+            # plain dict and `result.residue` below raises (HTTP 500).
+            handle = client.get_workflow_handle(purge_workflow_id, result_type=PurgeWorkspaceResult)
+            description = await handle.describe()
+        except RPCError:
+            return PurgeWorkspaceReportResponse(
+                purge_workflow_id=purge_workflow_id,
+                workspace_id=workspace_id,
+                status="not_found",
+            )
+
+        if description.status is None or description.status.name != "COMPLETED":
+            return PurgeWorkspaceReportResponse(
+                purge_workflow_id=purge_workflow_id,
+                workspace_id=workspace_id,
+                status="purging",
+            )
+
+        result = await handle.result()
+        db_svc = shared_services.get_db_service()
+        receipt = await db_svc.get_purge_receipt_by_workflow_id(purge_workflow_id)
+
+        return PurgeWorkspaceReportResponse(
+            purge_workflow_id=purge_workflow_id,
+            workspace_id=workspace_id,
+            status="completed",
+            residue=result.residue,
+            verified=result.verified,
+            receipt=receipt,
+        )
+
+    app.include_router(admin_router)
+
     return app

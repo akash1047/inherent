@@ -32,6 +32,20 @@ class SearchRequest(BaseModel):
         default=None, description="Filter to specific document IDs"
     )
 
+    # Vertical pack tag filters (inherent#390 item 5): field -> one value or
+    # a list of values (any-of). Combinable with document_ids (both apply,
+    # ANDed). Only valid for a workspace bound to a vertical pack -- the
+    # search service validates field names against that pack's tag schema
+    # and returns a 400 for an unknown field or for a workspace with no pack
+    # bound at all (see SearchService._resolve_tag_filters).
+    filters: dict[str, str | list[str]] | None = Field(
+        default=None,
+        description=(
+            "Vertical pack tag filters: {field: value} or {field: [values]} "
+            "(any-of). Requires the workspace to be bound to a vertical pack."
+        ),
+    )
+
     # Context window (PM-S019)
     include_context: bool = Field(
         default=False,
@@ -57,11 +71,19 @@ class SearchRequest(BaseModel):
         default="semantic",
         description="Retrieval strategy: semantic (nearText), hybrid (BM25+vector), or keyword (BM25)",
     )
-    alpha: float = Field(
-        default=0.7,
+    # alpha (inherent#391 follow-up): default is None, not a fixed float, so
+    # SearchService can tell "caller didn't set this" apart from "caller
+    # explicitly asked for 0.7" -- only the former falls back to a per-
+    # workspace configured default (WORKSPACE_HYBRID_ALPHA); an explicit
+    # request value always wins. See SearchService.search's alpha
+    # resolution and DEFAULT_HYBRID_ALPHA for the global fallback (0.7,
+    # unchanged from before this existed).
+    alpha: float | None = Field(
+        default=None,
         ge=0.0,
         le=1.0,
-        description="Hybrid fusion weight (1.0=vector-heavy, 0.0=keyword-heavy); ignored unless search_mode=hybrid",
+        description="Hybrid fusion weight (1.0=vector-heavy, 0.0=keyword-heavy); ignored unless "
+        "search_mode=hybrid. Omit to use the workspace's configured default (falls back to 0.7).",
     )
 
 
@@ -108,6 +130,13 @@ class SearchResult(BaseModel):
     content_hash: str | None = None
     source_uri: str | None = None
 
+    # Source link (inherent#391) — optional, backward-compatible. The URL of
+    # the ORIGINAL file in whatever system uploaded it (e.g. a Drive
+    # webViewLink), supplied by the connector at upload time. Distinct from
+    # source_uri above, which is THIS engine's own stored copy. None for
+    # every upload with no connector-supplied link (the vast majority).
+    source_url: str | None = None
+
     # Freshness (#42) — optional, backward-compatible. Promoted from the chunk
     # so callers can age returned evidence:
     #   ingested_at — when the chunk was (re)ingested (None if unknown)
@@ -126,6 +155,24 @@ class SearchResult(BaseModel):
     #   content_risk_reasons — matched heuristic reason codes (None if unknown)
     content_risk: str | None = None
     content_risk_reasons: list[str] | None = None
+
+    # Vertical pack tags (inherent#390 item 4/5) — optional, backward-
+    # compatible. Parsed from Weaviate's "field=value" TEXT_ARRAY property
+    # into {field: value}; None for every chunk with no pack tags (the vast
+    # majority, unchanged).
+    tags: dict[str, str] | None = None
+
+    # Usage-based ranking boost (inherent#394) — optional, backward-
+    # compatible. How many times this chunk's content has been detected as
+    # reused (near-duplicated) in a newer document in this same workspace
+    # (see inh-ingestion-svc's reuse_detection.py). 0 for every chunk never
+    # detected as reused (the vast majority, unchanged). ``score`` above is
+    # ALREADY boosted by this value when the workspace has a
+    # ``WORKSPACE_REUSE_BOOST`` weight configured (see
+    # ``SearchService._apply_reuse_boost``) -- this field is exposed purely
+    # for transparency/debugging, the same way ``bm25_score``/
+    # ``vector_similarity`` expose the OTHER signals that produced ``score``.
+    reuse_count: int = 0
 
     # Claim-level citation (#39) — optional, backward-compatible. Built from this
     # result's own fields (chunk_id + spans + score + provenance + freshness) so
