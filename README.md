@@ -35,6 +35,12 @@ You connect sources (text, Markdown, PDF, DOCX, source code, and
 them, then serves cited retrieval over REST and MCP. Self-host it in your own
 VPC or run it locally with one command.
 
+<p align="center">
+  <video src="docs/imgs/inherent-demo.mp4" controls muted width="100%">
+    <a href="docs/imgs/inherent-demo.mp4">Watch the demo</a>
+  </video>
+</p>
+
 ## Why Inherent
 
 - **Connected once, queried everywhere.** Ingest a source one time; every agent reads from the same governed index.
