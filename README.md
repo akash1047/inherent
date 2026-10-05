@@ -35,11 +35,7 @@ You connect sources (text, Markdown, PDF, DOCX, source code, and
 them, then serves cited retrieval over REST and MCP. Self-host it in your own
 VPC or run it locally with one command.
 
-<p align="center">
-  <video src="docs/imgs/inherent-demo.mp4" controls muted width="100%">
-    <a href="docs/imgs/inherent-demo.mp4">Watch the demo</a>
-  </video>
-</p>
+https://github.com/user-attachments/assets/c01c0e25-c995-4e70-b07c-ce6da2ff393d
 
 ## Why Inherent
 
